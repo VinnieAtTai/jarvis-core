@@ -3,6 +3,9 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
+import { captureScreen } from './screen.mjs';
+import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
+import { fetchRealUsage } from './usage.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DATA = process.env.JARVIS_DATA || HERE;
@@ -19,6 +22,7 @@ const WORKER_DOC = join(HERE, 'WORKER.md');
 const PORT = Number(process.env.JARVIS_PORT || 8124);
 const ORIGIN = `http://127.0.0.1:${PORT}`;
 const NO_UI = !!process.env.JARVIS_NO_UI;
+const PROJECTS = process.env.JARVIS_PROJECTS || join(process.env.USERPROFILE || '', '.claude', 'projects');
 const NATO = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa', 'quebec', 'romeo', 'sierra', 'tango', 'uniform', 'victor', 'whiskey', 'xray', 'yankee', 'zulu'];
 
 mkdirSync(DATA, { recursive: true });
@@ -63,7 +67,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .witem.queued{color:#9bb0c4}
 .witem.done{color:#6f9b7e;text-decoration:line-through}
 </style></head><body>
-<div id="status">starting…</div>
+<div id="status"><span id="stext">starting…</span><span id="heat" style="float:right;font-size:14px;font-weight:normal;color:#7a8a9c"></span></div>
 <div id="interim"></div>
 <div id="main">
 <div id="left">
@@ -85,8 +89,32 @@ const braw = document.getElementById('braw');
 let speaking = false, stopped = false;
 let expanded = false, rawMode = false, pinned = true;
 let focusCS = 'jarvis', chatEvts = [], lastChatPayload = '';
+let lastTokens = null;
 
-function setStatus(cls, text) { statusEl.className = cls; statusEl.textContent = text; }
+function fmtTok(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return Math.round(n / 1000) + 'k';
+    return String(n);
+}
+function renderHeat() {
+    const parts = [];
+    if (lastTokens) parts.push(lastTokens.heat.icon + ' ' + lastTokens.heat.label + ' · ' + fmtTok(lastTokens.burn) + ' tok/hr');
+    if (lastTokens && typeof lastTokens.sessionPct === 'number') parts.push('session ' + lastTokens.sessionPct + '%');
+    if (lastTokens && lastTokens.resetAt) {
+        const ms = Date.parse(lastTokens.resetAt) - Date.now();
+        if (ms > 0) {
+            const h = Math.floor(ms / 3600000), mn = Math.ceil((ms % 3600000) / 60000);
+            parts.push('reset ' + (h ? h + 'h' : '') + mn + 'm');
+        }
+    }
+    document.getElementById('heat').textContent = parts.join('  ·  ');
+}
+async function pollHeat() {
+    try { lastTokens = await (await fetch('/tokens')).json(); renderHeat(); } catch { }
+    setTimeout(pollHeat, 30000);
+}
+
+function setStatus(cls, text) { statusEl.className = cls; document.getElementById('stext').textContent = text; }
 function esc(t) { return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
 
 function renderChat() {
@@ -137,6 +165,7 @@ document.addEventListener('keydown', e => {
 
 function renderBoards(d) {
     focusCS = d.focus;
+    renderHeat();
     workEl.innerHTML = d.boards.map(b => {
         const sec = (title, items, cls, mark) => (items && items.length)
             ? '<div class="wtitle ' + cls + '">' + title + '</div>'
@@ -147,7 +176,10 @@ function renderBoards(d) {
         const body = sec('WORKING ON', b.working, 'working', '&#9656;')
             + sec('QUEUED', b.queued, 'queued', '&#9675;')
             + sec('DONE', b.done, 'done', '&#10003;');
-        return '<div class="' + cls + '">' + esc(b.callsign.toUpperCase()) + star
+        const ctx = (typeof b.context === 'number')
+            ? ' <span class="bpurpose" style="color:' + (b.context >= 80 ? '#e06c6c' : b.context >= 60 ? '#d9a05d' : '#5dd97c') + '">' + b.context + '%</span>'
+            : '';
+        return '<div class="' + cls + '">' + esc(b.callsign.toUpperCase()) + star + ctx
             + (b.purpose ? ' <span class="bpurpose">' + esc(b.purpose) + '</span>' : '') + '</div>'
             + (body || '<div class="witem queued" style="color:#566270">empty</div>');
     }).join('');
@@ -158,6 +190,7 @@ async function pollWork() {
 }
 pollChat();
 pollWork();
+pollHeat();
 
 let buf = [];
 let flushTimer = null;
@@ -258,6 +291,42 @@ const roster = loadRoster();
 const pollWaiters = [];
 const sayQueue = [];
 let discard = false, meetingMode = false, running = true;
+let screenGrant = 0;
+const SESSION_BUDGET = Number(process.env.JARVIS_SESSION_BUDGET || 0);
+let tokenStats = { totals: { output: 0, input: 0, cacheWrite: 0, cacheRead: 0, turns: 0 }, burn: 0, heat: heatOf(0), resetAt: null, sessionPct: null, source: 'estimate', weekPct: null, blockBurn: 0, budget: null, at: null };
+let realUsage = null;
+function refreshTokens() {
+    try {
+        const now = Date.now();
+        const entries = scanUsage(PROJECTS, now - 7 * 24 * 3600000);
+        const totals = totalsOf(entries, now - 3600000);
+        const burn = burnOf(totals);
+        const b = blockStats(entries, now);
+        const budget = SESSION_BUDGET || b.maxBlockBurn || 0;
+        const estPct = b.resetAt && budget ? Math.min(100, Math.round(b.blockBurn / budget * 100)) : null;
+        const estReset = b.resetAt ? new Date(b.resetAt).toISOString() : null;
+        tokenStats = {
+            totals, burn, heat: heatOf(burn),
+            resetAt: realUsage && realUsage.resetAt ? realUsage.resetAt : estReset,
+            sessionPct: realUsage && realUsage.sessionPct !== null ? realUsage.sessionPct : estPct,
+            source: realUsage && realUsage.sessionPct !== null ? 'api' : 'estimate',
+            weekPct: realUsage ? realUsage.weekPct : null,
+            blockBurn: b.blockBurn, budget,
+            at: new Date().toISOString(),
+        };
+    } catch { }
+}
+async function refreshRealUsage() {
+    realUsage = await fetchRealUsage();
+    refreshTokens();
+}
+const REAL_USAGE = process.env.JARVIS_REAL_USAGE === '1';
+refreshTokens();
+if (REAL_USAGE) {
+    refreshRealUsage();
+    setInterval(refreshRealUsage, 600000).unref();
+}
+setInterval(refreshTokens, 30000).unref();
 let lastHist = null;
 
 function loadJsonl(path) {
@@ -478,16 +547,18 @@ function resolveClaude() {
     }
     return 'claude';
 }
-function spawnWorker(repo, purpose) {
+function spawnWorker(repo, purpose, model) {
     const safePurpose = purpose.replace(/["'^&<>|%]/g, '');
     const boot = 'You are a JARVIS worker session. Fetch http://127.0.0.1:' + PORT + '/protocol with a plain GET request and follow it exactly. Register with purpose: ' + safePurpose + '. Then wait for instructions on the poll loop.';
     const pm = repo.permissionMode ? ' --permission-mode ' + repo.permissionMode : '';
+    const md = model || repo.model;
+    const mm = md ? ' --model ' + md : '';
     const scriptPath = join(DATA, 'spawn-' + repo.key + '.cmd');
     writeFileSync(scriptPath, [
         '@echo off',
         'title JARVIS worker - ' + repo.key,
         'cd /d "' + repo.cwd + '"',
-        '"' + resolveClaude() + '"' + pm + ' "' + boot + '"',
+        '"' + resolveClaude() + '"' + pm + mm + ' "' + boot + '"',
     ].join('\r\n') + '\r\n');
     const child = spawn('wt', ['cmd', '/k', scriptPath], { detached: true, stdio: 'ignore' });
     child.on('error', () => {
@@ -545,6 +616,10 @@ function handleUtterance(rawText) {
         lower = canon(text).toLowerCase();
     }
 
+    if (/\bscreen ?shot\b|\blook at (my|the|this) screen\b/.test(lower)) {
+        screenGrant = Date.now() + 120000;
+    }
+
     const P = /^(?:jarvis[\s,.!]+)?/;
     const after = (re) => lower.match(new RegExp(P.source + re.source));
     let m;
@@ -569,6 +644,15 @@ function handleUtterance(rawText) {
         enqueueSay(lives.map(cs => {
             const uid = liveUidOf(cs);
             return cs + ', ' + roster.sessions[uid].purpose + (aliveNow(uid) ? '' : ', quiet') + (cs === focus ? ', focused' : '');
+        }).join('. ') + '.', 'jarvis');
+        return;
+    }
+    if (after(/context (?:check|health|report)\b/) || after(/how(?:'s| is) (?:the |everyone'?s? )?context\b/)) {
+        const lives = liveCallsigns();
+        if (!lives.length) { enqueueSay('No sessions to report context for.', 'jarvis'); return; }
+        enqueueSay(lives.map(cs => {
+            const s = roster.sessions[liveUidOf(cs)];
+            return cs + (typeof s.ctx === 'number' ? ' at ' + s.ctx + ' percent' : ', no report yet');
         }).join('. ') + '.', 'jarvis');
         return;
     }
@@ -648,17 +732,18 @@ function handleUtterance(rawText) {
         }
         return;
     }
-    if ((m = after(/(?:start|spin up|launch)(?: a| a new| new)? session (?:in|on|at|for)\s+(.+)$/))) {
-        const parts = m[1].split(/\s+for\s+/);
+    if ((m = after(/(?:start|spin up|launch)(?: a| a new| new)?( cheap| haiku| fast)? session (?:in|on|at|for)\s+(.+)$/))) {
+        const parts = m[2].split(/\s+for\s+/);
         const repo = findRepo(parts[0]);
         if (!repo) {
             const keys = Object.keys(loadRepos());
             enqueueSay('I do not know a repo matching ' + parts[0].trim() + '.' + (keys.length ? ' I know ' + keys.join(', ') + '.' : ' No repos are registered yet.'), 'jarvis');
             return;
         }
+        const model = m[1] ? 'haiku' : undefined;
         const purpose = (parts[1] || repo.defaultPurpose || repo.key).trim();
-        spawnWorker(repo, purpose);
-        enqueueSay('Launching a session in ' + repo.key + ' for ' + purpose + '. It will check in shortly.', 'jarvis');
+        spawnWorker(repo, purpose, model);
+        enqueueSay('Launching a session in ' + repo.key + ' for ' + purpose + (model ? ', on ' + model : '') + '. It will check in shortly.', 'jarvis');
         return;
     }
     if ((m = after(/(?:give|move|send) (?:the )?(.+?) task to ([a-z-]+)\b/))) {
@@ -798,6 +883,7 @@ async function handleRequest(req, res) {
                 callsign: cs,
                 purpose: uid ? roster.sessions[uid].purpose : '',
                 alive: cs === 'jarvis' ? true : (uid ? aliveNow(uid) : false),
+                context: uid && roster.sessions[uid].ctx !== undefined ? roster.sessions[uid].ctx : null,
                 working: b.working, queued: b.queued, done: b.done,
             };
         });
@@ -826,6 +912,23 @@ async function handleRequest(req, res) {
             text: e.text,
         }));
         return json(res, 200, lim > 0 ? evts.slice(-lim) : evts);
+    }
+    if (key === 'GET /tokens') {
+        return json(res, 200, tokenStats);
+    }
+    if (key === 'GET /screen') {
+        const s = roster.sessions[u.searchParams.get('uid')];
+        if (Date.now() > screenGrant) {
+            return json(res, 403, { error: 'screen is voice-gated: the human must say take a screenshot first, one capture per ask' });
+        }
+        try {
+            const shot = await captureScreen(DATA, u.searchParams.get('all') === '1');
+            screenGrant = 0;
+            record({ kind: 'sys', text: (s ? s.callsign : 'someone') + ' took the screenshot' });
+            return json(res, 200, shot);
+        } catch (e) {
+            return json(res, 500, { error: e.message });
+        }
     }
     if (key === 'GET /protocol') {
         res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
@@ -862,6 +965,22 @@ async function handleRequest(req, res) {
         }
         try { return json(res, 200, registerSession(b.cwd, b.purpose, b.pin)); }
         catch (e) { return json(res, 409, { error: e.message }); }
+    }
+    if (key === 'POST /health') {
+        const b = await readBody(req);
+        const s = roster.sessions[b.uid];
+        if (!s || s.ended) return json(res, 404, { error: 'unknown uid' });
+        const n = Math.round(Number(b.context));
+        if (!Number.isFinite(n) || n < 0 || n > 100) return json(res, 400, { error: 'context must be a number 0-100' });
+        s.ctx = n;
+        s.ctxTs = new Date().toISOString();
+        if (n >= 80 && !s.ctxWarned) {
+            s.ctxWarned = true;
+            enqueueSay(s.callsign + ' is at ' + n + ' percent context. Have it wrap up and hand off soon.', 'jarvis');
+        }
+        if (n < 80) s.ctxWarned = false;
+        saveRoster();
+        return json(res, 200, { ok: true });
     }
     if (key === 'POST /describe') {
         const b = await readBody(req);
@@ -935,7 +1054,7 @@ async function handleRequest(req, res) {
         const name = String(b.name || '').toLowerCase().replace(/[^a-z0-9-]/g, '');
         if (!name || !b.cwd || !existsSync(b.cwd)) return json(res, 400, { error: 'need name and an existing cwd' });
         const repos = loadRepos();
-        repos[name] = { cwd: b.cwd, defaultPurpose: b.defaultPurpose || '', ...(b.permissionMode ? { permissionMode: b.permissionMode } : {}) };
+        repos[name] = { cwd: b.cwd, defaultPurpose: b.defaultPurpose || '', ...(b.permissionMode ? { permissionMode: b.permissionMode } : {}), ...(b.model ? { model: b.model } : {}) };
         writeFileSync(REPOS, JSON.stringify(repos, null, 1));
         record({ kind: 'sys', text: 'repo registered: ' + name + ' -> ' + b.cwd });
         enqueueSay('Repo ' + name + ' registered.', 'jarvis');

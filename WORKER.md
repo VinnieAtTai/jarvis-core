@@ -58,6 +58,11 @@ done
 - Silent text: `POST /send {"from":"<uid>","to":"human","text":"..."}`. Shows in the hub's
   console chat without being spoken. Use for anything long, code, or paths.
 - Another session: `POST /send {"from":"<uid>","to":"<callsign>","text":"..."}`.
+- Screenshot of the human's screen: `GET /screen?uid=<uid>` returns `{"path":"<png>"}` — read
+  that file (it is an image). Primary monitor by default, `&all=1` for every monitor. This is
+  HARD-GATED by voice: it only works right after the human says take a screenshot (or look at
+  my screen), and each ask is good for exactly one capture. A 403 means they have not asked —
+  never retry it; ask them to say take a screenshot if you need to see something.
 
 ## 4. Tasks
 
@@ -90,6 +95,11 @@ old you did. Make it count. Then stop polling and end your turn. Leave the termi
 - One `/say` per thought. Short spoken lines; long content goes through `/send` to human.
 - Keep `/send` text compact too: it lands in another model's context. Send paths, ids, and
   conclusions, not file contents or logs.
+- Report context health: chain `POST /health {"uid":"<uid>","context":<0-100>}` into a bash
+  call you are already making (after handling a batch, alongside board updates) — your best
+  estimate of how full your context window is. The board shows it and the hub warns the human
+  at 80 so a fresh session can take over before you degrade. If your context was recently
+  summarized or compacted, report high (85+).
 - Never edit files in the jarvis folder; the hub is the only writer.
 - Update the board as you start and finish things so it reflects reality.
 - If the hub is unreachable the wrapper loop retries by itself; do not exit it.

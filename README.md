@@ -19,8 +19,12 @@ a voice todo board with a file protocol any program can drive.
 - **Conversation view** — chat bubbles (you right, brains left), last 10 messages, expand
   toggle (`t`), raw protocol view (`r`), auto-pinned to bottom with a jump-to-latest chip.
 - **Session spawning** — "jarvis, start a session in broker" launches Claude Code in a
-  registered repo's terminal; it checks in by itself.
+  registered repo's terminal; it checks in by itself. "start a cheap session in ..." spawns
+  it on haiku; a `model` field on the repo entry sets a per-repo default.
 - **Meeting mode / pause** — gate or discard the mic without shutting down.
+- **Screen look (voice-gated)** — saying "take a screenshot" arms exactly one desktop
+  capture; a session then fetches `GET /screen` for the PNG path. Without that spoken
+  grant the endpoint refuses — sessions cannot watch the screen on their own.
 
 ## Setup
 
