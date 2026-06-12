@@ -17,6 +17,7 @@ const WORKLIST = join(DATA, 'worklist.json');
 const SESSIONS = join(DATA, 'sessions.json');
 const BUS = join(DATA, 'bus.jsonl');
 const REPOS = join(DATA, 'repos.json');
+const SCHEDULE = join(DATA, 'schedule.json');
 const ARCHIVE = join(DATA, 'archive');
 const WORKER_DOC = join(HERE, 'WORKER.md');
 const PORT = Number(process.env.JARVIS_PORT || 8124);
@@ -55,7 +56,8 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .chip{font-size:10px;color:#5db4d9;letter-spacing:1px}
 .t{font-size:10px;color:#7a8a9c;margin-left:10px;white-space:nowrap}
 .divider{text-align:center;color:#d9a05d;font-size:11px;margin:2px 0}
-#work{flex:2;background:#101822;border:1px solid #1f2c3a;border-radius:8px;padding:12px;position:sticky;top:8px;max-height:90vh;overflow-y:auto}
+#right{flex:2;position:sticky;top:8px;max-height:92vh;overflow-y:auto;display:flex;flex-direction:column;gap:10px}
+.panel{background:#101822;border:1px solid #1f2c3a;border-radius:8px;padding:12px}
 .bhead{font-weight:bold;font-size:13px;letter-spacing:1px;margin:12px 0 2px;color:#d7e3f0;border-bottom:1px solid #1f2c3a;padding-bottom:2px}
 .bhead.focused{color:#5db4d9}
 .bhead.dead{color:#566270}
@@ -66,6 +68,16 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .witem.working{color:#f0e0b0;border-left-color:#e8c35a}
 .witem.queued{color:#9bb0c4}
 .witem.done{color:#6f9b7e;text-decoration:line-through}
+.expander{cursor:pointer;color:#5db4d9 !important;text-decoration:none}
+.bdoing{font-size:11px;color:#9bb0c4;margin:0 0 2px}
+.needs{color:#fff;background:#a33;border-radius:4px;padding:0 5px;font-weight:bold;letter-spacing:1px}
+.nmlabel{color:#5db4d9;font-weight:bold;font-size:11px;letter-spacing:1px}
+.nmtime{color:#7a8a9c;font-size:11px}
+#caltext{width:100%;height:110px;background:#0d1420;color:#d7e3f0;border:1px solid #1f2c3a;border-radius:6px;font:12px Consolas,monospace;margin:6px 0;box-sizing:border-box}
+.evrow{display:flex;align-items:center;gap:6px}
+.evrow > span:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.evicons{margin-left:auto;white-space:nowrap}
+.evic{text-decoration:none;margin-left:6px;font-size:13px}
 </style></head><body>
 <div id="status"><span id="stext">starting…</span><span id="heat" style="float:right;font-size:14px;font-weight:normal;color:#7a8a9c"></span></div>
 <div id="interim"></div>
@@ -73,9 +85,14 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 <div id="left">
 <div id="chat"></div>
 <div id="rawlog"></div>
-<div id="bar"><button class="btn" id="bexp">EXPAND (t)</button><button class="btn" id="braw">RAW (r)</button><span id="jump" class="btn" style="display:none">&#8595; latest</span></div>
+<div id="bar"><button class="btn" id="bexp">EXPAND (t)</button><button class="btn" id="braw">RAW (r)</button><button class="btn" id="bcal">SCHEDULE</button><span id="jump" class="btn" style="display:none">&#8595; latest</span></div>
+<div id="calbox" style="display:none"><textarea id="caltext" placeholder="Paste your calendar agenda here (titles + 3:00 PM-4:00 PM lines)"></textarea><button class="btn" id="bcalsave">LOAD SCHEDULE</button></div>
 </div>
-<div id="work"></div>
+<div id="right">
+<div id="nextpanel" class="panel" style="display:none"></div>
+<div id="work" class="panel"></div>
+<div id="schedpanel" class="panel" style="display:none"></div>
+</div>
 </div>
 <script>
 const statusEl = document.getElementById('status');
@@ -158,33 +175,108 @@ chatEl.onscroll = () => {
 jumpEl.onclick = () => { pinned = true; chatEl.scrollTop = chatEl.scrollHeight; jumpEl.style.display = 'none'; };
 bexp.onclick = () => setExpanded(!expanded);
 braw.onclick = () => setRaw(!rawMode);
+document.getElementById('bcal').onclick = () => {
+    const box = document.getElementById('calbox');
+    box.style.display = box.style.display === 'none' ? 'block' : 'none';
+};
+document.getElementById('bcalsave').onclick = async () => {
+    const ta = document.getElementById('caltext');
+    try {
+        const r = await (await fetch('/schedule', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: ta.value }) })).json();
+        if (r.ok) { ta.value = ''; document.getElementById('calbox').style.display = 'none'; }
+        else alert(r.error || 'parse failed');
+    } catch { }
+};
 document.addEventListener('keydown', e => {
     if (e.key === 't') setExpanded(!expanded);
     if (e.key === 'r') setRaw(!rawMode);
 });
 
+const boardExpand = new Set();
+let lastBoard = null, lastSched = null;
+function fmtClock(iso) {
+    const d = new Date(iso);
+    let h = d.getHours();
+    const m = d.getMinutes(), ap = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    return h + ':' + String(m).padStart(2, '0') + ' ' + ap;
+}
 function renderBoards(d) {
     focusCS = d.focus;
+    lastBoard = d;
     renderHeat();
+    const evIcons = (e) => {
+        let h = '';
+        if (e.join) {
+            const ic = e.joinKind === 'zoom' ? '🔵' : e.joinKind === 'teams' ? '🤮' : '🎥';
+            h += '<span class="evic" data-open="' + esc(e.join) + '" title="join ' + esc(e.joinKind || 'meeting') + '">' + ic + '</span>';
+        }
+        if (e.link) h += '<span class="evic" data-open="' + esc(e.link) + '" title="open invite">📅</span>';
+        return h ? '<span class="evicons">' + h + '</span>' : '';
+    };
+    let top = '';
+    if (lastSched && (lastSched.current || lastSched.next)) {
+        const nmRow = (label, e, time) => '<div class="evrow"><span><span class="nmlabel">' + label + '</span> ' + esc(e.title) + ' <span class="nmtime">' + time + '</span></span>' + evIcons(e) + '</div>';
+        top = (lastSched.current ? nmRow('NOW', lastSched.current, 'until ' + fmtClock(lastSched.current.end)) : '')
+            + (lastSched.next ? nmRow('NEXT', lastSched.next, fmtClock(lastSched.next.start)) : '');
+    }
+    let sched = '';
+    if (lastSched && lastSched.events && lastSched.events.length) {
+        sched = '<div class="bhead" style="margin-top:0">SCHEDULE</div>' + lastSched.events.map(e => {
+            const past = Date.parse(e.end) < Date.now();
+            return '<div class="witem evrow" style="color:' + (past ? '#566270' : '#9bb0c4') + '"><span>' + fmtClock(e.start) + '  ' + esc(e.title) + '</span>' + (past ? '' : evIcons(e)) + '</div>';
+        }).join('');
+    }
+    const np = document.getElementById('nextpanel'), sp = document.getElementById('schedpanel');
+    np.innerHTML = top; np.style.display = top ? 'block' : 'none';
+    sp.innerHTML = sched; sp.style.display = sched ? 'block' : 'none';
     workEl.innerHTML = d.boards.map(b => {
-        const sec = (title, items, cls, mark) => (items && items.length)
-            ? '<div class="wtitle ' + cls + '">' + title + '</div>'
-                + items.map(i => '<div class="witem ' + cls + '">' + mark + ' ' + esc(i) + '</div>').join('')
-            : '';
+        const item = (i, cls, mark) => '<div class="witem ' + cls + '">' + mark + ' ' + esc(i) + '</div>';
+        const queued = b.queued || [], done = b.done || [], working = b.working || [];
+        if (b.callsign === 'jarvis' && b.callsign !== d.focus && !working.length && !queued.length && !done.length) return '';
         const cls = 'bhead' + (b.callsign === d.focus ? ' focused' : '') + (b.alive === false ? ' dead' : '');
         const star = b.callsign === d.focus ? ' &#9733;' : '';
-        const body = sec('WORKING ON', b.working, 'working', '&#9656;')
-            + sec('QUEUED', b.queued, 'queued', '&#9675;')
-            + sec('DONE', b.done, 'done', '&#10003;');
+        let body = working.length ? '<div class="wtitle working">WORKING ON</div>' + working.map(i => item(i, 'working', '&#9656;')).join('') : '';
+        if (queued.length) {
+            const qKey = b.callsign + ':q';
+            const qOpen = boardExpand.has(qKey);
+            const qShow = qOpen ? queued : queued.slice(0, 3);
+            body += '<div class="wtitle queued">QUEUED (' + queued.length + ')</div>'
+                + qShow.map(i => item(i, 'queued', '&#9675;')).join('')
+                + (queued.length > 3 ? '<div class="witem queued expander" data-x="' + qKey + '">' + (qOpen ? 'show less' : '+ ' + (queued.length - 3) + ' more') + '</div>' : '');
+        }
+        if (done.length) {
+            const dKey = b.callsign + ':d';
+            const dOpen = boardExpand.has(dKey);
+            const dShow = dOpen ? done : done.slice(-1);
+            body += '<div class="wtitle done' + (done.length > 1 ? ' expander' : '') + '"' + (done.length > 1 ? ' data-x="' + dKey + '"' : '') + '>DONE (' + done.length + ')' + (done.length > 1 ? (dOpen ? ' &#9650;' : ' &#9660;') : '') + '</div>'
+                + dShow.map(i => item(i, 'done', '&#10003;')).join('');
+        }
         const ctx = (typeof b.context === 'number')
             ? ' <span class="bpurpose" style="color:' + (b.context >= 80 ? '#e06c6c' : b.context >= 60 ? '#d9a05d' : '#5dd97c') + '">' + b.context + '%</span>'
             : '';
+        const doing = (b.needsYou || b.doing)
+            ? '<div class="bdoing">' + (b.needsYou ? '<span class="needs">NEEDS YOU</span> ' : '') + esc(b.doing || '') + '</div>'
+            : '';
         return '<div class="' + cls + '">' + esc(b.callsign.toUpperCase()) + star + ctx
             + (b.purpose ? ' <span class="bpurpose">' + esc(b.purpose) + '</span>' : '') + '</div>'
+            + doing
             + (body || '<div class="witem queued" style="color:#566270">empty</div>');
     }).join('');
 }
+workEl.onclick = (e) => {
+    const x = e.target.getAttribute('data-x');
+    if (!x || !lastBoard) return;
+    if (boardExpand.has(x)) boardExpand.delete(x); else boardExpand.add(x);
+    renderBoards(lastBoard);
+};
+document.addEventListener('click', (e) => {
+    const t = e.target.closest ? e.target.closest('[data-open]') : null;
+    if (!t) return;
+    fetch('/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: t.getAttribute('data-open') }) }).catch(() => { });
+});
 async function pollWork() {
+    try { lastSched = await (await fetch('/schedule')).json(); } catch { }
     try { renderBoards(await (await fetch('/board')).json()); } catch { }
     setTimeout(pollWork, 1500);
 }
@@ -228,13 +320,24 @@ const rec = new webkitSpeechRecognition();
 rec.continuous = true;
 rec.interimResults = true;
 rec.lang = 'en-US';
+let speakingText = '';
+function isNovelSpeech(t) {
+    const words = t.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 2);
+    if (!words.length) return false;
+    const novel = words.filter(w => !speakingText.includes(' ' + w + ' ')).length;
+    return novel >= 2 || (novel / words.length >= 0.6 && words.length >= 2);
+}
 rec.onresult = (e) => {
     for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i];
+        const t = r[0].transcript.trim();
+        if (speaking && t) {
+            if (!isNovelSpeech(t)) continue;
+            speechSynthesis.cancel();
+        }
         if (r.isFinal) {
-            const text = r[0].transcript.trim();
-            if (text) {
-                buf.push(text);
+            if (t) {
+                buf.push(t);
                 const joined = buf.join(' ');
                 if (INSTANT.some(re => re.test(joined))) { flushBuf(); continue; }
                 interimEl.textContent = joined + ' …';
@@ -251,32 +354,36 @@ rec.onerror = (e) => {
         setStatus('error', 'ERROR: ' + e.error + ' (auto-restarting)');
     }
 };
-rec.onend = () => { if (!speaking && !stopped) setTimeout(startRec, 200); };
+rec.onend = () => { if (!stopped) setTimeout(startRec, 200); };
 function startRec() {
-    if (speaking || stopped) return;
-    try { rec.start(); setStatus('listening', 'LISTENING'); } catch { }
+    if (stopped) return;
+    try { rec.start(); if (!speaking) setStatus('listening', 'LISTENING'); } catch { }
 }
 function pickVoice() {
     const voices = speechSynthesis.getVoices();
-    return voices.find(v => v.name === 'Google US English')
-        || voices.find(v => v.lang === 'en-US' && v.name.includes('Google'))
-        || voices.find(v => v.lang === 'en-US')
-        || null;
+    const prefs = ['Google UK English Male', 'Microsoft Ryan', 'Microsoft George', 'Google US English'];
+    for (const p of prefs) {
+        const v = voices.find(v => v.name.includes(p));
+        if (v) return v;
+    }
+    return voices.find(v => v.lang === 'en-GB') || voices.find(v => v.lang === 'en-US') || null;
 }
 window.__speak = (text) => new Promise((resolve) => {
     speaking = true;
-    try { rec.stop(); } catch { }
+    speakingText = ' ' + String(text).toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ') + ' ';
     const u = new SpeechSynthesisUtterance(text);
     u.voice = pickVoice();
-    u.rate = 1.05;
+    u.rate = 1.0;
+    u.pitch = 0.85;
     const done = () => {
         speaking = false;
-        setTimeout(startRec, 300);
+        speakingText = '';
+        setStatus('listening', 'LISTENING');
         resolve();
     };
     u.onend = done;
     u.onerror = done;
-    setStatus('speaking', 'SPEAKING');
+    setStatus('speaking', 'SPEAKING (talk to interrupt)');
     speechSynthesis.speak(u);
 });
 window.__shutdown = () => { stopped = true; flushBuf(); try { rec.stop(); } catch { } setStatus('muted', 'STOPPED'); };
@@ -327,6 +434,27 @@ if (REAL_USAGE) {
     setInterval(refreshRealUsage, 600000).unref();
 }
 setInterval(refreshTokens, 30000).unref();
+setInterval(() => {
+    const s = loadSchedule();
+    if (!s.events || !s.events.length || s.date !== new Date().toDateString()) return;
+    const now = Date.now();
+    let dirty = false;
+    for (const e of s.events) {
+        const st = Date.parse(e.start);
+        const k5 = e.title + ':5', k0 = e.title + ':0';
+        if (now >= st - 300000 && now < st && !s.announced[k5]) {
+            s.announced[k5] = true;
+            dirty = true;
+            enqueueSay('Heads up: ' + e.title + ' in ' + Math.max(1, Math.round((st - now) / 60000)) + ' minutes.', 'jarvis');
+        }
+        if (now >= st && now < st + 60000 && !s.announced[k0]) {
+            s.announced[k0] = true;
+            dirty = true;
+            enqueueSay(e.title + ' is starting now.', 'jarvis');
+        }
+    }
+    if (dirty) saveSchedule(s);
+}, 15000).unref();
 let lastHist = null;
 
 function loadJsonl(path) {
@@ -390,6 +518,40 @@ function findTaskAll(w, needle, lists, prefer) {
 function loadRepos() {
     try { return JSON.parse(readFileSync(REPOS, 'utf8')) || {}; } catch { return {}; }
 }
+function loadSchedule() {
+    try { return JSON.parse(readFileSync(SCHEDULE, 'utf8')) || { events: [], announced: {} }; } catch { return { events: [], announced: {} }; }
+}
+function saveSchedule(s) {
+    writeFileSync(SCHEDULE, JSON.stringify(s, null, 1));
+}
+function parseScheduleText(text) {
+    const lines = String(text).split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const events = [];
+    let pendingTitle = null;
+    const timeRe = /^(\d{1,2}):(\d{2})\s*(AM|PM)?\s*[-–—]\s*(\d{1,2}):(\d{2})\s*(AM|PM)$/i;
+    for (const l of lines) {
+        if (/^past events$/i.test(l)) { pendingTitle = null; continue; }
+        const m = l.match(timeRe);
+        if (m && pendingTitle) {
+            const mk = (h, mm, ap) => {
+                let H = Number(h) % 12;
+                if (String(ap || '').toUpperCase() === 'PM') H += 12;
+                const d = new Date();
+                d.setHours(H, Number(mm), 0, 0);
+                return d;
+            };
+            const start = mk(m[1], m[2], m[3] || m[6]);
+            const end = mk(m[4], m[5], m[6]);
+            events.push({ title: pendingTitle, start: start.toISOString(), end: end.toISOString() });
+            pendingTitle = null;
+            continue;
+        }
+        if (/^(going\?|awaiting your response|yes$|no$|maybe$)/i.test(l)) continue;
+        pendingTitle = l.replace(/\s*\([^)]*@[^)]*\)\s*$/, '');
+    }
+    events.sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
+    return { date: new Date().toDateString(), events, announced: {} };
+}
 
 function liveUidOf(cs) {
     const l = roster.callsigns[cs];
@@ -413,12 +575,16 @@ function csFrom(word) {
 function canon(s) {
     return s.replace(/\bx[\s-]ray\b/gi, 'xray').replace(/\bjuliette\b/gi, 'juliet');
 }
+const pendingPins = new Map();
 function assignCallsign(pin) {
+    for (const [cs, ts] of pendingPins) {
+        if (Date.now() - ts > 300000) pendingPins.delete(cs);
+    }
     if (pin) {
         const p = String(pin).toLowerCase().replace(/[^a-z]/g, '');
         if (NATO.includes(p) && !liveUidOf(p)) return p;
     }
-    const free = NATO.filter(cs => !liveUidOf(cs));
+    const free = NATO.filter(cs => !liveUidOf(cs) && !pendingPins.has(cs));
     if (!free.length) throw new Error('all 26 callsigns are live');
     const never = free.filter(cs => !(roster.callsigns[cs] || []).length);
     if (never.length) return never[0];
@@ -465,6 +631,7 @@ function eventsFor(uid, cursor) {
 }
 function registerSession(cwd, purpose, pin) {
     const cs = assignCallsign(pin);
+    pendingPins.delete(cs);
     const uid = 's_' + String(roster.nextUid++).padStart(4, '0');
     const now = new Date().toISOString();
     roster.callsigns[cs] = [uid, ...(roster.callsigns[cs] || [])];
@@ -508,6 +675,10 @@ function routeTo(cs, msg) {
     if (!uid) return false;
     busAppend({ from: 'human', to: uid, kind: 'speech', text: msg }, SPEECH_DEBOUNCE);
     record({ kind: 'speech', text: msg, to: cs });
+    if (roster.sessions[uid].needsYou) {
+        roster.sessions[uid].needsYou = false;
+        saveRoster();
+    }
     if (!aliveNow(uid)) {
         if (Date.now() - (nagAt[cs] || 0) > 300000) {
             nagAt[cs] = Date.now();
@@ -531,6 +702,36 @@ function findRepo(spoken) {
         || keys.find(x => x.toLowerCase().includes(clean));
     return key ? { key, ...repos[key] } : null;
 }
+function chromeExe() {
+    const cands = [
+        join(process.env['PROGRAMFILES'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        join(process.env['PROGRAMFILES(X86)'] || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    ];
+    return cands.find(p => existsSync(p)) || 'chrome';
+}
+function workProfileDir() {
+    try {
+        const ls = JSON.parse(readFileSync(join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'User Data', 'Local State'), 'utf8'));
+        const cache = (ls.profile && ls.profile.info_cache) || {};
+        const email = String(process.env.JARVIS_LINK_EMAIL || '').toLowerCase();
+        if (email) {
+            for (const [dir, info] of Object.entries(cache)) {
+                if (String(info.user_name || '').toLowerCase() === email) return dir;
+            }
+        }
+    } catch { }
+    return 'Default';
+}
+function openInWorkChrome(url) {
+    const child = spawn(chromeExe(), ['--profile-directory=' + workProfileDir(), url], { detached: true, stdio: 'ignore' });
+    child.on('error', () => {
+        const c2 = spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore' });
+        c2.unref();
+    });
+    child.unref();
+    record({ kind: 'sys', text: 'opened: ' + url.slice(0, 90) });
+}
 function resolveClaude() {
     const home = process.env.USERPROFILE || '';
     const dirs = [
@@ -548,26 +749,30 @@ function resolveClaude() {
     return 'claude';
 }
 function spawnWorker(repo, purpose, model) {
+    const cs = assignCallsign();
+    pendingPins.set(cs, Date.now());
     const safePurpose = purpose.replace(/["'^&<>|%]/g, '');
-    const boot = 'You are a JARVIS worker session. Fetch http://127.0.0.1:' + PORT + '/protocol with a plain GET request and follow it exactly. Register with purpose: ' + safePurpose + '. Then wait for instructions on the poll loop.';
+    const tabTitle = cs + ' - ' + safePurpose;
+    const boot = 'You are a JARVIS worker session. Fetch http://127.0.0.1:' + PORT + '/protocol with a plain GET request and follow it exactly. Register with pin: ' + cs + ' and purpose: ' + safePurpose + '. Then wait for instructions on the poll loop.';
     const pm = repo.permissionMode ? ' --permission-mode ' + repo.permissionMode : '';
     const md = model || repo.model;
     const mm = md ? ' --model ' + md : '';
-    const scriptPath = join(DATA, 'spawn-' + repo.key + '.cmd');
+    const scriptPath = join(DATA, 'spawn-' + cs + '.cmd');
     writeFileSync(scriptPath, [
         '@echo off',
-        'title JARVIS worker - ' + repo.key,
+        'title ' + tabTitle,
         'cd /d "' + repo.cwd + '"',
         '"' + resolveClaude() + '"' + pm + mm + ' "' + boot + '"',
     ].join('\r\n') + '\r\n');
-    const child = spawn('wt', ['cmd', '/k', scriptPath], { detached: true, stdio: 'ignore' });
+    const child = spawn('wt', ['new-tab', '--title', tabTitle, '--suppressApplicationTitle', 'cmd', '/k', scriptPath], { detached: true, stdio: 'ignore' });
     child.on('error', () => {
-        const c2 = spawn('cmd', ['/c', 'start', 'JARVIS worker', 'cmd', '/k', scriptPath], { detached: true, stdio: 'ignore' });
+        const c2 = spawn('cmd', ['/c', 'start', tabTitle, 'cmd', '/k', scriptPath], { detached: true, stdio: 'ignore' });
         c2.on('error', () => enqueueSay('Could not launch a terminal for ' + repo.key + '.', 'jarvis'));
         c2.unref();
     });
     child.unref();
-    record({ kind: 'sys', text: 'spawned session in ' + repo.cwd + ' (' + repo.key + ')' });
+    record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + repo.cwd + ' (' + repo.key + ')' });
+    return cs;
 }
 function speakBoard(cs, board) {
     const part = (label, items) => items && items.length ? label + ': ' + items.join('. ') + '. ' : '';
@@ -618,6 +823,14 @@ function handleUtterance(rawText) {
 
     if (/\bscreen ?shot\b|\blook at (my|the|this) screen\b/.test(lower)) {
         screenGrant = Date.now() + 120000;
+        const all = /\b(all|both|every) (monitors?|screens?)\b/.test(lower);
+        captureScreen(DATA, all).then(shot => {
+            record({ kind: 'sys', text: 'screenshot: ' + shot.path });
+            enqueueSay('Snap.', 'jarvis');
+            const w = loadWork();
+            const uid = w.focus !== 'jarvis' ? liveUidOf(w.focus) : null;
+            if (uid) busAppend({ from: 'jarvis', to: uid, kind: 'screenshot', text: shot.path });
+        }).catch(() => enqueueSay('Screenshot failed.', 'jarvis'));
     }
 
     const P = /^(?:jarvis[\s,.!]+)?/;
@@ -645,6 +858,19 @@ function handleUtterance(rawText) {
             const uid = liveUidOf(cs);
             return cs + ', ' + roster.sessions[uid].purpose + (aliveNow(uid) ? '' : ', quiet') + (cs === focus ? ', focused' : '');
         }).join('. ') + '.', 'jarvis');
+        return;
+    }
+    if (after(/(?:what'?s?|read|when'?s?) (?:my |the )?next (?:meeting|event|thing)\b/) || after(/what'?s? next\b/)) {
+        const s = loadSchedule();
+        const now = Date.now();
+        const evs = s.date === new Date().toDateString() ? (s.events || []) : [];
+        const cur = evs.find(e => Date.parse(e.start) <= now && now < Date.parse(e.end));
+        const next = evs.find(e => Date.parse(e.start) > now);
+        const fmt = iso => { const d = new Date(iso); let h = d.getHours(); const m = d.getMinutes(); const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12; return h + (m ? ':' + String(m).padStart(2, '0') : '') + ' ' + ap; };
+        const parts = [];
+        if (cur) parts.push('Now: ' + cur.title + ' until ' + fmt(cur.end) + '.');
+        if (next) parts.push('Next: ' + next.title + ' at ' + fmt(next.start) + '.');
+        enqueueSay(parts.length ? parts.join(' ') : 'Nothing on the schedule.', 'jarvis');
         return;
     }
     if (after(/context (?:check|health|report)\b/) || after(/how(?:'s| is) (?:the |everyone'?s? )?context\b/)) {
@@ -742,8 +968,8 @@ function handleUtterance(rawText) {
         }
         const model = m[1] ? 'haiku' : undefined;
         const purpose = (parts[1] || repo.defaultPurpose || repo.key).trim();
-        spawnWorker(repo, purpose, model);
-        enqueueSay('Launching a session in ' + repo.key + ' for ' + purpose + (model ? ', on ' + model : '') + '. It will check in shortly.', 'jarvis');
+        const cs = spawnWorker(repo, purpose, model);
+        enqueueSay('Launching ' + cs + ' in ' + repo.key + ' for ' + purpose + (model ? ', on ' + model : '') + '. It will check in shortly.', 'jarvis');
         return;
     }
     if ((m = after(/(?:give|move|send) (?:the )?(.+?) task to ([a-z-]+)\b/))) {
@@ -884,6 +1110,8 @@ async function handleRequest(req, res) {
                 purpose: uid ? roster.sessions[uid].purpose : '',
                 alive: cs === 'jarvis' ? true : (uid ? aliveNow(uid) : false),
                 context: uid && roster.sessions[uid].ctx !== undefined ? roster.sessions[uid].ctx : null,
+                doing: uid ? roster.sessions[uid].doing || '' : '',
+                needsYou: uid ? !!roster.sessions[uid].needsYou : false,
                 working: b.working, queued: b.queued, done: b.done,
             };
         });
@@ -974,6 +1202,7 @@ async function handleRequest(req, res) {
         if (!Number.isFinite(n) || n < 0 || n > 100) return json(res, 400, { error: 'context must be a number 0-100' });
         s.ctx = n;
         s.ctxTs = new Date().toISOString();
+        if (b.doing !== undefined) s.doing = String(b.doing || '').slice(0, 80);
         if (n >= 80 && !s.ctxWarned) {
             s.ctxWarned = true;
             enqueueSay(s.callsign + ' is at ' + n + ' percent context. Have it wrap up and hand off soon.', 'jarvis');
@@ -1009,6 +1238,10 @@ async function handleRequest(req, res) {
         const b = await readBody(req);
         const s = roster.sessions[b.from];
         const label = s ? s.callsign : 'jarvis';
+        if (s && /^need you[:,]/i.test(String(b.text || '').trim())) {
+            s.needsYou = true;
+            saveRoster();
+        }
         String(b.text || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean).forEach(l => enqueueSay(l, label));
         return json(res, 200, { ok: true });
     }
@@ -1059,6 +1292,47 @@ async function handleRequest(req, res) {
         record({ kind: 'sys', text: 'repo registered: ' + name + ' -> ' + b.cwd });
         enqueueSay('Repo ' + name + ' registered.', 'jarvis');
         return json(res, 200, { ok: true });
+    }
+    if (key === 'POST /open') {
+        const b = await readBody(req);
+        const url = String(b.url || '');
+        if (!/^https?:\/\//i.test(url)) return json(res, 400, { error: 'http(s) urls only' });
+        openInWorkChrome(url);
+        return json(res, 200, { ok: true });
+    }
+    if (key === 'GET /schedule') {
+        const s = loadSchedule();
+        const stale = s.date !== new Date().toDateString();
+        const events = stale ? [] : (s.events || []);
+        const now = Date.now();
+        const next = events.find(e => Date.parse(e.start) > now) || null;
+        const current = events.find(e => Date.parse(e.start) <= now && now < Date.parse(e.end)) || null;
+        return json(res, 200, { events, next, current });
+    }
+    if (key === 'POST /schedule') {
+        const b = await readBody(req);
+        let s;
+        if (Array.isArray(b.events)) {
+            const events = b.events
+                .filter(e => e && e.title && e.start && e.end)
+                .map(e => ({
+                    title: String(e.title).slice(0, 120),
+                    start: e.start,
+                    end: e.end,
+                    ...(e.link ? { link: String(e.link) } : {}),
+                    ...(e.join ? { join: String(e.join), joinKind: String(e.joinKind || 'meet') } : {}),
+                }))
+                .sort((x, y) => Date.parse(x.start) - Date.parse(y.start));
+            s = { date: new Date().toDateString(), events, announced: {} };
+        } else {
+            s = parseScheduleText(b.text || '');
+        }
+        if (!s.events.length) return json(res, 400, { error: 'no events parsed - expected title lines followed by H:MM AM-H:MM PM lines, or an events array' });
+        saveSchedule(s);
+        const upcoming = s.events.filter(e => Date.parse(e.start) > Date.now()).length;
+        record({ kind: 'sys', text: 'schedule loaded: ' + s.events.length + ' events, ' + upcoming + ' upcoming' });
+        enqueueSay('Schedule loaded. ' + upcoming + ' upcoming.', 'jarvis');
+        return json(res, 200, { ok: true, events: s.events.length, upcoming });
     }
     if (key === 'POST /hear') {
         const b = await readBody(req);
