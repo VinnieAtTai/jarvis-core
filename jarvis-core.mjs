@@ -362,10 +362,7 @@ function enqueueSay(text, from) {
     const spoken = (label !== 'jarvis' && label !== focus) ? label + ' says: ' + text : text;
     sayQueue.push({ text, spoken, from: label });
 }
-function busAppend(ev) {
-    const e = { ...ev, ts: new Date().toISOString() };
-    bus.push(e);
-    appendFileSync(BUS, JSON.stringify(e) + '\n');
+function releaseWaiters() {
     for (let i = pollWaiters.length - 1; i >= 0; i--) {
         const wt = pollWaiters[i];
         const out = eventsFor(wt.uid, wt.cursor);
@@ -375,6 +372,19 @@ function busAppend(ev) {
             json(wt.res, 200, out);
         }
     }
+}
+let speechReleaseTimer = null;
+function busAppend(ev, debounceMs) {
+    const e = { ...ev, ts: new Date().toISOString() };
+    bus.push(e);
+    appendFileSync(BUS, JSON.stringify(e) + '\n');
+    if (!debounceMs) {
+        if (speechReleaseTimer) { clearTimeout(speechReleaseTimer); speechReleaseTimer = null; }
+        releaseWaiters();
+        return;
+    }
+    if (speechReleaseTimer) clearTimeout(speechReleaseTimer);
+    speechReleaseTimer = setTimeout(() => { speechReleaseTimer = null; releaseWaiters(); }, debounceMs);
 }
 function eventsFor(uid, cursor) {
     const events = [];
@@ -422,14 +432,23 @@ function retireSession(uid, summary) {
     busAppend({ from: 'jarvis', to: uid, kind: 'retired', text: 'retired' });
     return true;
 }
+const SPEECH_DEBOUNCE = Number(process.env.JARVIS_SPEECH_DEBOUNCE || 4000);
+const nagAt = {};
 function routeTo(cs, msg) {
     const uid = liveUidOf(cs);
     if (!uid) return false;
-    busAppend({ from: 'human', to: uid, kind: 'speech', text: msg });
+    busAppend({ from: 'human', to: uid, kind: 'speech', text: msg }, SPEECH_DEBOUNCE);
     record({ kind: 'speech', text: msg, to: cs });
     if (!aliveNow(uid)) {
-        const mins = Math.max(1, Math.round((Date.now() - Date.parse(roster.sessions[uid].lastSeen)) / 60000));
-        enqueueSay(cs + ' has not checked in for ' + mins + ' minute' + (mins === 1 ? '' : 's') + '. Queued it.', 'jarvis');
+        if (Date.now() - (nagAt[cs] || 0) > 300000) {
+            nagAt[cs] = Date.now();
+            const mins = Math.max(1, Math.round((Date.now() - Date.parse(roster.sessions[uid].lastSeen)) / 60000));
+            const other = liveCallsigns().find(c => c !== cs && aliveNow(liveUidOf(c)));
+            const hint = other ? ' Say focus on ' + other + ' to switch.' : '';
+            enqueueSay(cs + ' has not checked in for ' + mins + ' minute' + (mins === 1 ? '' : 's') + '. Queueing for it.' + hint, 'jarvis');
+        }
+    } else {
+        delete nagAt[cs];
     }
     return true;
 }
@@ -880,6 +899,7 @@ async function handleRequest(req, res) {
         const cs = (b.callsign && (w.sessions[b.callsign] || liveUidOf(String(b.callsign).toLowerCase()) || b.callsign === 'jarvis')) ? String(b.callsign).toLowerCase() : w.focus;
         const board = ensureBoard(w, cs);
         const needle = String(b.text || '').trim();
+        let task = needle || undefined;
         if (b.op === 'add' && needle) {
             board.queued.push(needle);
         } else if (b.op === 'start' || b.op === 'done' || b.op === 'drop') {
@@ -889,19 +909,21 @@ async function handleRequest(req, res) {
             const [t] = w.sessions[hit.cs][hit.list].splice(hit.i, 1);
             if (b.op === 'start') w.sessions[hit.cs].working.push(t);
             if (b.op === 'done') w.sessions[hit.cs].done.push(t);
+            task = t;
         } else if (b.op === 'move' && needle && b.to) {
             const hit = findTaskAll(w, needle, ['working', 'queued', 'done'], cs);
             if (!hit) return json(res, 404, { error: 'no task matching ' + needle });
             const [t] = w.sessions[hit.cs][hit.list].splice(hit.i, 1);
             ensureBoard(w, String(b.to).toLowerCase()).queued.push(t);
+            task = t;
         } else if (b.op === 'clear-done') {
             board.done = [];
         } else {
             return json(res, 400, { error: 'op must be add|start|done|drop|move|clear-done' });
         }
         saveWork(w);
-        record({ kind: 'task', op: b.op, board: cs, task: needle || undefined });
-        return json(res, 200, { ok: true, board: w.sessions[cs] });
+        record({ kind: 'task', op: b.op, board: cs, task });
+        return json(res, 200, { ok: true, op: b.op, task });
     }
     if (key === 'POST /retire') {
         const b = await readBody(req);
