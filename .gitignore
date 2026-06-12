@@ -1,0 +1,12 @@
+node_modules/
+chrome-profile/
+archive/
+transcript.jsonl
+bus.jsonl
+sessions.json
+worklist.json
+repos.json
+say.txt
+commands.txt
+spawn-*.cmd
+.testdata/

@@ -1,0 +1,11 @@
+{
+    "name": "jarvis-core",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "start": "node jarvis-core.mjs"
+    },
+    "dependencies": {
+        "playwright": "^1.48.0"
+    }
+}
