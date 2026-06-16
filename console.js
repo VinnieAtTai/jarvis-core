@@ -1,0 +1,571 @@
+
+const statusEl = document.getElementById('status');
+const interimEl = document.getElementById('interim');
+const itextEl = document.getElementById('itext');
+const mutedcueEl = document.getElementById('mutedcue');
+const cancelBtn = document.getElementById('icancel');
+const chatEl = document.getElementById('chat');
+const rawEl = document.getElementById('rawlog');
+const workEl = document.getElementById('work');
+const jumpEl = document.getElementById('jump');
+const bexp = document.getElementById('bexp');
+const braw = document.getElementById('braw');
+let speaking = false, stopped = false;
+let expanded = false, rawMode = false, pinned = true;
+let focusCS = 'jarvis', chatEvts = [], lastChatPayload = '';
+let lastTokens = null;
+let lastArchive = null;
+let activeTab = 'all';
+
+function fmtTok(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return Math.round(n / 1000) + 'k';
+    return String(n);
+}
+function renderHeat() {
+    const parts = [];
+    if (lastTokens) parts.push(lastTokens.heat.icon + ' ' + lastTokens.heat.label + ' · ' + fmtTok(lastTokens.burn) + ' tok/hr');
+    if (lastTokens && typeof lastTokens.sessionPct === 'number') parts.push('session ' + lastTokens.sessionPct + '%');
+    if (lastTokens && lastTokens.resetAt) {
+        const ms = Date.parse(lastTokens.resetAt) - Date.now();
+        if (ms > 0) {
+            const h = Math.floor(ms / 3600000), mn = Math.ceil((ms % 3600000) / 60000);
+            parts.push('reset ' + (h ? h + 'h' : '') + mn + 'm');
+        }
+    }
+    document.getElementById('heat').textContent = parts.join('  ·  ');
+}
+async function pollHeat() {
+    try { lastTokens = await (await fetch('/tokens')).json(); renderHeat(); } catch { }
+    setTimeout(pollHeat, 30000);
+}
+
+function setStatus(cls, text) { statusEl.className = cls; document.getElementById('stext').textContent = text; }
+function esc(t) { return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
+function escAttr(t) { return esc(t).split('"').join('&quot;'); }
+
+const REMOJI = { up: '👍', love: '❤️', squee: '🤩', fire: '🔥', down: '👎', poop: '💩' };
+function renderChat() {
+    renderTabs();
+    const reactMap = {};
+    for (const e of chatEvts) if (e.kind === 'react' && e.target) reactMap[e.target] = e.reaction;
+    const groups = [];
+    for (const e of eventsForTab()) {
+        if (e.kind === 'react') continue;
+        if (e.kind === 'sys') { groups.push({ divider: e.text }); continue; }
+        if (e.img) { groups.push({ who: e.who, texts: [e.text], ts: e.ts, lastTs: e.ts, img: e.img }); continue; }
+        const last = groups[groups.length - 1];
+        if (last && !last.divider && !last.img && last.who === e.who && (Date.parse(e.ts) - Date.parse(last.lastTs)) < 5000) {
+            last.texts.push(e.text); last.lastTs = e.ts;
+        } else groups.push({ who: e.who, texts: [e.text], ts: e.ts, lastTs: e.ts });
+    }
+    const show = expanded ? groups : groups.slice(-10);
+    chatEl.innerHTML = show.map(g => {
+        if (g.divider) return '<div class="divider">&#9472;&#9472; ' + esc(g.divider) + ' &#9472;&#9472;</div>';
+        const me = g.who === 'you';
+        const chip = (!me && g.who !== 'jarvis' && g.who !== focusCS) ? '<span class="chip">' + esc(g.who.toUpperCase()) + ' &#183; </span>' : '';
+        const cur = reactMap[g.ts];
+        // Ordered happiest -> poop: squee, fire, love, up (positives, descending), then down, poop.
+        const reactBar = '<span class="reacts">' + ['squee', 'fire', 'love', 'up', 'down', 'poop'].map(k => '<span class="rx' + (cur === k ? ' on' : '') + '" data-react="' + k + '" data-ts="' + escAttr(g.ts || '') + '">' + REMOJI[k] + '</span>').join('') + '</span>';
+        return '<div class="row ' + (me ? 'me' : 'them') + '"><div class="bubble">' + chip
+            + esc(g.texts.join('\n')).split('\n').join('<br>')
+            + (g.img ? '<br><a href="' + g.img + '" target="_blank"><img src="' + g.img + '" class="thumb"></a>' : '')
+            + '<span class="t">' + (g.ts || '').slice(11, 16) + '</span>'
+            + '<span class="copybtn" data-c="' + btoa(unescape(encodeURIComponent(g.texts.join('\n')))) + '" title="copy">📋</span>' + reactBar + '</div></div>';
+    }).join('');
+    rawEl.innerHTML = chatEvts.slice(-200).reverse().map(e =>
+        '<div>[' + (e.ts || '').slice(11, 19) + '] <b>' + esc(e.kind === 'sys' ? 'SYS' : (e.who === 'you' ? 'YOU' : String(e.who).toUpperCase())) + '</b> ' + esc(e.text) + '</div>'
+    ).join('');
+    if (pinned) chatEl.scrollTop = chatEl.scrollHeight;
+}
+async function pollChat() {
+    try {
+        const r = await (await fetch('/transcript?limit=' + (expanded ? 0 : 60))).json();
+        const p = JSON.stringify(r);
+        if (p !== lastChatPayload) { lastChatPayload = p; chatEvts = r; renderChat(); }
+    } catch { }
+    setTimeout(pollChat, 1500);
+}
+chatEl.addEventListener('click', (e) => {
+    const rx = e.target.closest ? e.target.closest('[data-react]') : null;
+    if (rx) {
+        fetch('/react', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ts: rx.getAttribute('data-ts'), reaction: rx.getAttribute('data-react') }) }).catch(() => { });
+        return;
+    }
+    const c = e.target.closest ? e.target.closest('.copybtn') : null;
+    if (!c) return;
+    const txt = decodeURIComponent(escape(atob(c.getAttribute('data-c'))));
+    const ok = () => { c.textContent = '✓'; setTimeout(() => { c.textContent = '📋'; }, 1000); };
+    const fallback = () => {
+        const ta = document.createElement('textarea');
+        ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.focus(); ta.select();
+        let okFlag = false;
+        try { okFlag = document.execCommand('copy'); } catch { okFlag = false; }
+        document.body.removeChild(ta);
+        if (okFlag) ok(); else { c.textContent = '✗'; setTimeout(() => { c.textContent = '📋'; }, 1000); }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(txt).then(ok).catch(fallback);
+    } else {
+        fallback();
+    }
+});
+function refreshChat() { lastChatPayload = ''; }
+function setExpanded(v) { expanded = v; bexp.className = 'btn' + (v ? ' on' : ''); refreshChat(); }
+function setRaw(v) { rawMode = v; braw.className = 'btn' + (v ? ' on' : ''); chatEl.style.display = v ? 'none' : 'flex'; rawEl.style.display = v ? 'block' : 'none'; }
+chatEl.onscroll = () => {
+    pinned = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 40;
+    jumpEl.style.display = pinned ? 'none' : 'inline-block';
+};
+jumpEl.onclick = () => { pinned = true; chatEl.scrollTop = chatEl.scrollHeight; jumpEl.style.display = 'none'; };
+bexp.onclick = () => setExpanded(!expanded);
+braw.onclick = () => setRaw(!rawMode);
+document.getElementById('bcal').onclick = () => {
+    const box = document.getElementById('calbox');
+    box.style.display = box.style.display === 'none' ? 'block' : 'none';
+};
+document.getElementById('bcalsave').onclick = async () => {
+    const ta = document.getElementById('caltext');
+    try {
+        const r = await (await fetch('/schedule', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: ta.value }) })).json();
+        if (r.ok) { ta.value = ''; document.getElementById('calbox').style.display = 'none'; }
+        else alert(r.error || 'parse failed');
+    } catch { }
+};
+document.addEventListener('keydown', e => {
+    if (e.key === 't') setExpanded(!expanded);
+    if (e.key === 'r') setRaw(!rawMode);
+});
+
+const boardExpand = new Set();
+let lastBoard = null, lastSched = null;
+function fmtClock(iso) {
+    const d = new Date(iso);
+    let h = d.getHours();
+    const m = d.getMinutes(), ap = h >= 12 ? 'PM' : 'AM';
+    h = h % 12 || 12;
+    return h + ':' + String(m).padStart(2, '0') + ' ' + ap;
+}
+// 3-letter category chips derived from a leading TAG: in the task text (BUG:/SECURITY:/...).
+// [code, full-label-for-tooltip, color-class]. The tag is stripped from the visible text and
+// shown as a colored chip with a hover tooltip instead.
+const TCHIPS = {
+    BUG: ['BUG', 'Bug', 'bug'],
+    SECURITY: ['SEC', 'Security', 'sec'], SEC: ['SEC', 'Security', 'sec'],
+    ROBUST: ['ROB', 'Robustness', 'rob'], ROB: ['ROB', 'Robustness', 'rob'],
+    FEATURE: ['FEA', 'Feature', 'fea'], FEAT: ['FEA', 'Feature', 'fea'], FEA: ['FEA', 'Feature', 'fea'],
+    REVIEW: ['REV', 'Review', 'rev'], REV: ['REV', 'Review', 'rev'],
+    WORK: ['WRK', 'Working', 'wrk'], WRK: ['WRK', 'Working', 'wrk'],
+    FS: ['FS', 'Filesystem', 'fs'],
+    MAINT: ['MNT', 'Maintenance', 'mnt'],
+    POLISH: ['PSH', 'Polish', 'psh'],
+    NOTE: ['NTE', 'Note', 'nte'],
+};
+function chipFor(text) {
+    const m = String(text == null ? '' : text).match(/^([A-Za-z]{2,8}):\s*/);
+    if (!m) return { chip: '', rest: text };
+    const c = TCHIPS[m[1].toUpperCase()];
+    if (!c) return { chip: '', rest: text };
+    return { chip: '<span class="tchip ' + c[2] + '" title="' + c[1] + '">' + c[0] + '</span>', rest: text.slice(m[0].length) };
+}
+function renderBoards(d) {
+    focusCS = d.focus;
+    lastBoard = d;
+    if (typeof d.muted === 'boolean' && d.muted !== isMuted) window.__setMute(d.muted);
+    if (typeof d.paused === 'boolean' && d.paused !== isPaused) window.__setPause(d.paused);
+    renderHeat();
+    const evIcons = (e) => {
+        let h = '';
+        if (e.join) {
+            const ic = e.joinKind === 'zoom' ? '🔵' : e.joinKind === 'teams' ? '🤮' : '🎥';
+            h += '<span class="evic" data-open="' + esc(e.join) + '" title="join ' + esc(e.joinKind || 'meeting') + '">' + ic + '</span>';
+        }
+        if (e.link) h += '<span class="evic" data-open="' + esc(e.link) + '" title="open invite">📅</span>';
+        return h ? '<span class="evicons">' + h + '</span>' : '';
+    };
+    let top = '';
+    if (lastSched && (lastSched.current || lastSched.next)) {
+        const nmRow = (label, e, time) => '<div class="evrow"><span><span class="nmlabel">' + label + '</span> ' + esc(e.title) + ' <span class="nmtime">' + time + '</span></span>' + evIcons(e) + '</div>';
+        top = (lastSched.current ? nmRow('NOW', lastSched.current, 'until ' + fmtClock(lastSched.current.end)) : '')
+            + (lastSched.next ? nmRow('NEXT', lastSched.next, fmtClock(lastSched.next.start)) : '');
+    }
+    let sched = '';
+    if (lastSched && lastSched.events && lastSched.events.length) {
+        sched = '<div class="bhead" style="margin-top:0">SCHEDULE</div>' + lastSched.events.map(e => {
+            const past = Date.parse(e.end) < Date.now();
+            return '<div class="witem evrow" style="color:' + (past ? '#566270' : '#9bb0c4') + '"><span>' + fmtClock(e.start) + '  ' + esc(e.title) + '</span>' + (past ? '' : evIcons(e)) + '</div>';
+        }).join('');
+    }
+    const np = document.getElementById('nextpanel'), sp = document.getElementById('schedpanel');
+    np.innerHTML = top; np.style.display = top ? 'block' : 'none';
+    sp.innerHTML = sched; sp.style.display = sched ? 'block' : 'none';
+    const prio = b => b.pendingPerm ? 2 : b.needsYou ? 1 : 0;   // float perm/needs-you cards to the top
+    workEl.innerHTML = d.boards.slice().sort((a, b) => prio(b) - prio(a)).map(b => {
+        const queued = b.queued || [], done = b.done || [], working = b.working || [], review = b.review || [];
+        const cs = b.callsign;
+        if (cs === 'jarvis' && cs !== d.focus && !working.length && !queued.length && !done.length && !review.length) return '';
+        const dead = b.alive === false && cs !== 'jarvis';
+        const focused = cs === d.focus;
+        let btns = '';
+        if (dead) {
+            btns += '<span class="cbtn" data-act="continue" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="continue: launch a fresh worker for this job">🚀</span>';
+            btns += '<span class="cbtn" data-act="close" data-cs="' + esc(cs) + '" title="remove from board">✕</span>';
+        } else if (cs !== 'jarvis') {
+            if (!focused) btns += '<span class="cbtn" data-act="focus" data-cs="' + esc(cs) + '" title="focus">★</span>';
+            btns += '<span class="cbtn" data-act="voicemute" data-cs="' + esc(cs) + '" data-on="' + (b.voiceMuted ? '0' : '1') + '" title="' + (b.voiceMuted ? 'voice muted - click to unmute' : 'silence this session voice') + '">' + (b.voiceMuted ? '🔇' : '🔊') + '</span>';
+            btns += '<span class="cbtn" data-act="restart" data-uid="' + esc(b.uid || '') + '" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="restart: retire then relaunch">↻</span>';
+            btns += '<span class="cbtn" data-act="close" data-cs="' + esc(cs) + '" title="close / retire">✕</span>';
+        }
+        const ctx = (typeof b.context === 'number') ? ' <span style="color:' + (b.context >= 80 ? '#e06c6c' : b.context >= 60 ? '#d9a05d' : '#5dd97c') + '">' + b.context + '%</span>' : '';
+        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + ctx + '</span><span class="cbtns">' + btns + '</span></div>';
+        const purpose = b.purpose ? '<div class="cpurpose">' + esc(b.purpose) + '</div>' : '';
+        const doing = (b.needsYou || b.doing) ? '<div class="bdoing">' + (b.needsYou ? '<span class="needs">NEEDS YOU</span> ' : '') + esc(b.doing || '') + '</div>' : '';
+        const counts = (working.length || queued.length || review.length || done.length) ? '<div class="ccount">'
+            + (working.length ? '<span class="cnum work">' + working.length + ' working</span>' : '')
+            + (queued.length ? '<span class="cnum queue">' + queued.length + ' queued</span>' : '')
+            + (review.length ? '<span class="cnum review">' + review.length + ' in review</span>' : '')
+            + (done.length ? '<span class="cnum done">' + done.length + ' done</span>' : '') + '</div>' : '';
+        // Clean one-line task (glyph + text, consistent left edge); notes (if any) make the
+        // whole line clickable and drop full-width below — no leading indent, no double glyph.
+        const item = (i, list, mark) => {
+            const obj = i && typeof i === 'object';
+            const txt = obj ? (i.text == null ? '' : i.text) : i;
+            const id = obj ? (i.id || '') : '';
+            const notes = obj ? (i.notes || '') : '';
+            const a = (op, sym, title) => '<span class="ract" data-op="' + op + '" data-cs="' + esc(cs) + '" data-t="' + escAttr(txt) + '" title="' + title + '">' + sym + '</span>';
+            let acts = '';
+            if (list === 'queued') acts += a('top', '&#9650;', 'move to top of queue');
+            if (list === 'review') {
+                acts += a('done', '&#10003;', 'approve &#8594; done');
+                acts += a('start', '&#8635;', 'send back to working');
+            } else {
+                acts += a('review', '&#9678;', 'move to review');
+                if (list !== 'done') acts += a('done', '&#10003;', 'done');
+                if (list !== 'queued') acts += a('ready', '&#8634;', 'back to ready');
+            }
+            acts += '<span class="ract del" data-op="drop" data-cs="' + esc(cs) + '" data-t="' + escAttr(txt) + '" title="delete">&#128465;</span>';
+            const noteOpen = notes && boardExpand.has('note:' + id);
+            const dot = notes ? '<span class="ndot">' + (noteOpen ? '&#9662;' : '&#8250;') + '</span>' : '';
+            const noteBody = noteOpen ? '<div class="wnote">' + esc(notes).split('\n').join('<br>') + '</div>' : '';
+            const dx = notes ? ' data-x="note:' + id + '" style="cursor:pointer"' : '';
+            // text + note caret stay together on the left (.wleft); row actions sit far right.
+            // chip is derived from a leading TAG: and stripped from the visible text; data-t above
+            // keeps the FULL original text so op matching is unaffected.
+            const tc = chipFor(txt);
+            return '<div class="witem ' + list + '"' + dx + '><span class="wleft"><span class="wtext">' + mark + ' ' + tc.chip + esc(tc.rest) + '</span>' + dot + '</span><span class="rowacts">' + acts + '</span>' + noteBody + '</div>';
+        };
+        // Top 3 per lane + a "N more" expander; the done lane defaults to FULLY collapsed (history).
+        const lane = (items, list, mark) => {
+            if (!items.length) return '';
+            const open = boardExpand.has(cs + ':' + list);
+            const cap = list === 'done' ? 0 : 3;
+            const vis = open ? items : items.slice(0, cap);
+            let h = vis.map(i => item(i, list, mark)).join('');
+            if (items.length > cap) {
+                const label = open ? '&#9662; less' : '&#9656; ' + (cap ? (items.length - cap) + ' more ' + list : items.length + ' ' + list);
+                h += '<div class="ctoggle" data-x="' + cs + ':' + list + '">' + label + '</div>';
+            }
+            return h;
+        };
+        const expandedCard = working.length > 0 || review.length > 0 || boardExpand.has(cs + ':card');
+        const hiddenN = working.length + queued.length + review.length + done.length;
+        let tasks = '';
+        if (expandedCard) {
+            // Review on top (finished work floats up), then Working with Queued right beside it.
+            tasks = lane(review, 'review', '&#9678;') + lane(working, 'working', '&#9656;') + lane(queued, 'queued', '&#9675;') + lane(done, 'done', '&#10003;');
+            if (!working.length && !review.length && (queued.length || done.length)) tasks = '<div class="ctoggle" data-x="' + cs + ':card">&#9662; collapse</div>' + tasks;
+        } else if (hiddenN) {
+            tasks = '<div class="ctoggle" data-x="' + cs + ':card">&#9656; show ' + hiddenN + ' task' + (hiddenN > 1 ? 's' : '') + '</div>';
+        }
+        const perm = b.pendingPerm ? '<div class="permreq"><div class="permhead">&#9888; wants to run <b>' + esc(b.pendingPerm.tool) + '</b></div><div class="permdetail">' + esc((b.pendingPerm.detail || '').slice(0, 240)) + '</div><div class="permbtns"><span class="pbtn ok" data-act="approve" data-permid="' + esc(b.pendingPerm.id) + '">Approve</span><span class="pbtn no" data-act="deny" data-permid="' + esc(b.pendingPerm.id) + '">Deny</span><span class="pbtn" data-act="always" data-permid="' + esc(b.pendingPerm.id) + '">Always</span></div></div>' : '';
+        return '<div class="card' + (focused ? ' cfocus' : '') + (dead ? ' cdead' : '') + ((b.needsYou || b.pendingPerm) ? ' cneeds' : '') + '">' + head + purpose + perm + doing + counts + tasks + '</div>';
+    }).join('');
+    const deadN = d.boards.filter(b => b.alive === false && b.callsign !== 'jarvis').length;
+    if (deadN > 1) workEl.innerHTML = '<div style="margin-bottom:8px"><span class="cbtn" data-act="continueall" style="opacity:1;color:#5db4d9;font-weight:bold;font-size:12px">🚀 continue all (' + deadN + ')</span></div>' + workEl.innerHTML;
+    renderChat();
+}
+workEl.onclick = (e) => {
+    const t = e.target.closest ? e.target.closest('[data-x],[data-op],[data-act]') : null;
+    if (!t) return;
+    const post = (url, body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).catch(() => { });
+    const x = t.getAttribute('data-x');
+    if (x) { if (boardExpand.has(x)) boardExpand.delete(x); else boardExpand.add(x); if (lastBoard) renderBoards(lastBoard); return; }
+    const op = t.getAttribute('data-op');
+    if (op) { post('/worklist', { op, callsign: t.getAttribute('data-cs'), text: t.getAttribute('data-t') }); return; }
+    const act = t.getAttribute('data-act');
+    if (act === 'focus') post('/focus', { callsign: t.getAttribute('data-cs') });
+    else if (act === 'close') post('/forget', { callsign: t.getAttribute('data-cs') });
+    else if (act === 'continue') post('/spawn', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
+    else if (act === 'restart') post('/retire', { uid: t.getAttribute('data-uid'), summary: 'Restarted from console.', successor: true });
+    else if (act === 'voicemute') post('/voicemute', { callsign: t.getAttribute('data-cs'), on: t.getAttribute('data-on') === '1' });
+    else if (act === 'continueall' && lastBoard) lastBoard.boards.filter(b => b.alive === false && b.callsign !== 'jarvis' && b.cwd && b.purpose).forEach(b => post('/spawn', { cwd: b.cwd, purpose: b.purpose }));
+    else if (act === 'approve') post('/permission-answer', { id: t.getAttribute('data-permid'), decision: 'allow' });
+    else if (act === 'deny') post('/permission-answer', { id: t.getAttribute('data-permid'), decision: 'deny' });
+    else if (act === 'always') post('/permission-answer', { id: t.getAttribute('data-permid'), decision: 'always' });
+};
+document.addEventListener('click', (e) => {
+    const t = e.target.closest ? e.target.closest('[data-open]') : null;
+    if (!t) return;
+    fetch('/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: t.getAttribute('data-open') }) }).catch(() => { });
+});
+let isMuted = false;
+window.__setMute = (on) => {
+    isMuted = !!on;
+    if (isMuted) { try { speechSynthesis.cancel(); } catch { } }
+    document.getElementById('bmute').textContent = isMuted ? 'UNMUTE' : 'MUTE';
+    document.getElementById('bmute').className = 'btn' + (isMuted ? ' on' : '');
+    setStatus(isMuted ? 'muted' : 'listening', isMuted ? 'MUTED' : 'LISTENING');
+    if (typeof setInterim === 'function') setInterim(itextEl.textContent); // refresh muted cue
+};
+document.getElementById('bmute').onclick = () => {
+    fetch('/mute', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ on: !isMuted }) }).catch(() => { });
+};
+let isPaused = false;
+window.__setPause = (on) => {
+    isPaused = !!on;
+    document.getElementById('bpause').textContent = isPaused ? 'RESUME' : 'PAUSE';
+    document.getElementById('bpause').className = 'btn' + (isPaused ? ' on' : '');
+    if (isPaused) setStatus('paused', 'PAUSED');
+    else if (!isMuted) setStatus('listening', 'LISTENING');
+};
+document.getElementById('bpause').onclick = () => {
+    fetch('/pause', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ on: !isPaused }) }).catch(() => { });
+};
+const typeBox = document.getElementById('typebox');
+function sendTyped() {
+    const t = typeBox.value.trim();
+    if (!t) return;
+    typeBox.value = '';
+    const sess = activeTab && activeTab !== 'all' && activeTab !== 'general';
+    const out = sess ? ('on ' + activeTab + ', ' + t) : t;
+    fetch('/hear', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: out, typed: true }) }).catch(() => { });
+}
+typeBox.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); sendTyped(); } e.stopPropagation(); });
+document.getElementById('btype').onclick = sendTyped;
+function attachFile(f) {
+    const r = new FileReader();
+    r.onload = () => {
+        const b64 = String(r.result).split(',')[1] || '';
+        if (!b64) return;
+        const cs = (activeTab && activeTab !== 'all' && activeTab !== 'general') ? activeTab : '';
+        fetch('/attach', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callsign: cs, data: b64, name: f.name || 'paste.png' }) }).catch(() => { });
+    };
+    r.readAsDataURL(f);
+}
+document.addEventListener('paste', (e) => {
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    let handled = false;
+    for (const it of items) {
+        if (it.type && it.type.indexOf('image') === 0) { const f = it.getAsFile(); if (f) { attachFile(f); handled = true; } }
+    }
+    if (handled) e.preventDefault();
+});
+window.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+window.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const files = (e.dataTransfer && e.dataTransfer.files) || [];
+    for (const f of files) attachFile(f);
+});
+async function pollWork() {
+    try { lastSched = await (await fetch('/schedule')).json(); } catch { }
+    try { renderBoards(await (await fetch('/board')).json()); } catch { }
+    setTimeout(pollWork, 1500);
+}
+function renderArchive(d) {
+    lastArchive = d;
+    const ap = document.getElementById('archpanel');
+    const items = (d && d.items) || [];
+    if (!items.length) { ap.style.display = 'none'; return; }
+    const open = boardExpand.has('archive:open');
+    let html = '<div class="bhead" style="cursor:pointer;margin-top:0" data-x="archive:open">' + (open ? '&#9662;' : '&#9656;') + ' ARCHIVE (' + items.length + ')</div>';
+    if (open) {
+        html += items.slice(0, 50).map(a => {
+            const cont = (a.cwd && a.purpose) ? '<span class="ract" data-act="continue" data-cwd="' + escAttr(a.cwd) + '" data-purpose="' + escAttr(a.purpose) + '" title="continue this job (restores its handoff)">&#128640;</span>' : '';
+            const hf = a.hasHandoff ? '<span style="color:#5db4d9" title="left handoff notes">&#9678;</span>' : '';
+            const title = a.purpose || a.summary || '(untitled session)';
+            const sm = (a.summary || '').trim().toLowerCase();
+            const isStub = sm === 'closed from console.' || sm === 'restarted from console.' || sm === 'closed from console' || sm === 'restarted from console';
+            const epi = (a.summary && a.summary !== a.purpose && !isStub) ? '<span class="aepi">' + esc(a.summary) + '</span>' : '';
+            const tip = (a.summary && !isStub) ? a.summary : (a.purpose || '');
+            return '<div class="arow"><span class="achip">' + esc((a.callsign || '?').toUpperCase()) + '</span><span class="asum"><span class="atitle" title="' + escAttr(tip) + '">' + esc(title) + '</span>' + epi + '</span>' + hf + cont + '</div>';
+        }).join('');
+    }
+    ap.innerHTML = html;
+    ap.style.display = 'block';
+}
+async function pollArchive() {
+    try { renderArchive(await (await fetch('/archive')).json()); } catch { }
+    setTimeout(pollArchive, 8000);
+}
+document.getElementById('archpanel').onclick = (e) => {
+    const t = e.target.closest ? e.target.closest('[data-x],[data-act]') : null;
+    if (!t) return;
+    const x = t.getAttribute('data-x');
+    if (x) { if (boardExpand.has(x)) boardExpand.delete(x); else boardExpand.add(x); if (lastArchive) renderArchive(lastArchive); return; }
+    if (t.getAttribute('data-act') === 'continue') {
+        fetch('/spawn', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') }) }).catch(() => { });
+    }
+};
+function eventsForTab() {
+    if (activeTab === 'all') return chatEvts;
+    if (activeTab === 'general') return chatEvts.filter(e => e.kind === 'sys' || e.who === 'jarvis' || (e.who === 'you' && !e.to));
+    return chatEvts.filter(e => e.kind !== 'sys' && (e.who === activeTab || (e.who === 'you' && e.to === activeTab)));
+}
+function renderTabs() {
+    const sessions = lastBoard ? lastBoard.boards.filter(b => b.callsign !== 'jarvis' && b.alive !== false) : [];
+    const ids = ['all', 'general'].concat(sessions.map(b => b.callsign));
+    if (!ids.includes(activeTab)) activeTab = 'all';
+    let html = ['all', 'general'].map(id => '<span class="stab' + (id === activeTab ? ' active' : '') + '" data-tab="' + id + '">' + id.toUpperCase() + '</span>').join('');
+    html += sessions.map(b => '<span class="stab' + (b.callsign === activeTab ? ' active' : '') + (b.needsYou ? ' needs' : '') + '" data-tab="' + esc(b.callsign) + '">' + esc(b.callsign.toUpperCase()) + (b.needsYou ? '<span class="sbadge">!</span>' : '') + '</span>').join('');
+    document.getElementById('stabs').innerHTML = html;
+    const sess = activeTab !== 'all' && activeTab !== 'general';
+    typeBox.placeholder = sess ? ('Message ' + activeTab + ' - no focus change') : 'Type to jarvis (routes like speech; works while paused/muted)';
+}
+document.getElementById('stabs').onclick = (e) => {
+    const t = e.target.closest ? e.target.closest('[data-tab]') : null;
+    if (!t) return;
+    activeTab = t.getAttribute('data-tab');
+    renderChat();
+};
+pollChat();
+pollWork();
+pollHeat();
+pollArchive();
+
+let buf = [];
+let flushTimer = null;
+const INSTANT = [
+    /\b(pause|stop|resume|start) listening\b/i,
+    /\bjarvis\b.*\b(shut ?down|shutdown)\b/i,
+    /\bend (the )?session\b/i,
+    /\bmeeting mode\b/i,
+    /\bend meeting\b/i,
+    /^(?:jarvis[,!. ]+)?(add|new) task\b/i,
+    /^(?:jarvis[,!. ]+)?(start|begin|finish|complete|scratch|drop) task\b/i,
+    /^(?:jarvis[,!. ]+)?done with\b/i,
+    /^(?:jarvis[,!. ]+)?clear done\b/i,
+    /^(?:jarvis[,!. ]+)?(read|what is|what's) (the |on |my )?(list|worklist|tasks)\b/i,
+    /^(?:jarvis[,!. ]+)?read everyone/i,
+    /^(?:jarvis[,!. ]+)?(focus( on)?|switch to|talk to)\b/i,
+    /^(?:jarvis[,!. ]+)?retire\b/i,
+    /^(?:jarvis[,!. ]+)?who('s| is| else is)? (running|up|alive|online)\b/i,
+    /^(?:jarvis[,!. ]+)?(start|spin up|launch) (a |a new |new )?session\b/i,
+];
+// Render the live transcript, toggling the CANCEL button + muted cue with it.
+function setInterim(t) {
+    const txt = t || '';
+    const has = !!(buf.length || txt.trim());
+    itextEl.textContent = txt;
+    cancelBtn.style.display = has ? 'inline-block' : 'none';
+    mutedcueEl.style.display = (isMuted && has) ? 'inline-block' : 'none';
+}
+// Discard an in-progress utterance before it sends (CANCEL button + Escape). Clears the
+// debounce + buffer and aborts recognition so a half-spoken partial can't reappear.
+function cancelUtterance() {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    buf = [];
+    setInterim('');
+    try { rec.abort(); } catch { }
+}
+function flushBuf() {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    if (!buf.length) return;
+    const text = buf.join(' ').trim();
+    buf = [];
+    setInterim('');
+    if (text) window.__jarvisHear(text);
+}
+function armFlush() {
+    if (flushTimer) clearTimeout(flushTimer);
+    flushTimer = setTimeout(flushBuf, 2500);
+}
+cancelBtn.onclick = cancelUtterance;
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && (buf.length || itextEl.textContent.trim())) cancelUtterance(); });
+
+const rec = new webkitSpeechRecognition();
+rec.continuous = true;
+rec.interimResults = true;
+rec.lang = 'en-US';
+let speakingText = '';
+function isNovelSpeech(t) {
+    const words = t.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/s+/).filter(w => w.length > 2);
+    if (!words.length) return false;
+    const novel = words.filter(w => !speakingText.includes(' ' + w + ' ')).length;
+    return novel >= 2 || (novel / words.length >= 0.6 && words.length >= 2);
+}
+rec.onresult = (e) => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i];
+        const t = r[0].transcript.trim();
+        if (speaking && t) {
+            if (!isNovelSpeech(t)) continue;
+            speechSynthesis.cancel();
+        }
+        if (r.isFinal) {
+            if (t) {
+                buf.push(t);
+                const joined = buf.join(' ');
+                if (INSTANT.some(re => re.test(joined))) { flushBuf(); continue; }
+                setInterim(joined + ' …');
+            }
+            armFlush();
+        } else {
+            setInterim((buf.length ? buf.join(' ') + ' ' : '') + r[0].transcript);
+            armFlush();
+        }
+    }
+};
+rec.onerror = (e) => {
+    if (e.error !== 'no-speech' && e.error !== 'aborted') {
+        setStatus('error', 'ERROR: ' + e.error + ' (auto-restarting)');
+    }
+};
+rec.onend = () => { if (!stopped) setTimeout(startRec, 200); };
+function startRec() {
+    if (stopped) return;
+    try { rec.start(); if (!speaking && !isPaused && !isMuted) setStatus('listening', 'LISTENING'); } catch { }
+}
+function pickVoice() {
+    const voices = speechSynthesis.getVoices();
+    const prefs = ['Microsoft Emily', 'Google UK English Female', 'Microsoft Hazel', 'Microsoft Zira', 'Microsoft Aria', 'Microsoft Sonia', 'Microsoft Libby', 'Google US English'];
+    for (const p of prefs) {
+        const v = voices.find(v => v.name.includes(p));
+        if (v) return v;
+    }
+    return voices.find(v => v.lang === 'en-IE' && !/male/i.test(v.name))
+        || voices.find(v => /^en/.test(v.lang) && /(zira|hazel|aria|sonia|libby|emily|female|susan|catherine|linda|heera|eva)/i.test(v.name))
+        || voices.find(v => /^en/.test(v.lang) && !/(david|mark|george|ryan|james|paul|guy|male|richard|sean|alex)/i.test(v.name))
+        || voices.find(v => /^en/.test(v.lang)) || voices[0] || null;
+}
+window.__speak = (text) => new Promise((resolve) => {
+    speaking = true;
+    speakingText = ' ' + String(text).toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/s+/g, ' ') + ' ';
+    const u = new SpeechSynthesisUtterance(text);
+    u.voice = pickVoice();
+    u.rate = 1.0;
+    u.pitch = 1.05;
+    const done = () => {
+        speaking = false;
+        speakingText = '';
+        setStatus(isPaused ? 'paused' : isMuted ? 'muted' : 'listening', isPaused ? 'PAUSED' : isMuted ? 'MUTED' : 'LISTENING');
+        resolve();
+    };
+    u.onend = done;
+    u.onerror = done;
+    setStatus('speaking', 'SPEAKING (talk to interrupt)');
+    speechSynthesis.speak(u);
+});
+window.__shutdown = () => { stopped = true; flushBuf(); try { rec.stop(); } catch { } setStatus('muted', 'STOPPED'); };
+let voicesReported = false;
+function reportVoices() {
+    const vs = speechSynthesis.getVoices();
+    if (voicesReported || !vs.length) return;
+    voicesReported = true;
+    const c = pickVoice();
+    fetch('/voices', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ voices: vs.map(v => v.name + ' [' + v.lang + ']'), chosen: c ? c.name : null }) }).catch(() => { });
+}
+speechSynthesis.getVoices();
+speechSynthesis.onvoiceschanged = reportVoices;
+reportVoices();
+startRec();
