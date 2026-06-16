@@ -11,11 +11,15 @@ R=$(curl -s -X POST http://127.0.0.1:8124/register -H "content-type: application
 echo "$R"
 UID2="${R#*\"uid\":\"}"; UID2="${UID2%%\"*}"
 CS="${R#*\"callsign\":\"}"; CS="${CS%%\"*}"
-curl -s -X POST http://127.0.0.1:8124/say -H "content-type: application/json" -d "{\"from\":\"$UID2\",\"text\":\"$CS checking in.\"}"
+case "$R" in *'"uid"'*) curl -s -X POST http://127.0.0.1:8124/say -H "content-type: application/json" -d "{\"from\":\"$UID2\",\"text\":\"$CS checking in.\"}";; *) echo "REGISTER FAILED, not greeting: $R";; esac
 ```
 
 The register response is `{"uid":"s_0007","callsign":"xray"}`. Remember both. The callsign
 is how the human refers to you by voice; the uid is your identity on every later call.
+
+If the response also carries a `handoff` field, a predecessor on your cwd left you one:
+`GET /handoff?cwd=<your cwd>` to read its summary + detailed notes, tell the human in one
+chat line that you've picked up the handoff, then resume that work (see §5).
 
 If your boot instructions name a pin (e.g. "Register with pin: golf"), include
 `"pin":"golf"` in the register body — your terminal tab is already titled with that
@@ -93,16 +97,32 @@ When several updates land at once (finished one task, starting the next, plus a 
 chain all the curls in ONE Bash call separated by `;` — every separate tool call is a
 separate model turn and turns are the expensive unit.
 
-## 5. Retire
+## 5. Retire & hand off
 
 When your work is finished, or you receive a `retire-request`:
 
 ```
-curl.exe -s -X POST http://127.0.0.1:8124/retire -H "content-type: application/json" -d "{\"uid\":\"<uid>\",\"summary\":\"<one line: what you accomplished>\"}"
+curl.exe -s -X POST http://127.0.0.1:8124/retire -H "content-type: application/json" -d "{\"uid\":\"<uid>\",\"summary\":\"<one line: what you accomplished>\",\"notes\":\"<detailed handoff>\"}"
 ```
 
-The summary is your epitaph; it is what the human hears months later when they ask what the
-old you did. Make it count. Then stop polling and end your turn. Leave the terminal open.
+The `summary` is your epitaph — what the human hears months later when they ask what the old
+you did; make it count. The `notes` are your detailed handoff (state, gotchas, what's left,
+where you were mid-thought). Then stop polling and end your turn. Leave the terminal open.
+
+**Auto-successor.** If your board still has working/queued tasks when you retire, the hub
+spawns a SUCCESSOR on the same job, hands it your summary + notes + your unfinished board,
+and moves focus to it — so work continues with no human re-brief. Add `"successor":false`
+to retire cleanly with no replacement (job truly done), or `"successor":true` to force one.
+
+**Hand off before you degrade.** When your context passes ~85% (or you were just compacted),
+don't soldier on — POST a rich `/handoff {"uid":"<uid>","notes":"..."}` checkpoint (callable
+anytime, latest wins), then `/retire` with `successor:true`. A fresh session picks up exactly
+where you left off.
+
+**If you ARE the successor** (your boot prompt said so): the moment you register, `GET
+/handoff?cs=<your-callsign>` to read your predecessor's summary + notes, tell the human in
+one chat line that you've picked up the handoff, then resume. Your board already holds the
+unfinished items.
 
 ## Rules
 

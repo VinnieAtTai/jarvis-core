@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "node d:/claude/jarvis-core/perm-hook.mjs", "timeout": 600 }
+        ]
+      }
+    ]
+  }
+}

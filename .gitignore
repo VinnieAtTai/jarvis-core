@@ -12,3 +12,4 @@ spawn-*.cmd
 .testdata/
 screen/
 schedule.json
+attachments/
