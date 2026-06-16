@@ -93,6 +93,12 @@ curl.exe -s -X POST http://127.0.0.1:8124/worklist -H "content-type: application
 `op` is one of `add` (to queued), `start` (queued -> working), `done` (working -> done),
 `drop`, `clear-done`, `move` (with `"to":"<callsign>"`). Matching is by substring.
 
+**Prefix task text with a category tag** so the board renders a colored chip (Chris likes the
+context-at-a-glance): start the text with one of `BUG: SECURITY: ROBUST: FEATURE: REVIEW:
+WORK: FS: MAINT: POLISH: NOTE:` (e.g. `"text":"BUG: copy button denied"`). The tag is shown
+as a 3-letter chip with a hover tooltip and stripped from the visible line; untagged tasks
+just render plain.
+
 When several updates land at once (finished one task, starting the next, plus a `/say`),
 chain all the curls in ONE Bash call separated by `;` — every separate tool call is a
 separate model turn and turns are the expensive unit.

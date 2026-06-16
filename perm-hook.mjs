@@ -1,5 +1,9 @@
 import http from 'http';
 import { readFileSync } from 'fs';
+import { resolve } from 'path';
+
+// Normalize an absolute path for case-insensitive, separator-agnostic prefix comparison (Windows).
+function norm(p) { return resolve(String(p == null ? '' : p)).replace(/\\/g, '/').toLowerCase(); }
 
 function out(decision, reason) {
     process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: decision, ...(reason ? { permissionDecisionReason: reason } : {}) } }));
@@ -20,7 +24,17 @@ else if (tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit') detail = i
 else detail = JSON.stringify(input).slice(0, 200);
 
 if (tool === 'Bash' && (detail.includes('127.0.0.1:' + port) || detail.includes('localhost:' + port))) out('allow');
-if (tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit') out('allow');
+// Auto-allow file writes ONLY inside the worker's own cwd; gate writes that escape it (a
+// worker shouldn't silently overwrite the hub's source or files in another repo). Out-of-cwd
+// writes fall through to the hub /permission gate below instead of being rubber-stamped.
+if (tool === 'Edit' || tool === 'Write' || tool === 'MultiEdit') {
+    const fp = input.file_path;
+    if (fp) {
+        const cwd = norm(ev.cwd || process.cwd());
+        const target = norm(fp);
+        if (cwd && (target === cwd || target.startsWith(cwd + '/'))) out('allow', 'write within worker cwd');
+    }
+}
 
 const body = JSON.stringify({ callsign: cs, tool, detail });
 const req = http.request({ host: '127.0.0.1', port, path: '/permission', method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => {

@@ -13,3 +13,4 @@ spawn-*.cmd
 screen/
 schedule.json
 attachments/
+bus.base

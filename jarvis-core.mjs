@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
@@ -16,6 +16,7 @@ const CMD = join(DATA, 'commands.txt');
 const WORKLIST = join(DATA, 'worklist.json');
 const SESSIONS = join(DATA, 'sessions.json');
 const BUS = join(DATA, 'bus.jsonl');
+const BUSBASE = join(DATA, 'bus.base'); // persisted count of bus events dropped off the front
 const REPOS = join(DATA, 'repos.json');
 const SCHEDULE = join(DATA, 'schedule.json');
 const ARCHIVE = join(DATA, 'archive');
@@ -26,6 +27,11 @@ const NO_UI = !!process.env.JARVIS_NO_UI;
 const PROJECTS = process.env.JARVIS_PROJECTS || join(process.env.USERPROFILE || '', '.claude', 'projects');
 const NATO = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa', 'quebec', 'romeo', 'sierra', 'tango', 'uniform', 'victor', 'whiskey', 'xray', 'yankee', 'zulu'];
 const WORK_VERSION = 3;
+// Bound the in-memory event arrays AND their .jsonl files so a long-lived hub doesn't grow
+// without limit. We keep at most CACHE_CAP entries and only compact once we drift CACHE_SLACK
+// past it, so the (atomic) file rewrite happens every ~SLACK events, not on every append.
+const CACHE_CAP = 5000;
+const CACHE_SLACK = 1000;
 
 mkdirSync(DATA, { recursive: true });
 mkdirSync(ARCHIVE, { recursive: true });
@@ -36,13 +42,19 @@ if (!existsSync(BUS)) writeFileSync(BUS, '');
 if (!existsSync(REPOS)) writeFileSync(REPOS, '{}\n');
 if (!existsSync(SESSIONS)) writeFileSync(SESSIONS, JSON.stringify({ callsigns: {}, sessions: {}, nextUid: 1 }, null, 1));
 if (!existsSync(WORKLIST)) writeFileSync(WORKLIST, JSON.stringify({ version: WORK_VERSION, focus: 'jarvis', sessions: { jarvis: { working: [], queued: [], done: [] } } }, null, 1));
+// Sweep stale spawn launch scripts (one was written per spawned callsign; each is only read
+// once at terminal launch, so leftovers from past sessions are just clutter — REVIEW.md LOW).
+try { for (const f of readdirSync(DATA)) if (/^spawn-.*\.cmd$/i.test(f)) { try { unlinkSync(join(DATA, f)); } catch { } } } catch { }
 
 const CONSOLE_HTML = `<!doctype html>
 <html><head><meta charset="utf-8"><title>JARVIS core</title><style>
 body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;padding:16px}
 #status{font-size:22px;font-weight:bold;padding:10px 14px;border-radius:8px;background:#16202c;margin-bottom:12px}
 #status.listening{color:#5dd97c}#status.speaking{color:#5db4d9}#status.muted{color:#d9a05d}#status.paused{color:#d9a05d}#status.error{color:#e06c6c}
-#interim{color:#7a8a9c;min-height:1.5em;margin-bottom:8px;font-style:italic}
+#interim{display:flex;align-items:center;gap:10px;color:#7a8a9c;min-height:1.5em;margin-bottom:8px;font-style:italic}
+#itext{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#mutedcue{display:none;flex:none;font-style:normal;color:#d9a05d;font-size:11px;letter-spacing:.5px}
+#icancel{display:none;flex:none;font-style:normal;color:#e06c6c;border-color:#e06c6c}
 #main{display:flex;gap:20px;align-items:flex-start}
 #left{flex:3;min-width:0}
 #bar{display:flex;gap:8px;margin-top:6px;align-items:center}
@@ -75,6 +87,8 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .wtitle{font-weight:bold;letter-spacing:1px;font-size:12px;margin:8px 0 2px}
 .wtitle.working{color:#e8c35a}.wtitle.queued{color:#7a8a9c}.wtitle.done{color:#5dd97c}
 .witem{padding:3px 0 3px 6px;font-size:13px;border-left:2px solid transparent}
+.tchip{display:inline-block;font:bold 9px Consolas,monospace;letter-spacing:.5px;padding:0 4px;border-radius:3px;margin:0 5px 0 1px;vertical-align:middle;border:1px solid currentColor;cursor:default}
+.tchip.bug{color:#e06c6c}.tchip.sec{color:#e0a85d}.tchip.rob{color:#b48ce0}.tchip.fea{color:#5dd97c}.tchip.rev{color:#5db4d9}.tchip.wrk{color:#e8c35a}.tchip.fs{color:#7fc4e0}.tchip.mnt{color:#9bb0c4}.tchip.psh{color:#d9a05d}.tchip.nte{color:#7a8a9c}
 .witem.working{color:#f0e0b0;border-left-color:#e8c35a}
 .witem.queued{color:#9bb0c4}
 .witem.review{color:#7fc4e0;border-left-color:#5db4d9}
@@ -135,7 +149,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .pbtn:hover{filter:brightness(1.35)}
 </style></head><body>
 <div id="status"><span id="stext">starting…</span><span style="float:right"><span id="heat" style="font-size:14px;font-weight:normal;color:#7a8a9c"></span><button class="btn" id="bpause" style="margin-left:14px;font-size:13px;padding:3px 14px">PAUSE</button><button class="btn" id="bmute" style="margin-left:14px;font-size:13px;padding:3px 14px">MUTE</button></span></div>
-<div id="interim"></div>
+<div id="interim"><span id="itext"></span><span id="mutedcue">&#128263; muted &#183; say "unmute"</span><button class="btn" id="icancel">&#10005; CANCEL</button></div>
 <div id="main">
 <div id="left">
 <div id="stabs"></div>
@@ -155,6 +169,9 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 <script>
 const statusEl = document.getElementById('status');
 const interimEl = document.getElementById('interim');
+const itextEl = document.getElementById('itext');
+const mutedcueEl = document.getElementById('mutedcue');
+const cancelBtn = document.getElementById('icancel');
 const chatEl = document.getElementById('chat');
 const rawEl = document.getElementById('rawlog');
 const workEl = document.getElementById('work');
@@ -195,7 +212,7 @@ function setStatus(cls, text) { statusEl.className = cls; document.getElementByI
 function esc(t) { return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
 function escAttr(t) { return esc(t).split('"').join('&quot;'); }
 
-const REMOJI = { up: '👍', love: '❤️', down: '👎', poop: '💩' };
+const REMOJI = { up: '👍', love: '❤️', squee: '🤩', fire: '🔥', down: '👎', poop: '💩' };
 function renderChat() {
     renderTabs();
     const reactMap = {};
@@ -216,7 +233,8 @@ function renderChat() {
         const me = g.who === 'you';
         const chip = (!me && g.who !== 'jarvis' && g.who !== focusCS) ? '<span class="chip">' + esc(g.who.toUpperCase()) + ' &#183; </span>' : '';
         const cur = reactMap[g.ts];
-        const reactBar = '<span class="reacts">' + ['up', 'love', 'down', 'poop'].map(k => '<span class="rx' + (cur === k ? ' on' : '') + '" data-react="' + k + '" data-ts="' + escAttr(g.ts || '') + '">' + REMOJI[k] + '</span>').join('') + '</span>';
+        // Ordered happiest -> poop: squee, fire, love, up (positives, descending), then down, poop.
+        const reactBar = '<span class="reacts">' + ['squee', 'fire', 'love', 'up', 'down', 'poop'].map(k => '<span class="rx' + (cur === k ? ' on' : '') + '" data-react="' + k + '" data-ts="' + escAttr(g.ts || '') + '">' + REMOJI[k] + '</span>').join('') + '</span>';
         return '<div class="row ' + (me ? 'me' : 'them') + '"><div class="bubble">' + chip
             + esc(g.texts.join('\\n')).split('\\n').join('<br>')
             + (g.img ? '<br><a href="' + g.img + '" target="_blank"><img src="' + g.img + '" class="thumb"></a>' : '')
@@ -244,11 +262,22 @@ chatEl.addEventListener('click', (e) => {
     }
     const c = e.target.closest ? e.target.closest('.copybtn') : null;
     if (!c) return;
-    try {
-        navigator.clipboard.writeText(decodeURIComponent(escape(atob(c.getAttribute('data-c')))));
-        c.textContent = '✓';
-        setTimeout(() => { c.textContent = '📋'; }, 1000);
-    } catch { }
+    const txt = decodeURIComponent(escape(atob(c.getAttribute('data-c'))));
+    const ok = () => { c.textContent = '✓'; setTimeout(() => { c.textContent = '📋'; }, 1000); };
+    const fallback = () => {
+        const ta = document.createElement('textarea');
+        ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.focus(); ta.select();
+        let okFlag = false;
+        try { okFlag = document.execCommand('copy'); } catch { okFlag = false; }
+        document.body.removeChild(ta);
+        if (okFlag) ok(); else { c.textContent = '✗'; setTimeout(() => { c.textContent = '📋'; }, 1000); }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(txt).then(ok).catch(fallback);
+    } else {
+        fallback();
+    }
 });
 function refreshChat() { lastChatPayload = ''; }
 function setExpanded(v) { expanded = v; bexp.className = 'btn' + (v ? ' on' : ''); refreshChat(); }
@@ -285,6 +314,28 @@ function fmtClock(iso) {
     const m = d.getMinutes(), ap = h >= 12 ? 'PM' : 'AM';
     h = h % 12 || 12;
     return h + ':' + String(m).padStart(2, '0') + ' ' + ap;
+}
+// 3-letter category chips derived from a leading TAG: in the task text (BUG:/SECURITY:/...).
+// [code, full-label-for-tooltip, color-class]. The tag is stripped from the visible text and
+// shown as a colored chip with a hover tooltip instead.
+const TCHIPS = {
+    BUG: ['BUG', 'Bug', 'bug'],
+    SECURITY: ['SEC', 'Security', 'sec'], SEC: ['SEC', 'Security', 'sec'],
+    ROBUST: ['ROB', 'Robustness', 'rob'], ROB: ['ROB', 'Robustness', 'rob'],
+    FEATURE: ['FEA', 'Feature', 'fea'], FEAT: ['FEA', 'Feature', 'fea'], FEA: ['FEA', 'Feature', 'fea'],
+    REVIEW: ['REV', 'Review', 'rev'], REV: ['REV', 'Review', 'rev'],
+    WORK: ['WRK', 'Working', 'wrk'], WRK: ['WRK', 'Working', 'wrk'],
+    FS: ['FS', 'Filesystem', 'fs'],
+    MAINT: ['MNT', 'Maintenance', 'mnt'],
+    POLISH: ['PSH', 'Polish', 'psh'],
+    NOTE: ['NTE', 'Note', 'nte'],
+};
+function chipFor(text) {
+    const m = String(text == null ? '' : text).match(/^([A-Za-z]{2,8}):\\s*/);
+    if (!m) return { chip: '', rest: text };
+    const c = TCHIPS[m[1].toUpperCase()];
+    if (!c) return { chip: '', rest: text };
+    return { chip: '<span class="tchip ' + c[2] + '" title="' + c[1] + '">' + c[0] + '</span>', rest: text.slice(m[0].length) };
 }
 function renderBoards(d) {
     focusCS = d.focus;
@@ -330,6 +381,7 @@ function renderBoards(d) {
             btns += '<span class="cbtn" data-act="close" data-cs="' + esc(cs) + '" title="remove from board">✕</span>';
         } else if (cs !== 'jarvis') {
             if (!focused) btns += '<span class="cbtn" data-act="focus" data-cs="' + esc(cs) + '" title="focus">★</span>';
+            btns += '<span class="cbtn" data-act="voicemute" data-cs="' + esc(cs) + '" data-on="' + (b.voiceMuted ? '0' : '1') + '" title="' + (b.voiceMuted ? 'voice muted - click to unmute' : 'silence this session voice') + '">' + (b.voiceMuted ? '🔇' : '🔊') + '</span>';
             btns += '<span class="cbtn" data-act="restart" data-uid="' + esc(b.uid || '') + '" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="restart: retire then relaunch">↻</span>';
             btns += '<span class="cbtn" data-act="close" data-cs="' + esc(cs) + '" title="close / retire">✕</span>';
         }
@@ -366,7 +418,10 @@ function renderBoards(d) {
             const noteBody = noteOpen ? '<div class="wnote">' + esc(notes).split('\\n').join('<br>') + '</div>' : '';
             const dx = notes ? ' data-x="note:' + id + '" style="cursor:pointer"' : '';
             // text + note caret stay together on the left (.wleft); row actions sit far right.
-            return '<div class="witem ' + list + '"' + dx + '><span class="wleft"><span class="wtext">' + mark + ' ' + esc(txt) + '</span>' + dot + '</span><span class="rowacts">' + acts + '</span>' + noteBody + '</div>';
+            // chip is derived from a leading TAG: and stripped from the visible text; data-t above
+            // keeps the FULL original text so op matching is unaffected.
+            const tc = chipFor(txt);
+            return '<div class="witem ' + list + '"' + dx + '><span class="wleft"><span class="wtext">' + mark + ' ' + tc.chip + esc(tc.rest) + '</span>' + dot + '</span><span class="rowacts">' + acts + '</span>' + noteBody + '</div>';
         };
         // Top 3 per lane + a "N more" expander; the done lane defaults to FULLY collapsed (history).
         const lane = (items, list, mark) => {
@@ -385,7 +440,8 @@ function renderBoards(d) {
         const hiddenN = working.length + queued.length + review.length + done.length;
         let tasks = '';
         if (expandedCard) {
-            tasks = lane(working, 'working', '&#9656;') + lane(review, 'review', '&#9678;') + lane(queued, 'queued', '&#9675;') + lane(done, 'done', '&#10003;');
+            // Review on top (finished work floats up), then Working with Queued right beside it.
+            tasks = lane(review, 'review', '&#9678;') + lane(working, 'working', '&#9656;') + lane(queued, 'queued', '&#9675;') + lane(done, 'done', '&#10003;');
             if (!working.length && !review.length && (queued.length || done.length)) tasks = '<div class="ctoggle" data-x="' + cs + ':card">&#9662; collapse</div>' + tasks;
         } else if (hiddenN) {
             tasks = '<div class="ctoggle" data-x="' + cs + ':card">&#9656; show ' + hiddenN + ' task' + (hiddenN > 1 ? 's' : '') + '</div>';
@@ -410,6 +466,7 @@ workEl.onclick = (e) => {
     else if (act === 'close') post('/forget', { callsign: t.getAttribute('data-cs') });
     else if (act === 'continue') post('/spawn', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
     else if (act === 'restart') post('/retire', { uid: t.getAttribute('data-uid'), summary: 'Restarted from console.', successor: true });
+    else if (act === 'voicemute') post('/voicemute', { callsign: t.getAttribute('data-cs'), on: t.getAttribute('data-on') === '1' });
     else if (act === 'continueall' && lastBoard) lastBoard.boards.filter(b => b.alive === false && b.callsign !== 'jarvis' && b.cwd && b.purpose).forEach(b => post('/spawn', { cwd: b.cwd, purpose: b.purpose }));
     else if (act === 'approve') post('/permission-answer', { id: t.getAttribute('data-permid'), decision: 'allow' });
     else if (act === 'deny') post('/permission-answer', { id: t.getAttribute('data-permid'), decision: 'deny' });
@@ -427,6 +484,7 @@ window.__setMute = (on) => {
     document.getElementById('bmute').textContent = isMuted ? 'UNMUTE' : 'MUTE';
     document.getElementById('bmute').className = 'btn' + (isMuted ? ' on' : '');
     setStatus(isMuted ? 'muted' : 'listening', isMuted ? 'MUTED' : 'LISTENING');
+    if (typeof setInterim === 'function') setInterim(itextEl.textContent); // refresh muted cue
 };
 document.getElementById('bmute').onclick = () => {
     fetch('/mute', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ on: !isMuted }) }).catch(() => { });
@@ -557,18 +615,36 @@ const INSTANT = [
     /^(?:jarvis[,!. ]+)?who('s| is| else is)? (running|up|alive|online)\\b/i,
     /^(?:jarvis[,!. ]+)?(start|spin up|launch) (a |a new |new )?session\\b/i,
 ];
+// Render the live transcript, toggling the CANCEL button + muted cue with it.
+function setInterim(t) {
+    const txt = t || '';
+    const has = !!(buf.length || txt.trim());
+    itextEl.textContent = txt;
+    cancelBtn.style.display = has ? 'inline-block' : 'none';
+    mutedcueEl.style.display = (isMuted && has) ? 'inline-block' : 'none';
+}
+// Discard an in-progress utterance before it sends (CANCEL button + Escape). Clears the
+// debounce + buffer and aborts recognition so a half-spoken partial can't reappear.
+function cancelUtterance() {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+    buf = [];
+    setInterim('');
+    try { rec.abort(); } catch { }
+}
 function flushBuf() {
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
     if (!buf.length) return;
     const text = buf.join(' ').trim();
     buf = [];
-    interimEl.textContent = '';
+    setInterim('');
     if (text) window.__jarvisHear(text);
 }
 function armFlush() {
     if (flushTimer) clearTimeout(flushTimer);
     flushTimer = setTimeout(flushBuf, 2500);
 }
+cancelBtn.onclick = cancelUtterance;
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && (buf.length || itextEl.textContent.trim())) cancelUtterance(); });
 
 const rec = new webkitSpeechRecognition();
 rec.continuous = true;
@@ -594,11 +670,11 @@ rec.onresult = (e) => {
                 buf.push(t);
                 const joined = buf.join(' ');
                 if (INSTANT.some(re => re.test(joined))) { flushBuf(); continue; }
-                interimEl.textContent = joined + ' …';
+                setInterim(joined + ' …');
             }
             armFlush();
         } else {
-            interimEl.textContent = (buf.length ? buf.join(' ') + ' ' : '') + r[0].transcript;
+            setInterim((buf.length ? buf.join(' ') + ' ' : '') + r[0].transcript);
             armFlush();
         }
     }
@@ -659,7 +735,12 @@ startRec();
 </script></body></html>`;
 
 const transcriptCache = loadJsonl(TRANSCRIPT);
+// busBase = the absolute index of bus[0]. Persisted so the poll cursor (an absolute event
+// count) stays valid across restarts and across front-trimming. logical total = busBase + bus.length.
+let busBase = existsSync(BUSBASE) ? (Number(readFileSync(BUSBASE, 'utf8').trim()) || 0) : 0;
 const bus = loadJsonl(BUS);
+trimTranscript(); // compact on startup if a pre-cap run left the file/cache oversized
+trimBus();
 const roster = loadRoster();
 const pollWaiters = [];
 const sayQueue = [];
@@ -777,10 +858,39 @@ function backupCorrupt(path) {
 function saveRoster() {
     atomicWrite(SESSIONS, JSON.stringify(roster, null, 1));
 }
+// Throttled persistence for the per-poll lastSeen churn: liveness uses the in-memory roster,
+// so on-disk lastSeen only needs to be roughly current. Caps full sessions.json rewrites to
+// once / ROSTER_FLUSH_MS instead of one per poll per session. Meaningful changes (register,
+// retire, needsYou, ctx, describe) still call saveRoster() directly for an immediate flush.
+const ROSTER_FLUSH_MS = 5000;
+let lastRosterFlush = 0;
+function saveRosterThrottled() {
+    const now = Date.now();
+    if (now - lastRosterFlush >= ROSTER_FLUSH_MS) { lastRosterFlush = now; saveRoster(); }
+}
+// Keep the display cache + its file bounded. The transcript is display-only (not index-
+// referenced), so trimming the front is safe; we rewrite the file from the capped cache.
+function trimTranscript() {
+    if (transcriptCache.length <= CACHE_CAP + CACHE_SLACK) return;
+    transcriptCache.splice(0, transcriptCache.length - CACHE_CAP);
+    atomicWrite(TRANSCRIPT, transcriptCache.map(e => JSON.stringify(e)).join('\n') + (transcriptCache.length ? '\n' : ''));
+}
+// Cap the event bus. The poll cursor is an ABSOLUTE event index, so dropping k entries off the
+// front means bumping busBase by k (and persisting it): busBase + bus.length stays constant as
+// events are trimmed and only grows as events arrive, so every live cursor remains valid.
+function trimBus() {
+    if (bus.length <= CACHE_CAP + CACHE_SLACK) return;
+    const drop = bus.length - CACHE_CAP;
+    bus.splice(0, drop);
+    busBase += drop;
+    atomicWrite(BUS, bus.map(e => JSON.stringify(e)).join('\n') + (bus.length ? '\n' : ''));
+    atomicWrite(BUSBASE, String(busBase));
+}
 function record(entry) {
     const e = { ...entry, ts: new Date().toISOString() };
     transcriptCache.push(e);
     appendFileSync(TRANSCRIPT, JSON.stringify(e) + '\n');
+    trimTranscript();
 }
 function drainWholeFile(path) {
     if (!existsSync(path)) return '';
@@ -970,6 +1080,12 @@ function enqueueSay(text, from) {
     const spoken = (label !== 'jarvis' && label !== focus) ? label + ' says: ' + text : text;
     sayQueue.push({ text, spoken, from: label });
 }
+// Per-session voice-mute: is this speaker's voice silenced? (still logged as tts, just not spoken)
+function voiceMutedFrom(label) {
+    if (!label || label === 'jarvis') return false;
+    const uid = liveUidOf(label);
+    return !!(uid && roster.sessions[uid] && roster.sessions[uid].voiceMuted);
+}
 function releaseWaiters() {
     for (let i = pollWaiters.length - 1; i >= 0; i--) {
         const wt = pollWaiters[i];
@@ -996,11 +1112,12 @@ function busAppend(ev, debounceMs) {
 }
 function eventsFor(uid, cursor) {
     const events = [];
-    for (let i = Math.max(0, cursor); i < bus.length; i++) {
+    // cursor is an absolute event index; bus[0] is at absolute index busBase.
+    for (let i = Math.max(0, cursor - busBase); i < bus.length; i++) {
         const e = bus[i];
         if (e.to === uid || e.to === 'all') events.push(e);
     }
-    return { cursor: bus.length, events };
+    return { cursor: busBase + bus.length, events };
 }
 function registerSession(cwd, purpose, pin) {
     const cs = assignCallsign(pin);
@@ -1035,6 +1152,7 @@ function retireSession(uid, summary, opts = {}) {
     s.ended = new Date().toISOString();
     if (summary) s.summary = summary;
     const cs = s.callsign;
+    try { unlinkSync(join(DATA, 'spawn-' + cs + '.cmd')); } catch { } // its launch script is done with
     const w = loadWork();
     const board = w.sessions[cs] || { working: [], queued: [], done: [], review: [] };
     const unfinished = [...(board.working || []), ...(board.queued || [])];
@@ -1182,7 +1300,10 @@ function resolveClaude() {
 function spawnWorker(repo, purpose, model, handoff) {
     const cs = assignCallsign();
     pendingPins.set(cs, Date.now());
-    const safePurpose = purpose.replace(/["'^&<>|%]/g, '');
+    // wt.exe treats ';' as a command separator even inside argv (--title) — a purpose like
+    // "...catalog; resuming" chops the wt command in half (0x80070002) and strands a pinned
+    // phantom callsign. Strip it alongside the other shell/wt specials.
+    const safePurpose = purpose.replace(/["'^&<>|%;]/g, '');
     const tabTitle = cs + ' - ' + safePurpose;
     let boot = 'You are a JARVIS worker session. Fetch http://127.0.0.1:' + PORT + '/protocol with a plain GET request and follow it exactly. Register with pin: ' + cs + ' and purpose: ' + safePurpose + '.';
     if (handoff) {
@@ -1211,7 +1332,13 @@ function spawnWorker(repo, purpose, model, handoff) {
     const child = spawn('wt', ['new-tab', '--title', tabTitle, '--suppressApplicationTitle', 'cmd', '/k', scriptPath], { detached: true, stdio: 'ignore' });
     child.on('error', () => {
         const c2 = spawn('cmd', ['/c', 'start', tabTitle, 'cmd', '/k', scriptPath], { detached: true, stdio: 'ignore' });
-        c2.on('error', () => enqueueSay('Could not launch a terminal for ' + repo.key + '.', 'jarvis'));
+        c2.on('error', () => {
+            enqueueSay('Could not launch a terminal for ' + repo.key + '.', 'jarvis');
+            // The session will never register, so free the pinned callsign and remove the
+            // leftover spawn script instead of letting both linger (phantom pin / .cmd clutter).
+            pendingPins.delete(cs);
+            try { unlinkSync(scriptPath); } catch { }
+        });
         c2.unref();
     });
     child.unref();
@@ -1561,9 +1688,26 @@ function readBody(req) {
     });
 }
 
+// CSRF / DNS-rebinding guard for mutating requests. Binding to 127.0.0.1 stops the network
+// but NOT the browser: a web page you visit can fire fetch('http://127.0.0.1:8124/open',...)
+// in no-cors mode (which still sends an Origin header), or rebind a hostname to 127.0.0.1.
+// Worker/curl traffic sends no Origin and a 127.0.0.1/localhost Host, so it passes untouched;
+// only a browser cross-site write (foreign Origin) or a rebound Host (foreign Host) is blocked.
+function localRequestOk(req) {
+    const host = String(req.headers.host || '');
+    if (host !== '127.0.0.1:' + PORT && host !== 'localhost:' + PORT) return false;
+    const origin = req.headers.origin;
+    if (origin && origin !== 'http://127.0.0.1:' + PORT && origin !== 'http://localhost:' + PORT) return false;
+    return true;
+}
+
 async function handleRequest(req, res) {
     const u = new URL(req.url, ORIGIN);
     const key = req.method + ' ' + u.pathname;
+    // Only GET/HEAD are safe reads; every mutating method must come from the local console.
+    if (req.method !== 'GET' && req.method !== 'HEAD' && !localRequestOk(req)) {
+        return json(res, 403, { error: 'forbidden: request must originate from the local console' });
+    }
     if (key === 'GET /worklist') return json(res, 200, loadWork());
     if (key === 'GET /board') {
         const w = loadWork();
@@ -1583,6 +1727,7 @@ async function handleRequest(req, res) {
                 context: uid && roster.sessions[uid].ctx !== undefined ? roster.sessions[uid].ctx : null,
                 doing: uid ? roster.sessions[uid].doing || '' : '',
                 needsYou: uid ? !!roster.sessions[uid].needsYou : false,
+                voiceMuted: uid ? !!roster.sessions[uid].voiceMuted : false,
                 pendingPerm: pend ? { id: pend.id, tool: pend.tool, detail: pend.detail } : null,
                 working: b.working, queued: b.queued, done: b.done, review: b.review || [],
             };
@@ -1681,14 +1826,14 @@ async function handleRequest(req, res) {
         if (!s) return json(res, 404, { error: 'unknown uid' });
         if (s.ended) return json(res, 410, { error: 'retired' });
         s.lastSeen = new Date().toISOString();
-        saveRoster();
+        saveRosterThrottled();
         const out = eventsFor(uid, cursor);
         if (out.events.length) return json(res, 200, out);
         const waiter = { uid, cursor, res, timer: null };
         waiter.timer = setTimeout(() => {
             const i = pollWaiters.indexOf(waiter);
             if (i >= 0) pollWaiters.splice(i, 1);
-            json(res, 200, { cursor: bus.length, events: [] });
+            json(res, 200, { cursor: busBase + bus.length, events: [] });
         }, 25000);
         pollWaiters.push(waiter);
         req.on('close', () => {
@@ -1765,8 +1910,8 @@ async function handleRequest(req, res) {
         const b = await readBody(req);
         const target = String(b.ts || '').trim();
         const reaction = String(b.reaction || '').trim();
-        if (!target || !['up', 'love', 'down', 'poop'].includes(reaction)) {
-            return json(res, 400, { error: 'need ts and reaction one of up|love|down|poop' });
+        if (!target || !['up', 'love', 'squee', 'fire', 'down', 'poop'].includes(reaction)) {
+            return json(res, 400, { error: 'need ts and reaction one of up|love|squee|fire|down|poop' });
         }
         record({ kind: 'react', target, reaction, from: 'you', text: reaction });
         return json(res, 200, { ok: true });
@@ -1999,6 +2144,17 @@ async function handleRequest(req, res) {
         record({ kind: 'sys', text: discard ? 'listening paused (console)' : 'listening resumed (console)' });
         return json(res, 200, { ok: true, paused: discard });
     }
+    if (key === 'POST /voicemute') {
+        // Silence one session's spoken lines (still logged in chat); per-session, not the global mute.
+        const b = await readBody(req);
+        const uid = b.uid || liveUidOf(String(b.callsign || '').toLowerCase());
+        const s = uid && roster.sessions[uid];
+        if (!s) return json(res, 404, { error: 'unknown session' });
+        s.voiceMuted = !!b.on;
+        saveRoster();
+        record({ kind: 'sys', text: s.callsign + (s.voiceMuted ? ' voice muted' : ' voice unmuted') + ' (console)' });
+        return json(res, 200, { ok: true, voiceMuted: s.voiceMuted });
+    }
     if (key === 'POST /open') {
         const b = await readBody(req);
         const url = String(b.url || '');
@@ -2065,7 +2221,7 @@ async function main() {
             channel: 'chrome', headless: false, viewport: null,
             args: ['--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required', `--app=${ORIGIN}`],
         });
-        await context.grantPermissions(['microphone'], { origin: ORIGIN }).catch(() => { });
+        await context.grantPermissions(['microphone', 'clipboard-read', 'clipboard-write'], { origin: ORIGIN }).catch(() => { });
         consolePage = context.pages()[0] || await context.newPage();
         if (!consolePage.url().startsWith(ORIGIN)) await consolePage.goto(ORIGIN, { waitUntil: 'domcontentloaded' });
         await consolePage.exposeFunction('__jarvisHear', (text) => handleUtterance(text));
@@ -2078,7 +2234,7 @@ async function main() {
         speakingNow = true;
         const item = sayQueue.shift();
         record({ kind: 'tts', text: item.text, from: item.from });
-        if (consolePage && !muted) {
+        if (consolePage && !muted && !voiceMutedFrom(item.from)) {
             consolePage.evaluate(t => window.__speak(t), item.spoken || item.text)
                 .catch(() => { })
                 .finally(() => { speakingNow = false; });
@@ -2112,7 +2268,7 @@ async function main() {
     }
     for (const wt of pollWaiters.splice(0)) {
         clearTimeout(wt.timer);
-        try { json(wt.res, 200, { cursor: bus.length, events: [] }); } catch { }
+        try { json(wt.res, 200, { cursor: busBase + bus.length, events: [] }); } catch { }
     }
     if (consolePage) await consolePage.evaluate(() => window.__shutdown()).catch(() => { });
     record({ kind: 'sys', text: 'jarvis core stopped' });
