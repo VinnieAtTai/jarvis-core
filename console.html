@@ -1,21 +1,29 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><title>JARVIS core</title><link rel="stylesheet" href="/console.css"></head><body>
-<div id="status"><span id="stext">starting…</span><span style="float:right"><span id="heat" style="font-size:14px;font-weight:normal;color:#7a8a9c"></span><button class="btn" id="bpause" style="margin-left:14px;font-size:13px;padding:3px 14px">PAUSE</button><button class="btn" id="bmute" style="margin-left:14px;font-size:13px;padding:3px 14px">MUTE</button></span></div>
+<div id="status"><span id="stext">starting…</span><span style="float:right"><span id="heat" style="font-size:14px;font-weight:normal;color:#7a8a9c"></span><button class="btn" id="bpause" style="margin-left:14px;font-size:13px;padding:3px 14px">PAUSE</button><button class="btn" id="bmute" style="margin-left:14px;font-size:13px;padding:3px 14px">MUTE</button><span id="jvctl" class="jvctl" style="margin-left:14px;position:relative;display:inline-block"><button class="btn wind" id="bjv" style="font-size:13px;padding:3px 14px" title="JARVIS hub controls">&#9211; JARVIS &#9662;</button><div id="jvmenu" class="jvmenu" style="display:none"><div class="jvitem" id="jvrestart" title="Relaunch the hub with the latest code; live sessions survive">&#8635; Restart &amp; deploy</div><div class="jvitem" id="jvwind" title="Checkpoint + retire all sessions and stop for the night">&#127769; Wind down for the night</div></div></span></span></div>
 <div id="interim"><span id="itext"></span><span id="mutedcue">&#128263; muted &#183; say "unmute"</span><button class="btn" id="icancel">&#10005; CANCEL</button></div>
 <div id="main">
 <div id="left">
+<div id="chatpanel" class="panel">
 <div id="stabs"></div>
+<div id="newsessbox" style="display:none"><select id="nsrepo"></select><input id="nspurpose" placeholder="what should it work on?" autocomplete="off"><button class="btn" id="nsgo">SPIN UP</button><span class="btn" id="nscancel" title="cancel">&#10005;</span></div>
 <div id="chat"></div>
-<div style="display:flex;gap:8px;margin-top:6px"><input id="typebox" placeholder="Type to jarvis (routes like speech; works while paused/muted)" style="flex:1;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:8px 12px;font-size:14px;font-family:inherit" autocomplete="off"><button class="btn" id="btype" style="font-size:13px;padding:3px 14px">SEND</button></div>
 <div id="rawlog"></div>
-<div id="bar"><button class="btn" id="bexp">EXPAND (t)</button><button class="btn" id="braw">RAW (r)</button><button class="btn" id="bcal">SCHEDULE</button><span id="jump" class="btn" style="display:none">&#8595; latest</span></div>
-<div id="calbox" style="display:none"><textarea id="caltext" placeholder="Paste your calendar agenda here (titles + 3:00 PM-4:00 PM lines)"></textarea><button class="btn" id="bcalsave">LOAD SCHEDULE</button></div>
+<div id="chatinput"><input id="typebox" placeholder="Type to jarvis (routes like speech; works while paused/muted)" autocomplete="off"><button class="btn" id="btype">SEND</button></div>
+<div id="bar"><button class="btn" id="bexp">EXPAND (t)</button><button class="btn" id="braw">RAW (r)</button><span id="jump" class="btn" style="display:none">&#8595; latest</span></div>
+</div>
 </div>
 <div id="right">
 <div id="nextpanel" class="panel" style="display:none"></div>
 <div id="work" class="panel"></div>
-<div id="schedpanel" class="panel" style="display:none"></div>
+<div id="holdpanel" class="panel" style="display:none"></div>
 <div id="archpanel" class="panel" style="display:none"></div>
+<div id="calcard" class="panel">
+<div id="schedpanel"></div>
+<div id="calbar"><button class="btn" id="bcal">SCHEDULE</button></div>
+<div id="notifybar"><span class="ntlabel" title="phone push via ntfy">&#128241;</span><input id="nturl" placeholder="ntfy URL — https://ntfy.sh/topic or your Tailscale ntfy" autocomplete="off"><button class="btn" id="ntsave">SAVE</button><button class="btn" id="nttest" title="send a test push to your phone">TEST</button><span id="ntstatus" class="ntstatus">off</span></div>
+<div id="calbox" style="display:none"><textarea id="caltext" placeholder="Paste your calendar agenda here (titles + 3:00 PM-4:00 PM lines)"></textarea><button class="btn" id="bcalsave">LOAD SCHEDULE</button></div>
+</div>
 </div>
 </div>
 <script src="/console.js"></script></body></html>

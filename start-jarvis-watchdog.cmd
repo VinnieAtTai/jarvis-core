@@ -11,7 +11,9 @@ REM   To stop the hub for good: close this window, or press Ctrl+C and answer Y.
 REM
 REM Operational note: under this watchdog, `jarvis shutdown` becomes a RESTART
 REM (node exits, the loop brings it back with whatever source is on disk) -- which
-REM is also the simplest deploy: edit source, say "jarvis shutdown", done.
+REM is also the simplest deploy: edit source, say "jarvis shutdown", done. The
+REM console's WIND DOWN button is the exception: it writes a STOP sentinel so the
+REM watchdog does a REAL stop (see :loop below) instead of relaunching.
 REM
 REM Boot-persistence (start automatically at Windows logon) is NOT handled here.
 REM Pick one, in increasing robustness:
@@ -29,6 +31,10 @@ cd /d "%~dp0"
 :loop
 echo [watchdog] starting jarvis-core at %date% %time%
 node jarvis-core.mjs
+REM A wind-down writes a STOP sentinel (in %LOCALAPPDATA%\jarvis, the default JARVIS_DATA) to
+REM signal a REAL stop rather than a restart. If present, delete it and exit instead of relaunching.
+if exist "%LOCALAPPDATA%\jarvis\STOP" ( echo [watchdog] WIND-DOWN stop sentinel found -- stopping for the night. & del /q "%LOCALAPPDATA%\jarvis\STOP" >nul 2>&1 & goto end )
 echo [watchdog] jarvis-core exited (code %errorlevel%) -- relaunching in 2s. Ctrl+C to stop.
 timeout /t 2 /nobreak >nul
 goto loop
+:end

@@ -15,7 +15,9 @@ let expanded = false, rawMode = false, pinned = true;
 let focusCS = 'jarvis', chatEvts = [], lastChatPayload = '';
 let lastTokens = null;
 let lastArchive = null;
+let lastHold = null;
 let activeTab = 'all';
+let nsRepos = [];
 
 function fmtTok(n) {
     if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
@@ -43,6 +45,77 @@ async function pollHeat() {
 function setStatus(cls, text) { statusEl.className = cls; document.getElementById('stext').textContent = text; }
 function esc(t) { return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }
 function escAttr(t) { return esc(t).split('"').join('&quot;'); }
+function b64(s) { return btoa(unescape(encodeURIComponent(String(s)))); }
+function unb64(s) { return decodeURIComponent(escape(atob(s))); }
+// Click-to-copy: any element with data-copy="<base64 text>" copies on click. Works in the
+// Playwright console (clipboard-write is granted to the context; falls back to execCommand).
+function doCopy(txt, el) {
+    const flash = (cls) => { if (!el) return; el.classList.add(cls); setTimeout(() => el.classList.remove('copied', 'copyfail'), 700); };
+    const fallback = () => {
+        const ta = document.createElement('textarea');
+        ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.focus(); ta.select();
+        let okFlag = false; try { okFlag = document.execCommand('copy'); } catch { okFlag = false; }
+        document.body.removeChild(ta); flash(okFlag ? 'copied' : 'copyfail');
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(() => flash('copied')).catch(fallback);
+    else fallback();
+}
+// Single delegated, capture-phase handler so copy works anywhere (chat, cards, archive, hold)
+// and fires before each panel's own click handler without needing to touch them.
+document.addEventListener('click', (e) => {
+    const t = e.target.closest ? e.target.closest('[data-copy]') : null;
+    if (!t) return;
+    e.stopPropagation(); e.preventDefault();
+    doCopy(unb64(t.getAttribute('data-copy')), t);
+}, true);
+// Hover any copyable path/URL token -> floating menu to open it in Explorer or Chrome.
+const pathfly = document.createElement('div');
+pathfly.id = 'pathfly'; pathfly.style.display = 'none';
+document.body.appendChild(pathfly);
+let pathflyTimer = null;
+function showPathFly(tok) {
+    clearTimeout(pathflyTimer);
+    const val = unb64(tok.getAttribute('data-copy') || '');
+    if (!val) return;
+    const isUrl = /^https?:\/\//i.test(val);
+    let h = '';
+    if (!isUrl) h += '<span class="pathact" data-revealpath="' + b64(val) + '">&#128193; Explorer</span>';
+    h += '<span class="pathact" data-openpath="' + b64(val) + '">&#127760; ' + (isUrl ? 'Open in Chrome' : 'Chrome') + '</span>';
+    pathfly.innerHTML = h;
+    const r = tok.getBoundingClientRect();
+    pathfly.style.left = Math.round(r.left) + 'px';
+    pathfly.style.top = Math.round(r.bottom + 2) + 'px';
+    pathfly.style.display = 'block';
+}
+function hidePathFlySoon() { clearTimeout(pathflyTimer); pathflyTimer = setTimeout(() => { pathfly.style.display = 'none'; }, 280); }
+document.addEventListener('mouseover', (e) => { const t = e.target.closest ? e.target.closest('.pathtok') : null; if (t) showPathFly(t); });
+document.addEventListener('mouseout', (e) => { const t = e.target.closest ? e.target.closest('.pathtok') : null; if (t) hidePathFlySoon(); });
+pathfly.addEventListener('mouseover', () => clearTimeout(pathflyTimer));
+pathfly.addEventListener('mouseleave', hidePathFlySoon);
+pathfly.addEventListener('click', (e) => {
+    const rev = e.target.closest ? e.target.closest('[data-revealpath]') : null;
+    if (rev) { fetch('/reveal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: unb64(rev.getAttribute('data-revealpath')) }) }).catch(() => { }); pathfly.style.display = 'none'; return; }
+    const op = e.target.closest ? e.target.closest('[data-openpath]') : null;
+    if (op) { fetch('/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: unb64(op.getAttribute('data-openpath')) }) }).catch(() => { }); pathfly.style.display = 'none'; return; }
+});
+// Turn every URL and drive-letter file path inside free text into a click-to-copy token.
+// Non-matching text is escaped; matches are escaped for display but carry the raw value (b64)
+// for the clipboard. Trailing sentence punctuation is left outside the token.
+function linkify(raw) {
+    const re = /(https?:\/\/[^\s<>"']+|[A-Za-z]:[\\\/][^\s<>"']*)/g;
+    let out = '', last = 0, m;
+    while ((m = re.exec(raw))) {
+        out += esc(raw.slice(last, m.index));
+        let tok = m[0], trail = '';
+        const tm = tok.match(/[).,;:!?\]]+$/);
+        if (tm) { trail = tok.slice(tok.length - tm[0].length); tok = tok.slice(0, tok.length - tm[0].length); }
+        out += '<span class="cpy pathtok" data-copy="' + b64(tok) + '" title="click to copy; hover to open">' + esc(tok) + '</span>' + esc(trail);
+        last = m.index + m[0].length;
+    }
+    out += esc(raw.slice(last));
+    return out;
+}
 
 const REMOJI = { up: '👍', love: '❤️', squee: '🤩', fire: '🔥', down: '👎', poop: '💩' };
 function renderChat() {
@@ -68,7 +141,7 @@ function renderChat() {
         // Ordered happiest -> poop: squee, fire, love, up (positives, descending), then down, poop.
         const reactBar = '<span class="reacts">' + ['squee', 'fire', 'love', 'up', 'down', 'poop'].map(k => '<span class="rx' + (cur === k ? ' on' : '') + '" data-react="' + k + '" data-ts="' + escAttr(g.ts || '') + '">' + REMOJI[k] + '</span>').join('') + '</span>';
         return '<div class="row ' + (me ? 'me' : 'them') + '"><div class="bubble">' + chip
-            + esc(g.texts.join('\n')).split('\n').join('<br>')
+            + linkify(g.texts.join('\n')).split('\n').join('<br>')
             + (g.img ? '<br><a href="' + g.img + '" target="_blank"><img src="' + g.img + '" class="thumb"></a>' : '')
             + '<span class="t">' + (g.ts || '').slice(11, 16) + '</span>'
             + '<span class="copybtn" data-c="' + btoa(unescape(encodeURIComponent(g.texts.join('\n')))) + '" title="copy">📋</span>' + reactBar + '</div></div>';
@@ -137,6 +210,30 @@ document.addEventListener('keydown', e => {
     if (e.key === 't') setExpanded(!expanded);
     if (e.key === 'r') setRaw(!rawMode);
 });
+// Phone alerts (ntfy) — set the topic URL, save, and fire a test push.
+async function loadNotify() {
+    try {
+        const r = await (await fetch('/notify')).json();
+        const el = document.getElementById('nturl');
+        if (el && document.activeElement !== el) el.value = r.url || '';
+        const st = document.getElementById('ntstatus');
+        if (st) { st.textContent = r.configured ? 'on' : 'off'; st.className = 'ntstatus' + (r.configured ? ' on' : ''); }
+    } catch { }
+}
+document.getElementById('ntsave').onclick = async () => {
+    const url = document.getElementById('nturl').value.trim();
+    try { await fetch('/notify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) }); } catch { }
+    loadNotify();
+};
+document.getElementById('nttest').onclick = async () => {
+    const st = document.getElementById('ntstatus');
+    try {
+        const r = await fetch('/notify-test', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+        if (st) { st.textContent = r.ok ? 'test sent ✓' : 'set a URL first'; }
+    } catch { if (st) st.textContent = 'failed'; }
+    setTimeout(loadNotify, 1500);
+};
+loadNotify();
 
 const boardExpand = new Set();
 let lastBoard = null, lastSched = null;
@@ -146,6 +243,14 @@ function fmtClock(iso) {
     const m = d.getMinutes(), ap = h >= 12 ? 'PM' : 'AM';
     h = h % 12 || 12;
     return h + ':' + String(m).padStart(2, '0') + ' ' + ap;
+}
+// human countdown to a future ms-delta: "in 8 min" / "in 1 hr 20 min"
+function fmtCountdown(ms) {
+    const totalMin = Math.round(ms / 60000);
+    if (totalMin <= 0) return 'now';
+    if (totalMin < 60) return 'in ' + totalMin + ' min';
+    const h = Math.floor(totalMin / 60), m = totalMin % 60;
+    return 'in ' + h + ' hr' + (h > 1 ? 's' : '') + (m ? ' ' + m + ' min' : '');
 }
 // 3-letter category chips derived from a leading TAG: in the task text (BUG:/SECURITY:/...).
 // [code, full-label-for-tooltip, color-class]. The tag is stripped from the visible text and
@@ -182,43 +287,74 @@ function renderBoards(d) {
             h += '<span class="evic" data-open="' + esc(e.join) + '" title="join ' + esc(e.joinKind || 'meeting') + '">' + ic + '</span>';
         }
         if (e.link) h += '<span class="evic" data-open="' + esc(e.link) + '" title="open invite">📅</span>';
-        return h ? '<span class="evicons">' + h + '</span>' : '';
+        h += '<span class="evic evtask" data-mtask="' + b64(e.title || '') + '" title="add as a JARVIS task to work on">&#10133;</span>';
+        return '<span class="evicons">' + h + '</span>';
     };
-    let top = '';
+    let top = '', imminent = false;
     if (lastSched && (lastSched.current || lastSched.next)) {
-        const nmRow = (label, e, time) => '<div class="evrow"><span><span class="nmlabel">' + label + '</span> ' + esc(e.title) + ' <span class="nmtime">' + time + '</span></span>' + evIcons(e) + '</div>';
-        top = (lastSched.current ? nmRow('NOW', lastSched.current, 'until ' + fmtClock(lastSched.current.end)) : '')
-            + (lastSched.next ? nmRow('NEXT', lastSched.next, fmtClock(lastSched.next.start)) : '');
+        const now = Date.now();
+        const rows = [];
+        if (lastSched.current) {
+            const e = lastSched.current, s = Date.parse(e.start), en = Date.parse(e.end);
+            const leftMin = Math.max(0, Math.round((en - now) / 60000));
+            const pct = en > s ? Math.min(100, Math.max(0, Math.round((now - s) / (en - s) * 100))) : 0;
+            rows.push('<div class="evrow nmrow"><span><span class="nmlabel now">NOW</span> ' + esc(e.title)
+                + ' <span class="nmtime">' + (leftMin ? leftMin + ' min left' : 'wrapping up') + '</span></span>' + evIcons(e) + '</div>'
+                + '<div class="nmbar"><div class="nmbarfill" style="width:' + pct + '%"></div></div>');
+        }
+        if (lastSched.next) {
+            const e = lastSched.next, ms = Date.parse(e.start) - now, soon = ms <= 300000;
+            if (soon) imminent = true;
+            const cd = ms <= 0 ? 'starting now' : fmtCountdown(ms);
+            rows.push('<div class="evrow nmrow"><span><span class="nmlabel next' + (soon ? ' soon' : '') + '">NEXT</span> ' + esc(e.title)
+                + ' <span class="nmtime nmcd' + (soon ? ' soon' : '') + '">' + cd + ' · ' + fmtClock(e.start) + '</span></span>' + evIcons(e) + '</div>');
+        }
+        top = rows.join('');
+    }
+    if (!top && lastSched && lastSched.events && lastSched.events.length) {
+        top = '<div class="nmclear">&#127881; That\'s the lot - day\'s clear.</div>';
     }
     let sched = '';
     if (lastSched && lastSched.events && lastSched.events.length) {
+        const now = Date.now();
         sched = '<div class="bhead" style="margin-top:0">SCHEDULE</div>' + lastSched.events.map(e => {
-            const past = Date.parse(e.end) < Date.now();
-            return '<div class="witem evrow" style="color:' + (past ? '#566270' : '#9bb0c4') + '"><span>' + fmtClock(e.start) + '  ' + esc(e.title) + '</span>' + (past ? '' : evIcons(e)) + '</div>';
+            const s = Date.parse(e.start), en = Date.parse(e.end);
+            const past = en < now, cur = s <= now && now < en;
+            const col = past ? '#566270' : cur ? '#e8c35a' : '#9bb0c4';
+            return '<div class="witem evrow" style="color:' + col + (cur ? ';font-weight:bold' : '') + '"><span>' + fmtClock(e.start) + '  ' + esc(e.title) + '</span>' + (past ? '' : evIcons(e)) + '</div>';
         }).join('');
     }
     const np = document.getElementById('nextpanel'), sp = document.getElementById('schedpanel');
     np.innerHTML = top; np.style.display = top ? 'block' : 'none';
+    np.classList.toggle('imminent', imminent);
     sp.innerHTML = sched; sp.style.display = sched ? 'block' : 'none';
     const prio = b => b.pendingPerm ? 2 : b.needsYou ? 1 : 0;   // float perm/needs-you cards to the top
     workEl.innerHTML = d.boards.slice().sort((a, b) => prio(b) - prio(a)).map(b => {
         const queued = b.queued || [], done = b.done || [], working = b.working || [], review = b.review || [];
         const cs = b.callsign;
-        if (cs === 'jarvis' && cs !== d.focus && !working.length && !queued.length && !done.length && !review.length) return '';
         const dead = b.alive === false && cs !== 'jarvis';
         const focused = cs === d.focus;
         let btns = '';
+        const holdBtn = '<span class="cbtn" data-act="hold" data-cs="' + esc(cs) + '" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="park on hold (resume later — distinct from closing)">💤</span>';
         if (dead) {
             btns += '<span class="cbtn" data-act="continue" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="continue: launch a fresh worker for this job">🚀</span>';
+            btns += holdBtn;
             btns += '<span class="cbtn" data-act="close" data-cs="' + esc(cs) + '" title="remove from board">✕</span>';
         } else if (cs !== 'jarvis') {
             if (!focused) btns += '<span class="cbtn" data-act="focus" data-cs="' + esc(cs) + '" title="focus">★</span>';
             btns += '<span class="cbtn" data-act="voicemute" data-cs="' + esc(cs) + '" data-on="' + (b.voiceMuted ? '0' : '1') + '" title="' + (b.voiceMuted ? 'voice muted - click to unmute' : 'silence this session voice') + '">' + (b.voiceMuted ? '🔇' : '🔊') + '</span>';
+            btns += holdBtn;
             btns += '<span class="cbtn" data-act="restart" data-uid="' + esc(b.uid || '') + '" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="restart: retire then relaunch">↻</span>';
             btns += '<span class="cbtn" data-act="close" data-cs="' + esc(cs) + '" title="close / retire">✕</span>';
+        } else if (cs === 'jarvis') {
+            btns += '<span class="cbtn" data-act="spawnjarvis" title="stand up a worker on jarvis-core to work the punchlist">🚀</span>';
+            btns += '<span class="cbtn" data-act="rebuild" title="rebuild: restart the hub with the latest jarvis-core code">↻</span>';
         }
-        const ctx = (typeof b.context === 'number') ? ' <span style="color:' + (b.context >= 80 ? '#e06c6c' : b.context >= 60 ? '#d9a05d' : '#5dd97c') + '">' + b.context + '%</span>' : '';
-        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + ctx + '</span><span class="cbtns">' + btns + '</span></div>';
+        let bctx = b.context;
+        if (cs === 'jarvis' && typeof bctx !== 'number') { const jw = (d.boards || []).find(x => x.alive && /jarvis-core/i.test(x.cwd || '') && typeof x.context === 'number'); if (jw) bctx = jw.context; }
+        const ctx = (typeof bctx === 'number') ? ' <span style="color:' + (bctx >= 80 ? '#e06c6c' : bctx >= 60 ? '#d9a05d' : '#5dd97c') + '">' + bctx + '%</span>' : '';
+        const cwdChip = b.cwd ? '<span class="cpybtn pathtok" data-copy="' + b64(b.cwd) + '" title="copy path: ' + escAttr(b.cwd) + '">📋</span>' : '';
+        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + ctx + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
         const purpose = b.purpose ? '<div class="cpurpose">' + esc(b.purpose) + '</div>' : '';
         const doing = (b.needsYou || b.doing) ? '<div class="bdoing">' + (b.needsYou ? '<span class="needs">NEEDS YOU</span> ' : '') + esc(b.doing || '') + '</div>' : '';
         const counts = (working.length || queued.length || review.length || done.length) ? '<div class="ccount">'
@@ -228,7 +364,9 @@ function renderBoards(d) {
             + (done.length ? '<span class="cnum done">' + done.length + ' done</span>' : '') + '</div>' : '';
         // Clean one-line task (glyph + text, consistent left edge); notes (if any) make the
         // whole line clickable and drop full-width below — no leading indent, no double glyph.
-        const item = (i, list, mark) => {
+        const _laneArrs = { review, working, queued, done };
+        const _laneOff = {}; { let _c = 0; for (const _L of ['review', 'working', 'queued', 'done']) { _laneOff[_L] = _c; _c += (_laneArrs[_L] || []).length; } }
+        const item = (i, list, mark, num) => {
             const obj = i && typeof i === 'object';
             const txt = obj ? (i.text == null ? '' : i.text) : i;
             const id = obj ? (i.id || '') : '';
@@ -238,6 +376,7 @@ function renderBoards(d) {
             if (list === 'queued') acts += a('top', '&#9650;', 'move to top of queue');
             if (list === 'review') {
                 acts += a('done', '&#10003;', 'approve &#8594; done');
+                acts += a('ready', '&#8634;', 'back to queue');
                 acts += a('start', '&#8635;', 'send back to working');
             } else {
                 acts += a('review', '&#9678;', 'move to review');
@@ -253,7 +392,7 @@ function renderBoards(d) {
             // chip is derived from a leading TAG: and stripped from the visible text; data-t above
             // keeps the FULL original text so op matching is unaffected.
             const tc = chipFor(txt);
-            return '<div class="witem ' + list + '"' + dx + '><span class="wleft"><span class="wtext">' + mark + ' ' + tc.chip + esc(tc.rest) + '</span>' + dot + '</span><span class="rowacts">' + acts + '</span>' + noteBody + '</div>';
+            return '<div class="witem ' + list + '"' + dx + '><span class="wleft"><span class="wtext"><span class="wnum">' + num + '</span> ' + mark + ' ' + tc.chip + esc(tc.rest) + '</span>' + dot + '</span><span class="rowacts">' + acts + '</span>' + noteBody + '</div>';
         };
         // Top 3 per lane + a "N more" expander; the done lane defaults to FULLY collapsed (history).
         const lane = (items, list, mark) => {
@@ -261,7 +400,7 @@ function renderBoards(d) {
             const open = boardExpand.has(cs + ':' + list);
             const cap = list === 'done' ? 0 : 3;
             const vis = open ? items : items.slice(0, cap);
-            let h = vis.map(i => item(i, list, mark)).join('');
+            let h = vis.map((it, j) => item(it, list, mark, _laneOff[list] + j + 1)).join('');
             if (items.length > cap) {
                 const label = open ? '&#9662; less' : '&#9656; ' + (cap ? (items.length - cap) + ' more ' + list : items.length + ' ' + list);
                 h += '<div class="ctoggle" data-x="' + cs + ':' + list + '">' + label + '</div>';
@@ -278,7 +417,10 @@ function renderBoards(d) {
         } else if (hiddenN) {
             tasks = '<div class="ctoggle" data-x="' + cs + ':card">&#9656; show ' + hiddenN + ' task' + (hiddenN > 1 ? 's' : '') + '</div>';
         }
-        const perm = b.pendingPerm ? '<div class="permreq"><div class="permhead">&#9888; wants to run <b>' + esc(b.pendingPerm.tool) + '</b></div><div class="permdetail">' + esc((b.pendingPerm.detail || '').slice(0, 240)) + '</div><div class="permbtns"><span class="pbtn ok" data-act="approve" data-permid="' + esc(b.pendingPerm.id) + '">Approve</span><span class="pbtn no" data-act="deny" data-permid="' + esc(b.pendingPerm.id) + '">Deny</span><span class="pbtn" data-act="always" data-permid="' + esc(b.pendingPerm.id) + '">Always</span></div></div>' : '';
+        const pp = b.pendingPerm;
+        const pcount = b.pendingPermCount || 0;
+        const batch = pcount > 1 ? '<div class="permbatch"><span class="pbtn ok" data-act="approveall" data-cs="' + esc(b.callsign) + '">Approve all (' + pcount + ')</span><span class="pbtn no" data-act="denyall" data-cs="' + esc(b.callsign) + '">Deny all</span></div>' : '';
+        const perm = pp ? '<div class="permreq' + (pp.klass === 'danger' ? ' permdanger' : '') + '"><div class="permhead">' + (pp.klass === 'danger' ? '&#9888; RISKY: ' : '&#9888; ') + 'wants to run <b>' + esc(pp.tool) + '</b></div><div class="permdetail">' + esc((pp.detail || '').slice(0, 240)) + '</div><div class="permbtns"><span class="pbtn ok" data-act="approve" data-permid="' + esc(pp.id) + '">Approve</span><span class="pbtn no" data-act="deny" data-permid="' + esc(pp.id) + '">Deny</span><span class="pbtn" data-act="always" data-permid="' + esc(pp.id) + '" title="auto-allow this command family from now on">Always: ' + esc(pp.label || pp.tool) + '</span></div>' + batch + '</div>' : '';
         return '<div class="card' + (focused ? ' cfocus' : '') + (dead ? ' cdead' : '') + ((b.needsYou || b.pendingPerm) ? ' cneeds' : '') + '">' + head + purpose + perm + doing + counts + tasks + '</div>';
     }).join('');
     const deadN = d.boards.filter(b => b.alive === false && b.callsign !== 'jarvis').length;
@@ -297,17 +439,28 @@ workEl.onclick = (e) => {
     if (act === 'focus') post('/focus', { callsign: t.getAttribute('data-cs') });
     else if (act === 'close') post('/forget', { callsign: t.getAttribute('data-cs') });
     else if (act === 'continue') post('/spawn', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
+    else if (act === 'spawnjarvis') post('/spawn', { cwd: 'd:/claude/jarvis-core', purpose: 'JARVIS punchlist' });
+    else if (act === 'rebuild') { if (confirm('Rebuild JARVIS now? Restarts the hub with the latest jarvis-core code. Live sessions ride it out. Heads-up: this resets the in-memory token gauge.')) post('/restart', {}); }
     else if (act === 'restart') post('/retire', { uid: t.getAttribute('data-uid'), summary: 'Restarted from console.', successor: true });
+    else if (act === 'hold') post('/hold', { callsign: t.getAttribute('data-cs'), cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
     else if (act === 'voicemute') post('/voicemute', { callsign: t.getAttribute('data-cs'), on: t.getAttribute('data-on') === '1' });
     else if (act === 'continueall' && lastBoard) lastBoard.boards.filter(b => b.alive === false && b.callsign !== 'jarvis' && b.cwd && b.purpose).forEach(b => post('/spawn', { cwd: b.cwd, purpose: b.purpose }));
     else if (act === 'approve') post('/permission-answer', { id: t.getAttribute('data-permid'), decision: 'allow' });
     else if (act === 'deny') post('/permission-answer', { id: t.getAttribute('data-permid'), decision: 'deny' });
     else if (act === 'always') post('/permission-answer', { id: t.getAttribute('data-permid'), decision: 'always' });
+    else if (act === 'approveall') post('/permission-answer-all', { callsign: t.getAttribute('data-cs'), decision: 'allow' });
+    else if (act === 'denyall') post('/permission-answer-all', { callsign: t.getAttribute('data-cs'), decision: 'deny' });
 };
 document.addEventListener('click', (e) => {
     const t = e.target.closest ? e.target.closest('[data-open]') : null;
     if (!t) return;
     fetch('/open', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: t.getAttribute('data-open') }) }).catch(() => { });
+});
+document.addEventListener('click', (e) => {
+    const t = e.target.closest ? e.target.closest('[data-mtask]') : null;
+    if (!t) return;
+    const title = unb64(t.getAttribute('data-mtask'));
+    fetch('/worklist', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op: 'add', text: title, callsign: 'jarvis' }) }).then(() => { t.style.color = '#5dd97c'; t.textContent = '✓'; }).catch(() => { });
 });
 let isMuted = false;
 window.__setMute = (on) => {
@@ -332,13 +485,37 @@ window.__setPause = (on) => {
 document.getElementById('bpause').onclick = () => {
     fetch('/pause', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ on: !isPaused }) }).catch(() => { });
 };
+const jvmenu = document.getElementById('jvmenu');
+document.getElementById('bjv').onclick = (e) => { e.stopPropagation(); jvmenu.style.display = jvmenu.style.display === 'none' ? 'block' : 'none'; };
+document.addEventListener('click', () => { if (jvmenu) jvmenu.style.display = 'none'; });
+document.getElementById('jvrestart').onclick = () => {
+    jvmenu.style.display = 'none';
+    if (!confirm('Restart JARVIS now?\n\nRelaunches the hub with the latest code. Live sessions keep running (their poll loops ride out the bounce). Any pending permission prompt is dropped and will re-ask.')) return;
+    fetch('/restart', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => { });
+    if (typeof setStatus === 'function') setStatus('muted', 'RESTARTING…');
+};
+document.getElementById('jvwind').onclick = async () => {
+    jvmenu.style.display = 'none';
+    let plan = null;
+    try { plan = await (await fetch('/winddown', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ dry: true }) })).json(); } catch { }
+    let msg = 'Wind down JARVIS for the night?\n\nThis asks every live session to checkpoint a handoff and retire (no successors), then stops the hub.';
+    if (plan && plan.sessions) {
+        const live = plan.sessions.map(s => s.cs + (s.dirty && s.dirty !== 0 ? ' (' + s.dirty + ' uncommitted)' : '')).join(', ') || 'none';
+        msg += '\n\nLive: ' + live;
+        const dirty = plan.sessions.filter(s => s.dirty && s.dirty !== 0);
+        if (dirty.length) msg += '\n\nWARNING - uncommitted work in: ' + dirty.map(s => s.cs + ' [' + s.cwd + ']').join('; ') + '\nCommit/push those first if you want them saved.';
+    }
+    if (!confirm(msg)) return;
+    fetch('/winddown', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) }).catch(() => { });
+    if (typeof setStatus === 'function') setStatus('muted', 'WINDING DOWN…');
+};
 const typeBox = document.getElementById('typebox');
 function sendTyped() {
     const t = typeBox.value.trim();
     if (!t) return;
     typeBox.value = '';
-    const sess = activeTab && activeTab !== 'all' && activeTab !== 'general';
-    const out = sess ? ('on ' + activeTab + ', ' + t) : t;
+    const sess = activeTab && activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
+    const out = activeTab === 'jarvis' ? ('jarvis ' + t) : sess ? ('on ' + activeTab + ', ' + t) : t;
     fetch('/hear', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: out, typed: true }) }).catch(() => { });
 }
 typeBox.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); sendTyped(); } e.stopPropagation(); });
@@ -348,7 +525,7 @@ function attachFile(f) {
     r.onload = () => {
         const b64 = String(r.result).split(',')[1] || '';
         if (!b64) return;
-        const cs = (activeTab && activeTab !== 'all' && activeTab !== 'general') ? activeTab : '';
+        const cs = (activeTab && activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis') ? activeTab : '';
         fetch('/attach', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callsign: cs, data: b64, name: f.name || 'paste.png' }) }).catch(() => { });
     };
     r.readAsDataURL(f);
@@ -382,13 +559,15 @@ function renderArchive(d) {
     if (open) {
         html += items.slice(0, 50).map(a => {
             const cont = (a.cwd && a.purpose) ? '<span class="ract" data-act="continue" data-cwd="' + escAttr(a.cwd) + '" data-purpose="' + escAttr(a.purpose) + '" title="continue this job (restores its handoff)">&#128640;</span>' : '';
+            const park = (a.cwd && a.purpose) ? '<span class="ract" data-act="holdarchive" data-cwd="' + escAttr(a.cwd) + '" data-purpose="' + escAttr(a.purpose) + '" data-cs="' + esc(a.callsign || '') + '" title="put this project on hold (resume later)">&#128164;</span>' : '';
             const hf = a.hasHandoff ? '<span style="color:#5db4d9" title="left handoff notes">&#9678;</span>' : '';
             const title = a.purpose || a.summary || '(untitled session)';
             const sm = (a.summary || '').trim().toLowerCase();
             const isStub = sm === 'closed from console.' || sm === 'restarted from console.' || sm === 'closed from console' || sm === 'restarted from console';
             const epi = (a.summary && a.summary !== a.purpose && !isStub) ? '<span class="aepi">' + esc(a.summary) + '</span>' : '';
             const tip = (a.summary && !isStub) ? a.summary : (a.purpose || '');
-            return '<div class="arow"><span class="achip">' + esc((a.callsign || '?').toUpperCase()) + '</span><span class="asum"><span class="atitle" title="' + escAttr(tip) + '">' + esc(title) + '</span>' + epi + '</span>' + hf + cont + '</div>';
+            const acwd = a.cwd ? '<span class="cpybtn pathtok" data-copy="' + b64(a.cwd) + '" title="copy path: ' + escAttr(a.cwd) + '">📋</span>' : '';
+            return '<div class="arow"><span class="achip">' + esc((a.callsign || '?').toUpperCase()) + '</span><span class="asum"><span class="atitle" title="' + escAttr(tip) + '">' + esc(title) + '</span>' + epi + '</span>' + acwd + hf + park + cont + '</div>';
         }).join('');
     }
     ap.innerHTML = html;
@@ -401,37 +580,106 @@ async function pollArchive() {
 document.getElementById('archpanel').onclick = (e) => {
     const t = e.target.closest ? e.target.closest('[data-x],[data-act]') : null;
     if (!t) return;
+    const post = (url, body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).catch(() => { });
     const x = t.getAttribute('data-x');
     if (x) { if (boardExpand.has(x)) boardExpand.delete(x); else boardExpand.add(x); if (lastArchive) renderArchive(lastArchive); return; }
-    if (t.getAttribute('data-act') === 'continue') {
-        fetch('/spawn', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') }) }).catch(() => { });
+    const act = t.getAttribute('data-act');
+    if (act === 'continue') post('/spawn', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
+    else if (act === 'holdarchive') post('/hold', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose'), callsign: t.getAttribute('data-cs') });
+};
+// ON HOLD — projects parked for later (distinct from Archive=finished). Pull back to resume.
+function renderHold(d) {
+    lastHold = d;
+    const hp = document.getElementById('holdpanel');
+    const items = (d && d.items) || [];
+    if (!items.length) { hp.style.display = 'none'; return; }
+    const open = boardExpand.has('hold:open');
+    let html = '<div class="bhead holdhead" style="cursor:pointer;margin-top:0" data-x="hold:open">' + (open ? '&#9662;' : '&#9656;') + ' &#128164; ON HOLD (' + items.length + ')</div>';
+    if (open) {
+        html += items.slice(0, 50).map(h => {
+            const resume = '<span class="ract" data-act="resume" data-key="' + escAttr(h.key || '') + '" data-cwd="' + escAttr(h.cwd || '') + '" data-purpose="' + escAttr(h.purpose || '') + '" title="pull back: resume this project now">&#128640;</span>';
+            const drop = '<span class="ract del" data-act="drophold" data-key="' + escAttr(h.key || '') + '" data-cs="' + esc(h.callsign || '') + '" title="remove from on hold (keeps archive history)">&#128465;</span>';
+            const hf = h.hasHandoff ? '<span style="color:#5db4d9" title="has handoff notes">&#9678;</span>' : '';
+            const title = h.purpose || h.summary || '(parked project)';
+            const epi = (h.summary && h.summary !== h.purpose) ? '<span class="aepi">' + esc(h.summary) + '</span>' : '';
+            const tip = h.summary || h.purpose || '';
+            const hcwd = h.cwd ? '<span class="cpybtn pathtok" data-copy="' + b64(h.cwd) + '" title="copy path: ' + escAttr(h.cwd) + '">📋</span>' : '';
+            return '<div class="arow"><span class="achip">' + esc((h.callsign || '?').toUpperCase()) + '</span><span class="asum"><span class="atitle" title="' + escAttr(tip) + '">' + esc(title) + '</span>' + epi + '</span>' + hcwd + hf + resume + drop + '</div>';
+        }).join('');
     }
+    hp.innerHTML = html;
+    hp.style.display = 'block';
+}
+async function pollHold() {
+    try { renderHold(await (await fetch('/hold')).json()); } catch { }
+    setTimeout(pollHold, 8000);
+}
+document.getElementById('holdpanel').onclick = (e) => {
+    const t = e.target.closest ? e.target.closest('[data-x],[data-act]') : null;
+    if (!t) return;
+    const post = (url, body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).catch(() => { });
+    const x = t.getAttribute('data-x');
+    if (x) { if (boardExpand.has(x)) boardExpand.delete(x); else boardExpand.add(x); if (lastHold) renderHold(lastHold); return; }
+    const act = t.getAttribute('data-act');
+    if (act === 'resume') post('/unhold', { key: t.getAttribute('data-key'), cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
+    else if (act === 'drophold') post('/unhold', { key: t.getAttribute('data-key'), callsign: t.getAttribute('data-cs'), drop: true });
 };
 function eventsForTab() {
     if (activeTab === 'all') return chatEvts;
     if (activeTab === 'general') return chatEvts.filter(e => e.kind === 'sys' || e.who === 'jarvis' || (e.who === 'you' && !e.to));
+    if (activeTab === 'jarvis') return chatEvts.filter(e => e.who === 'jarvis' || (e.who === 'you' && (!e.to || e.to === 'jarvis')));
     return chatEvts.filter(e => e.kind !== 'sys' && (e.who === activeTab || (e.who === 'you' && e.to === activeTab)));
 }
 function renderTabs() {
     const sessions = lastBoard ? lastBoard.boards.filter(b => b.callsign !== 'jarvis' && b.alive !== false) : [];
-    const ids = ['all', 'general'].concat(sessions.map(b => b.callsign));
+    const ids = ['all', 'general', 'jarvis'].concat(sessions.map(b => b.callsign));
     if (!ids.includes(activeTab)) activeTab = 'all';
-    let html = ['all', 'general'].map(id => '<span class="stab' + (id === activeTab ? ' active' : '') + '" data-tab="' + id + '">' + id.toUpperCase() + '</span>').join('');
+    let html = ['all', 'general', 'jarvis'].map(id => '<span class="stab' + (id === activeTab ? ' active' : '') + '" data-tab="' + id + '">' + id.toUpperCase() + '</span>').join('');
     html += sessions.map(b => '<span class="stab' + (b.callsign === activeTab ? ' active' : '') + (b.needsYou ? ' needs' : '') + '" data-tab="' + esc(b.callsign) + '">' + esc(b.callsign.toUpperCase()) + (b.needsYou ? '<span class="sbadge">!</span>' : '') + '</span>').join('');
+    html += '<span class="stab plus" data-newsession="1" title="new session: spin up a fresh worker">+</span>';
     document.getElementById('stabs').innerHTML = html;
-    const sess = activeTab !== 'all' && activeTab !== 'general';
+    const sess = activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
     typeBox.placeholder = sess ? ('Message ' + activeTab + ' - no focus change') : 'Type to jarvis (routes like speech; works while paused/muted)';
 }
 document.getElementById('stabs').onclick = (e) => {
+    const plus = e.target.closest ? e.target.closest('[data-newsession]') : null;
+    if (plus) { toggleNewSession(); return; }
     const t = e.target.closest ? e.target.closest('[data-tab]') : null;
     if (!t) return;
     activeTab = t.getAttribute('data-tab');
     renderChat();
 };
+// "+" tab → inline composer: pick a repo, type a purpose, spin up a fresh worker via /spawn.
+// The new session appears as its own tab within a few seconds (renderTabs polls /board).
+async function loadNsRepos() {
+    try { const r = await (await fetch('/repos')).json(); nsRepos = r.items || []; } catch { nsRepos = []; }
+    const sel = document.getElementById('nsrepo');
+    sel.innerHTML = nsRepos.length
+        ? nsRepos.map((r, i) => '<option value="' + i + '">' + esc(r.key) + (r.defaultPurpose ? ' — ' + esc(r.defaultPurpose) : '') + '</option>').join('')
+        : '<option value="">(no repos registered)</option>';
+}
+function toggleNewSession() {
+    const box = document.getElementById('newsessbox');
+    const show = box.style.display === 'none' || !box.style.display;
+    box.style.display = show ? 'flex' : 'none';
+    if (show) loadNsRepos().then(() => document.getElementById('nspurpose').focus());
+}
+function spawnNewSession() {
+    const repo = nsRepos[Number(document.getElementById('nsrepo').value)] || nsRepos[0];
+    if (!repo) { alert('No repos registered yet — register one before spinning up a session.'); return; }
+    const purpose = document.getElementById('nspurpose').value.trim() || repo.defaultPurpose || repo.key;
+    fetch('/spawn', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cwd: repo.cwd, purpose }) }).catch(() => { });
+    document.getElementById('nspurpose').value = '';
+    document.getElementById('newsessbox').style.display = 'none';
+}
+document.getElementById('nsgo').onclick = spawnNewSession;
+document.getElementById('nscancel').onclick = () => { document.getElementById('newsessbox').style.display = 'none'; };
+document.getElementById('nspurpose').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); spawnNewSession(); } e.stopPropagation(); });
 pollChat();
 pollWork();
 pollHeat();
 pollArchive();
+pollHold();
 
 let buf = [];
 let flushTimer = null;

@@ -30,7 +30,7 @@ to your callsign on the board and hears in every announcement, and callsigns alo
 nothing to them. Make it specific ("TMS-19966 phase B visual QA", not "coding"). If your
 mission changes later, update it: `POST /describe {"uid":"<uid>","purpose":"<new line>"}`.
 
-## 2. Poll loop (your inbox and your heartbeat)
+## 2. Poll loop (your inbox) + heartbeat ping (your liveness)
 
 Run this wrapper loop as a single background Bash task, substituting your uid (CUR starts
 at 0). It silently re-polls while nothing is happening and exits only when there is
@@ -48,9 +48,22 @@ while :; do
 done
 ```
 
-- On exit it prints `{"cursor":N,"events":[...]}`. Relaunch the loop with `CUR=N` FIRST,
-  then handle the events — if you handle first and the work runs long, your inbox and
-  heartbeat are down the whole time and the human cannot reach you to redirect or stop you.
+**Also launch a heartbeat ping** as a SECOND perpetual background Bash task, once, right after
+you register. Unlike the poll loop it never exits, so it keeps your liveness fresh through a
+long agent turn that never reaches a relaunch boundary:
+
+```
+while :; do curl -s "http://127.0.0.1:8124/heartbeat?uid=<uid>" >/dev/null; sleep 30; done
+```
+
+`/heartbeat` only refreshes your `lastSeen` — no events, never blocks, costs zero model tokens.
+Without it, a single long turn (a big workflow / deep think) leaves the poll loop un-relaunched,
+`lastSeen` goes stale, and at 2 minutes the hub marks you gone-quiet and pulls focus away — comms
+dead for the whole turn. The ping prevents that; the poll loop stays your inbox.
+
+- On exit the poll loop prints `{"cursor":N,"events":[...]}`. Relaunch the loop with `CUR=N`
+  FIRST, then handle the events — if you handle first and the work runs long, your inbox is
+  down the whole time and the human cannot reach you to redirect or stop you.
   Handle ALL events in the batch in one turn (one combined response, not one per event).
   Never poll bare (a plain curl that returns empty wakes you for nothing). The hub holds
   rapid-fire speech for a few seconds so consecutive sentences arrive as one batch.
@@ -60,8 +73,9 @@ done
   asked for it, and your analysis should refer to that exact moment), `msg` (another
   session), `retire-request` (wrap up, see step 5), `retired` (you are done, stop polling).
 - An exit printing `{"error":"retired"}` means you were retired; stop, do not relaunch.
-- The running loop is your heartbeat. If it is down for 2 minutes the human is told you have
-  gone quiet. It rides out hub restarts by itself (empty response -> sleep and retry).
+- The heartbeat PING (not this loop) is what keeps you live — so even a long turn stays green.
+  If your `lastSeen` is stale for 2 minutes the human is told you have gone quiet. Both the
+  ping and the loop ride out hub restarts by themselves (empty/failed response -> sleep, retry).
 
 ## 3. Respond — text first, voice for headlines only
 
@@ -144,6 +158,16 @@ unfinished items.
   "working: F19 verify", "waiting on Chris for query results", "standing by" — it renders
   under your callsign so the human can tell waiting from working at a glance. Update it
   whenever your state changes, especially when you become blocked on the human.
+- **Permissions / self-sufficiency.** Read-only and routine build commands run WITHOUT bothering
+  the human: git status/diff/log/show/branch, ls/cat/grep/rg/find, node --check, npm run
+  lint/build/test, dotnet build/test. Only risky or out-of-repo actions raise a prompt. So favor
+  those pre-approved commands, batch shell calls (chain with `;`), and self-verify by running the
+  lint gate yourself instead of asking. Never ask the human to run something you can run.
+- **Risky actions still prompt** (rm/del, git push/reset --hard/commit, npm install, killing
+  processes, writing outside your cwd). That is intentional: surface them clearly and keep working
+  on everything else while they wait.
+- **Subagents inherit the same gate.** If you fan out Agent-tool subagents, keep them to the safe
+  command set so they do not each stack up permission prompts; do anything risky yourself.
 - Never edit files in the jarvis folder; the hub is the only writer.
 - Update the board as you start and finish things so it reflects reality.
 - If the hub is unreachable the wrapper loop retries by itself; do not exit it.

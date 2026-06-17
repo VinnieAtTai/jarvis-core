@@ -1,8 +1,8 @@
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, unlinkSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { captureScreen } from './screen.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
@@ -48,10 +48,15 @@ if (!existsSync(WORKLIST)) writeFileSync(WORKLIST, JSON.stringify({ version: WOR
 // Sweep stale spawn launch scripts (one was written per spawned callsign; each is only read
 // once at terminal launch, so leftovers from past sessions are just clutter — REVIEW.md LOW).
 try { for (const f of readdirSync(DATA)) if (/^spawn-.*\.cmd$/i.test(f)) { try { unlinkSync(join(DATA, f)); } catch { } } } catch { }
+try { unlinkSync(join(DATA, 'STOP')); } catch { } // clear any wind-down stop sentinel left from a prior run
 
 const CONSOLE_HTML = readFileSync(join(HERE, 'console.html'), 'utf8');
 const CONSOLE_CSS = readFileSync(join(HERE, 'console.css'), 'utf8');
 const CONSOLE_JS = readFileSync(join(HERE, 'console.js'), 'utf8');
+// Serve console assets fresh from disk per request (fall back to the startup copy on a read
+// error) so UI edits only need a browser refresh, not a hub restart.
+function freshAsset(name, fallback) { try { return readFileSync(join(HERE, name), 'utf8'); } catch { return fallback; } }
+const WINDDOWN_GRACE_MS = 10000; // grace for live workers to checkpoint + retire before the hub stops
 
 const transcriptCache = loadJsonl(TRANSCRIPT);
 // busBase = the absolute index of bus[0]. Persisted so the poll cursor (an absolute event
@@ -65,6 +70,26 @@ const pollWaiters = [];
 const sayQueue = [];
 const pendingPerms = new Map();
 let permSeq = 0;
+const pendingTier = new Map();
+const PERM_MULTIWORD = new Set(['git', 'npm', 'pnpm', 'yarn', 'dotnet', 'ng', 'npx', 'node', 'python', 'python3', 'pip', 'go', 'cargo', 'docker', 'kubectl', 'powershell']);
+// A coarse signature so one "Always" covers a whole command family: Bash/PowerShell collapse to
+// their leading verb ("git show abc" -> "Bash::git show"); other tools collapse to the tool name.
+function permSig(tool, detail) {
+    if (tool === 'Bash' || tool === 'PowerShell') {
+        const toks = String(detail || '').trim().split(/\s+/);
+        const n = PERM_MULTIWORD.has((toks[0] || '').toLowerCase()) ? 2 : 1;
+        return tool + '::' + toks.slice(0, n).join(' ').toLowerCase();
+    }
+    return tool + '::*';
+}
+function permLabel(tool, detail) {
+    if (tool === 'Bash' || tool === 'PowerShell') {
+        const toks = String(detail || '').trim().split(/\s+/);
+        const n = PERM_MULTIWORD.has((toks[0] || '').toLowerCase()) ? 2 : 1;
+        return toks.slice(0, n).join(' ') + ' *';
+    }
+    return tool;
+}
 let discard = false, meetingMode = false, running = true;
 let screenGrant = 0;
 let muted = false, autoMutedBy = null, consolePageRef = null;
@@ -132,8 +157,11 @@ setInterval(() => {
             s.announced[kEnd] = true;
             dirty = true;
             if (muted && autoMutedBy === e.title) {
-                setMute(false);
-                enqueueSay('Meeting over. Listening.', 'jarvis');
+                // Chris's rule: NEVER auto-unmute him. The meeting muted him; prompt him to
+                // unmute himself (force:true so it speaks through the mute) and drop our claim
+                // so the mute is now his to lift whenever he is ready.
+                autoMutedBy = null;
+                sayQueue.push({ text: e.title + ' is over. Say unmute whenever you are ready.', from: 'jarvis', force: true });
             }
         }
     }
@@ -355,6 +383,21 @@ function parseScheduleText(text) {
     return { date: new Date().toDateString(), events, announced: {} };
 }
 
+// Display-order task list for a session (matches the console card: review -> working -> queued
+// -> done). The position in this array is the 1-based index the human sees and speaks.
+function orderedTasks(board) {
+    const out = [];
+    for (const list of ['review', 'working', 'queued', 'done']) {
+        (board[list] || []).forEach((item, i) => out.push({ item, list, i }));
+    }
+    return out;
+}
+function shortTitle(s) {
+    const t = String(s).replace(/^[A-Z]{2,10}:\s*/, '').trim();
+    return t.split(/\s+/).slice(0, 7).join(' ').slice(0, 50);
+}
+const NUMWORDS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+const IDX_FILLER = new Set(['item', 'number', 'no', 'task', 'the', 'on', 'to']);
 function liveUidOf(cs) {
     const l = roster.callsigns[cs];
     if (!l || !l.length) return null;
@@ -398,6 +441,28 @@ function enqueueSay(text, from) {
     const focus = loadWork().focus;
     const spoken = (label !== 'jarvis' && label !== focus) ? label + ' says: ' + text : text;
     sayQueue.push({ text, spoken, from: label });
+    if (/^\s*need you\b/i.test(String(text || ''))) pushPhone('JARVIS - ' + label + ' needs you', text);
+}
+// --- phone push (ntfy) -------------------------------------------------------
+// Best-effort push to the human's phone for interrupt-worthy lines ("Need you:").
+// Point it at an ntfy topic URL (https://ntfy.sh/<topic>, or a self-hosted ntfy
+// reachable over Tailscale) via POST /notify, the JARVIS_NTFY_URL env var, or
+// DATA/notify.json. No URL configured -> silently does nothing. A short cooldown
+// collapses rapid-fire bursts (e.g. back-to-back permission prompts).
+let NOTIFY = { url: process.env.JARVIS_NTFY_URL || '' };
+try { NOTIFY = JSON.parse(readFileSync(join(DATA, 'notify.json'), 'utf8')); } catch { }
+function saveNotify() { try { writeFileSync(join(DATA, 'notify.json'), JSON.stringify(NOTIFY)); } catch { } }
+let lastPushAt = 0;
+function pushPhone(title, message) {
+    const url = NOTIFY && NOTIFY.url;
+    if (!url) return;
+    const now = Date.now();
+    if (now - lastPushAt < 5000) return;   // collapse bursts
+    lastPushAt = now;
+    const ascii = (t) => (String(t || '').replace(/[^\x20-\x7E]/g, '').trim().slice(0, 100) || 'JARVIS');
+    try {
+        fetch(url, { method: 'POST', headers: { 'Title': ascii(title), 'Priority': 'high', 'Tags': 'bell' }, body: String(message || '').slice(0, 400) }).catch(() => { });
+    } catch { }
 }
 // Per-session voice-mute: is this speaker's voice silenced? (still logged as tts, just not spoken)
 function voiceMutedFrom(label) {
@@ -441,10 +506,13 @@ function eventsFor(uid, cursor) {
 function registerSession(cwd, purpose, pin) {
     const cs = assignCallsign(pin);
     pendingPins.delete(cs);
+    let tier = pendingTier.get(cs); pendingTier.delete(cs);
+    if (!tier) { try { tier = resolveRepo(cwd).tier; } catch { } }
+    tier = tier === 'trusted' ? 'trusted' : 'guarded';
     const uid = 's_' + String(roster.nextUid++).padStart(4, '0');
     const now = new Date().toISOString();
     roster.callsigns[cs] = [uid, ...(roster.callsigns[cs] || [])];
-    roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now };
+    roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier };
     saveRoster();
     const w = loadWork();
     ensureBoard(w, cs);
@@ -520,7 +588,7 @@ function retireSession(uid, summary, opts = {}) {
     saveWork(w);
     saveRoster();
     record({ kind: 'sys', text: cs + ' retired (' + uid + ')' });
-    enqueueSay(cs + ' retired.' + (summary ? ' ' + summary : ''), 'jarvis');
+    enqueueSay(opts.spoken || (cs + ' retired.' + (summary ? ' ' + summary : '')), 'jarvis');
     busAppend({ from: 'jarvis', to: uid, kind: 'retired', text: 'retired' });
     return true;
 }
@@ -616,9 +684,11 @@ function resolveClaude() {
     }
     return 'claude';
 }
-function spawnWorker(repo, purpose, model, handoff) {
+function spawnWorker(repo, purpose, model, handoff, tier) {
     const cs = assignCallsign();
     pendingPins.set(cs, Date.now());
+    const effTier = (tier || repo.tier) === 'trusted' ? 'trusted' : null;
+    if (effTier) pendingTier.set(cs, effTier);
     // wt.exe treats ';' as a command separator even inside argv (--title) — a purpose like
     // "...catalog; resuming" chops the wt command in half (0x80070002) and strands a pinned
     // phantom callsign. Strip it alongside the other shell/wt specials.
@@ -635,6 +705,7 @@ function spawnWorker(repo, purpose, model, handoff) {
     } else {
         boot += ' Then wait for instructions on the poll loop.';
     }
+    boot += ' Permissions: read-only and routine build commands (git status/diff/log, npm run lint, node --check, ls/cat/grep/rg, dotnet build/test) run WITHOUT asking the human; only risky or out-of-repo actions prompt. Favor those pre-approved commands, batch shell calls, and self-verify (run the lint gate yourself) instead of asking. If you fan out subagents, keep them to the same safe command set so they do not each trigger a prompt.' + (effTier ? ' You are a TRUSTED session: your non-risky actions are auto-approved — work autonomously and only surface genuine decisions.' : '');
     const pm = repo.permissionMode ? ' --permission-mode ' + repo.permissionMode : '';
     const md = model || repo.model;
     const mm = md ? ' --model ' + md : '';
@@ -872,7 +943,7 @@ function handleUtterance(rawText, typed) {
         }
         return;
     }
-    if ((m = after(/(?:start|spin up|launch)(?: a| a new| new)?( cheap| haiku| fast)? session (?:in|on|at|for)\s+(.+)$/))) {
+    if ((m = after(/(?:start|spin up|launch)(?: a| a new| new)?((?:\s(?:cheap|haiku|fast|trusted|guarded|autonomous))*) session (?:in|on|at|for)\s+(.+)$/))) {
         const parts = m[2].split(/\s+for\s+/);
         const repo = findRepo(parts[0]);
         if (!repo) {
@@ -880,10 +951,82 @@ function handleUtterance(rawText, typed) {
             enqueueSay('I do not know a repo matching ' + parts[0].trim() + '.' + (keys.length ? ' I know ' + keys.join(', ') + '.' : ' No repos are registered yet.'), 'jarvis');
             return;
         }
-        const model = m[1] ? 'haiku' : undefined;
+        const adj = (m[1] || '').toLowerCase();
+        const model = /cheap|haiku|fast/.test(adj) ? 'haiku' : undefined;
+        const tier = /trusted|autonomous/.test(adj) ? 'trusted' : undefined;
         const purpose = (parts[1] || repo.defaultPurpose || repo.key).trim();
-        const cs = spawnWorker(repo, purpose, model);
-        enqueueSay('Launching ' + cs + ' in ' + repo.key + ' for ' + purpose + (model ? ', on ' + model : '') + '. It will check in shortly.', 'jarvis');
+        const cs = spawnWorker(repo, purpose, model, undefined, tier);
+        enqueueSay('Launching ' + cs + ' in ' + repo.key + ' for ' + purpose + (model ? ', on ' + model : '') + (tier ? ', trusted' : '') + '. It will check in shortly.', 'jarvis');
+        return;
+    }
+    if ((m = after(/(?:stop trusting|untrust|distrust|don'?t trust)\s+([a-z-]+)/))) {
+        const cs = csFrom(m[1]); const uid = cs && cs !== 'jarvis' && liveUidOf(cs);
+        if (!uid) { enqueueSay('No live session called ' + m[1] + '.', 'jarvis'); return; }
+        roster.sessions[uid].trustUntil = 0; saveRoster();
+        enqueueSay('Stopped trusting ' + cs + '. Back to asking on non-routine actions.', 'jarvis');
+        return;
+    }
+    if ((m = after(/trust\s+([a-z-]+)(?:\s+for\s+(\d+)\s*(min|minute|minutes|hr|hrs|hour|hours|h)?)?/))) {
+        const cs = csFrom(m[1]); const uid = cs && cs !== 'jarvis' && liveUidOf(cs);
+        if (!uid) { enqueueSay('No live session called ' + m[1] + '.', 'jarvis'); return; }
+        const n = m[2] ? parseInt(m[2], 10) : 30;
+        const isHr = m[3] && /^h/.test(m[3]);
+        const mins = isHr ? n * 60 : n;
+        roster.sessions[uid].trustUntil = Date.now() + mins * 60000;
+        saveRoster();
+        enqueueSay('Trusting ' + cs + ' for ' + (isHr ? n + ' hour' + (n > 1 ? 's' : '') : mins + ' minutes') + '. I will auto-approve its non-risky actions.', 'jarvis');
+        return;
+    }
+    if ((m = after(/(?:let'?s\s+)?(?:start(?:\s+working)?(?:\s+on)?|work(?:ing)?\s+on)\s+(?:([a-z-]+)\s+)?(?:item\s+|number\s+|no\.?\s*|#)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b/))) {
+        const w = loadWork();
+        const word = m[1];
+        let cs = w.focus;
+        if (word && !IDX_FILLER.has(word)) { const c = csFrom(word); if (c) cs = c; }
+        if (!cs || cs === 'jarvis' || !w.sessions[cs]) { enqueueSay(word ? ('No live session called ' + word + '.') : 'Nothing in focus to work on.', 'jarvis'); return; }
+        const ord = orderedTasks(w.sessions[cs]);
+        const n = NUMWORDS[m[2]] || parseInt(m[2], 10);
+        const hit = ord[n - 1];
+        if (!hit) { enqueueSay(cs + ' has no item ' + n + '.', 'jarvis'); return; }
+        const board = w.sessions[cs];
+        const title = shortTitle(textOf(hit.item));
+        if (hit.list === 'review') {
+            const [t] = board.review.splice(hit.i, 1);
+            board.review.unshift(t);
+            saveWork(w);
+            record({ kind: 'task', op: 'top', board: cs, task: textOf(t) });
+            enqueueSay('Flagged ' + title + '. Top of ' + cs + ' review, agent not pinged.', 'jarvis');
+            return;
+        }
+        const [t] = board[hit.list].splice(hit.i, 1);
+        board.working.unshift(t);
+        saveWork(w);
+        record({ kind: 'task', op: 'start', board: cs, task: textOf(t) });
+        const uid = liveUidOf(cs);
+        if (uid) busAppend({ from: 'human', to: uid, kind: 'speech', text: 'Start working on this now: ' + textOf(t) + '. I moved it to your working lane, so do not re-file it; do the work and report when done or blocked.' });
+        enqueueSay('Told ' + cs + ' to start: ' + title + '.', 'jarvis');
+        return;
+    }
+    if ((m = after(/(complete|finish|done|approve|drop|scratch|top|bump|prioriti[sz]e)\s+(?:([a-z-]+)\s+)?(?:item\s+|number\s+|no\.?\s*|#)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b/))) {
+        const verb = m[1].toLowerCase();
+        const w = loadWork();
+        const word = m[2];
+        let cs = w.focus;
+        if (word && !IDX_FILLER.has(word)) { const c = csFrom(word); if (c) cs = c; }
+        if (!cs || cs === 'jarvis' || !w.sessions[cs]) { enqueueSay(word ? ('No live session called ' + word + '.') : 'Nothing in focus.', 'jarvis'); return; }
+        const ord = orderedTasks(w.sessions[cs]);
+        const n = NUMWORDS[m[3]] || parseInt(m[3], 10);
+        const hit = ord[n - 1];
+        if (!hit) { enqueueSay(cs + ' has no item ' + n + '.', 'jarvis'); return; }
+        const board = w.sessions[cs];
+        const title = shortTitle(textOf(hit.item));
+        const [t] = board[hit.list].splice(hit.i, 1);
+        let op, msg;
+        if (/complete|finish|done|approve/.test(verb)) { board.done.push(t); op = 'done'; msg = (hit.list === 'review' ? 'Approved ' : 'Done with ') + title + '.'; }
+        else if (/drop|scratch/.test(verb)) { op = 'drop'; msg = 'Scratched ' + title + '.'; }
+        else { board[hit.list].unshift(t); op = 'top'; msg = 'Bumped ' + title + ' up.'; }
+        saveWork(w);
+        record({ kind: 'task', op, board: cs, task: textOf(t) });
+        enqueueSay(msg, 'jarvis');
         return;
     }
     if ((m = after(/(?:give|move|send) (?:the )?(.+?) task to ([a-z-]+)\b/))) {
@@ -1036,7 +1179,7 @@ async function handleRequest(req, res) {
         const boards = [...new Set([...order, ...extras])].map(cs => {
             const b = w.sessions[cs] || { working: [], queued: [], done: [], review: [] };
             const uid = cs === 'jarvis' ? null : liveUidOf(cs);
-            const pend = uid ? [...pendingPerms.values()].find(p => p.uid === uid) : null;
+            const pends = uid ? [...pendingPerms.values()].filter(p => p.uid === uid) : [];
             return {
                 callsign: cs,
                 uid: uid || null,
@@ -1047,7 +1190,8 @@ async function handleRequest(req, res) {
                 doing: uid ? roster.sessions[uid].doing || '' : '',
                 needsYou: uid ? !!roster.sessions[uid].needsYou : false,
                 voiceMuted: uid ? !!roster.sessions[uid].voiceMuted : false,
-                pendingPerm: pend ? { id: pend.id, tool: pend.tool, detail: pend.detail } : null,
+                pendingPerm: pends[0] ? { id: pends[0].id, tool: pends[0].tool, detail: pends[0].detail, klass: pends[0].klass || 'neutral', label: permLabel(pends[0].tool, pends[0].detail) } : null,
+                pendingPermCount: pends.length,
                 working: b.working, queued: b.queued, done: b.done, review: b.review || [],
             };
         });
@@ -1078,6 +1222,8 @@ async function handleRequest(req, res) {
             try { return json(res, 200, JSON.parse(readFileSync(join(ARCHIVE, f), 'utf8'))); }
             catch { return json(res, 500, { error: 'unreadable archive entry' }); }
         }
+        // A parked project lives in On Hold, not Archive — hide its session history here while held.
+        const heldKeys = new Set((roster.held || []).map(h => h.key));
         const items = files.map(f => {
             try {
                 const a = JSON.parse(readFileSync(join(ARCHIVE, f), 'utf8'));
@@ -1089,8 +1235,77 @@ async function handleRequest(req, res) {
                     counts: { working: (board.working || []).length, queued: (board.queued || []).length, done: (board.done || []).length, review: (board.review || []).length },
                 };
             } catch { return null; }
-        }).filter(Boolean).sort((x, y) => Date.parse(y.ended || 0) - Date.parse(x.ended || 0));
+        }).filter(Boolean).filter(a => !heldKeys.has(cwdKey(a.cwd))).sort((x, y) => Date.parse(y.ended || 0) - Date.parse(x.ended || 0));
         return json(res, 200, { count: items.length, items });
+    }
+    if (key === 'GET /repos') {
+        // Read-only repo list for the console's new-session composer (the + tab).
+        const repos = loadRepos();
+        const items = Object.entries(repos).map(([key, v]) => ({ key, cwd: v.cwd || '', defaultPurpose: v.defaultPurpose || '' }));
+        return json(res, 200, { items });
+    }
+    if (key === 'GET /hold') {
+        // Projects parked for later (distinct from Archive = finished). Newest first.
+        const items = (roster.held || []).map(h => ({
+            key: h.key, callsign: h.callsign || null, cwd: h.cwd || '', purpose: h.purpose || '',
+            summary: h.summary || null, parkedAt: h.parkedAt || null,
+            hasHandoff: !!(roster.handoffs && (roster.handoffs[cwdKey(h.cwd)] || (h.callsign && roster.handoffs['cs:' + h.callsign]))),
+        }));
+        return json(res, 200, { count: items.length, items });
+    }
+    if (key === 'POST /hold') {
+        // Park a session/project on hold. A live session is stopped cleanly (no successor) and
+        // filed under On Hold; a bare cwd+purpose parks a project that isn't live (e.g. from the
+        // Archive). Pull it back later with /unhold, which re-spawns it (inheriting its handoff).
+        const b = await readBody(req);
+        const cs0 = String(b.callsign || '').toLowerCase();
+        const uid = (b.uid && roster.sessions[b.uid] && !roster.sessions[b.uid].ended) ? b.uid : liveUidOf(cs0);
+        let cwd, purpose, callsign, summary;
+        if (uid && roster.sessions[uid]) {
+            const s = roster.sessions[uid];
+            cwd = s.cwd; purpose = s.purpose; callsign = s.callsign;
+            summary = String(b.summary || '').trim() || s.summary || 'Parked - pull it back when ready.';
+            retireSession(uid, summary, { successor: false, spoken: callsign + ' is on hold. Pull it back whenever you are ready.' });
+        } else {
+            cwd = String(b.cwd || '').trim();
+            purpose = String(b.purpose || '').trim();
+            callsign = cs0 || null;
+            summary = String(b.summary || '').trim() || null;
+            if (!cwd && !purpose) return json(res, 400, { error: 'need a live callsign/uid, or a cwd+purpose to park' });
+            enqueueSay((callsign || 'That project') + ' is on hold. Pull it back whenever.', 'jarvis');
+        }
+        const k = cwd ? cwdKey(cwd) : ('p:' + String(callsign || purpose || '').toLowerCase());
+        roster.held = (roster.held || []).filter(h => h.key !== k);   // de-dupe by project key
+        roster.held.unshift({ key: k, callsign, cwd, purpose, summary, parkedAt: new Date().toISOString() });
+        saveRoster();
+        record({ kind: 'sys', text: (callsign || purpose || 'project') + ' parked on hold' });
+        return json(res, 200, { ok: true, key: k });
+    }
+    if (key === 'POST /unhold') {
+        // Pull a parked project back: drop it from On Hold and (unless {drop:true}) spawn a fresh
+        // worker on it, which inherits the handoff via its cwd — same as the Archive "continue".
+        const b = await readBody(req);
+        roster.held = roster.held || [];
+        const wantKey = b.key || (b.cwd ? cwdKey(b.cwd) : null);
+        const wantCs = String(b.callsign || '').toLowerCase();
+        const idx = roster.held.findIndex(h => (wantKey && h.key === wantKey) || (b.cwd && cwdKey(h.cwd) === cwdKey(b.cwd)) || (wantCs && h.callsign === wantCs));
+        if (idx < 0) return json(res, 404, { error: 'not on hold' });
+        const h = roster.held[idx];
+        roster.held.splice(idx, 1);
+        saveRoster();
+        if (b.drop) {
+            record({ kind: 'sys', text: (h.callsign || h.purpose || 'project') + ' removed from on-hold' });
+            return json(res, 200, { ok: true, dropped: true });
+        }
+        let cs = null;
+        if (h.cwd && h.purpose) {
+            roster.handoffs = roster.handoffs || {};
+            const handoff = roster.handoffs[cwdKey(h.cwd)] || null;
+            try { cs = spawnWorker(resolveRepo(h.cwd), h.purpose, b.model, handoff); } catch { cs = null; }
+        }
+        record({ kind: 'sys', text: (h.callsign || h.purpose || 'project') + ' pulled back from on-hold' + (cs ? ' -> ' + cs : '') });
+        enqueueSay((h.callsign || 'That project') + ' is back' + (cs ? ', ' + cs + ' is spinning up' : '') + '.', 'jarvis');
+        return json(res, 200, { ok: true, callsign: cs });
     }
     if (key === 'GET /att') {
         const n = String(u.searchParams.get('n') || '').replace(/[\\/]/g, '');
@@ -1161,6 +1376,20 @@ async function handleRequest(req, res) {
         });
         return;
     }
+    if (key === 'GET /heartbeat') {
+        // Liveness-only ping, DECOUPLED from the agent turn. A worker fires this on a fixed
+        // background timer (see WORKER.md §2) so lastSeen stays fresh through long agent turns
+        // that never relaunch the event poll loop -- the loop only re-runs on a turn boundary,
+        // so one 45-min turn would otherwise let lastSeen go stale and aliveNow() flip false.
+        // It does NOT return events and NEVER blocks: bump lastSeen and reply immediately.
+        const uid = u.searchParams.get('uid');
+        const s = roster.sessions[uid];
+        if (!s) return json(res, 404, { error: 'unknown uid' });
+        if (s.ended) return json(res, 410, { error: 'retired' });
+        s.lastSeen = new Date().toISOString();
+        saveRosterThrottled();
+        return json(res, 200, { ok: true });
+    }
     if (key === 'POST /register') {
         const b = await readBody(req);
         if (!String(b.purpose || '').trim() || !String(b.cwd || '').trim()) {
@@ -1184,6 +1413,21 @@ async function handleRequest(req, res) {
         }
         if (n < 80) s.ctxWarned = false;
         saveRoster();
+        return json(res, 200, { ok: true });
+    }
+    if (key === 'GET /notify') {
+        return json(res, 200, { url: (NOTIFY && NOTIFY.url) || '', configured: !!(NOTIFY && NOTIFY.url) });
+    }
+    if (key === 'POST /notify') {
+        const b = await readBody(req);
+        NOTIFY = { url: String(b.url || '').trim() };
+        saveNotify();
+        return json(res, 200, { ok: true, configured: !!NOTIFY.url });
+    }
+    if (key === 'POST /notify-test') {
+        if (!(NOTIFY && NOTIFY.url)) return json(res, 400, { error: 'no ntfy url configured; POST /notify {url} first' });
+        lastPushAt = 0;
+        pushPhone('JARVIS test', 'Phone notifications are wired up. You will get a buzz when a session needs you.');
         return json(res, 200, { ok: true });
     }
     if (key === 'POST /describe') {
@@ -1254,28 +1498,32 @@ async function handleRequest(req, res) {
         const repo = resolveRepo(cwd);
         roster.handoffs = roster.handoffs || {};
         const handoff = roster.handoffs[cwdKey(cwd)] || null;
-        const cs = spawnWorker(repo, purpose, b.model, handoff);
+        const cs = spawnWorker(repo, purpose, b.model, handoff, b.tier);
         enqueueSay('Launching ' + cs + ' in ' + repo.key + (handoff ? ', resuming the handoff' : '') + '.', 'jarvis');
         return json(res, 200, { ok: true, callsign: cs });
     }
     if (key === 'POST /permission') {
         const b = await readBody(req);
         const cs = String(b.callsign || '').toLowerCase();
-        const tool = String(b.tool || ''); const detail = String(b.detail || '');
+        const tool = String(b.tool || ''); const detail = String(b.detail || ''); const klass = String(b.klass || 'neutral');
         const uid = liveUidOf(cs);
         const sess = uid ? roster.sessions[uid] : null;
-        const sig = tool + ' ' + detail;
+        const sig = permSig(tool, detail);
         if (sess && Array.isArray(sess.autoAllow) && sess.autoAllow.includes(sig)) {
             return json(res, 200, { decision: 'allow' });
         }
+        if (klass !== 'danger' && sess) {
+            if (sess.trustUntil && Date.now() < sess.trustUntil) return json(res, 200, { decision: 'allow' });
+            if (sess.tier === 'trusted') return json(res, 200, { decision: 'allow' });
+        }
         const id = 'perm_' + (++permSeq);
-        const rec = { id, cs, uid, tool, detail, res };
+        const rec = { id, cs, uid, tool, detail, klass, sig, res };
         rec.timer = setTimeout(() => { if (pendingPerms.delete(id)) { try { json(res, 200, { decision: 'timeout' }); } catch { } } }, 300000);
         if (rec.timer.unref) rec.timer.unref();
         pendingPerms.set(id, rec);
         if (sess) { sess.needsYou = true; saveRoster(); }
         record({ kind: 'sys', text: cs + ' wants to run [' + tool + '] ' + detail.slice(0, 90) });
-        enqueueSay('Need you: ' + cs + ' wants to run a ' + tool + ' command.', 'jarvis');
+        enqueueSay('Need you: ' + cs + ' wants to run a ' + (klass === 'danger' ? 'risky ' : '') + tool + ' command.', 'jarvis');
         return;
     }
     if (key === 'POST /permission-answer') {
@@ -1290,7 +1538,7 @@ async function handleRequest(req, res) {
             if (rec.uid && roster.sessions[rec.uid]) {
                 const s = roster.sessions[rec.uid];
                 s.autoAllow = s.autoAllow || [];
-                s.autoAllow.push(rec.tool + ' ' + rec.detail);
+                if (!s.autoAllow.includes(rec.sig)) s.autoAllow.push(rec.sig);
             }
         }
         if (rec.uid && roster.sessions[rec.uid]) roster.sessions[rec.uid].needsYou = false;
@@ -1298,6 +1546,29 @@ async function handleRequest(req, res) {
         record({ kind: 'sys', text: rec.cs + ' [' + rec.tool + '] ' + (decision === 'allow' ? 'approved' : 'denied') });
         try { json(rec.res, 200, { decision }); } catch { }
         return json(res, 200, { ok: true });
+    }
+    if (key === 'POST /permission-answer-all') {
+        const b = await readBody(req);
+        const cs = String(b.callsign || '').toLowerCase();
+        const uid = cs ? liveUidOf(cs) : String(b.uid || '');
+        let decision = String(b.decision || 'allow');
+        const store = decision === 'always';
+        if (store) decision = 'allow';
+        const recs = [...pendingPerms.values()].filter(p => p.uid === uid);
+        for (const rec of recs) {
+            pendingPerms.delete(rec.id);
+            clearTimeout(rec.timer);
+            if (store && roster.sessions[uid]) {
+                const s = roster.sessions[uid];
+                s.autoAllow = s.autoAllow || [];
+                if (!s.autoAllow.includes(rec.sig)) s.autoAllow.push(rec.sig);
+            }
+            try { json(rec.res, 200, { decision }); } catch { }
+        }
+        if (uid && roster.sessions[uid]) roster.sessions[uid].needsYou = false;
+        saveRoster();
+        record({ kind: 'sys', text: (cs || uid) + ' [' + recs.length + ' requests] ' + (decision === 'allow' ? 'approved' : 'denied') });
+        return json(res, 200, { ok: true, count: recs.length });
     }
     if (key === 'POST /attach') {
         const b = await readBody(req);
@@ -1476,9 +1747,22 @@ async function handleRequest(req, res) {
     }
     if (key === 'POST /open') {
         const b = await readBody(req);
-        const url = String(b.url || '');
-        if (!/^https?:\/\//i.test(url)) return json(res, 400, { error: 'http(s) urls only' });
+        let url = String(b.url || '');
+        if (/^[A-Za-z]:[\\/]/.test(url)) url = 'file:///' + url.replace(/\\/g, '/');
+        if (!/^(https?|file):\/\//i.test(url)) return json(res, 400, { error: 'http(s)/file urls or local paths only' });
         openInWorkChrome(url);
+        return json(res, 200, { ok: true });
+    }
+    if (key === 'POST /reveal') {
+        const b = await readBody(req);
+        let p = String(b.path || '');
+        if (!p) return json(res, 400, { error: 'no path' });
+        p = p.replace(/\//g, '\\');
+        let isDir = false; try { isDir = existsSync(p) && statSync(p).isDirectory(); } catch { }
+        const child = spawn('explorer.exe', isDir ? [p] : ['/select,' + p], { detached: true, stdio: 'ignore' });
+        child.on('error', () => { });
+        child.unref();
+        record({ kind: 'sys', text: 'revealed: ' + p.slice(0, 90) });
         return json(res, 200, { ok: true });
     }
     if (key === 'GET /schedule') {
@@ -1520,10 +1804,52 @@ async function handleRequest(req, res) {
         if (b.text) handleUtterance(String(b.text), !!b.typed);
         return json(res, 200, { ok: true });
     }
-    if (key === 'GET /console.css') { res.writeHead(200, { 'content-type': 'text/css; charset=utf-8' }); return res.end(CONSOLE_CSS); }
-    if (key === 'GET /console.js') { res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8' }); return res.end(CONSOLE_JS); }
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(CONSOLE_HTML);
+    if (key === 'POST /winddown') {
+        // End-of-day: ask every live worker to checkpoint a /handoff and retire (no successor),
+        // then stop the hub cleanly. {dry:true} returns the plan (live sessions + uncommitted git
+        // work per cwd) WITHOUT doing anything, so the console can show a confirm first.
+        const b = await readBody(req);
+        const sessions = liveCallsigns().filter(cs => cs !== 'jarvis').map(cs => {
+            const uid = liveUidOf(cs);
+            const s = uid ? roster.sessions[uid] : null;
+            if (!s || !aliveNow(uid)) return null;
+            let dirty = null;
+            if (s.cwd) {
+                try { const o = execFileSync('git', ['-C', s.cwd, 'status', '--porcelain'], { encoding: 'utf8', timeout: 8000 }); dirty = o.trim() ? o.trim().split('\n').length : 0; }
+                catch { dirty = 'unknown'; }
+            }
+            return { cs, uid, cwd: s.cwd || '', purpose: s.purpose || '', dirty };
+        }).filter(Boolean);
+        if (b.dry) return json(res, 200, { ok: true, dry: true, sessions });
+        record({ kind: 'sys', text: 'WIND-DOWN initiated: ' + sessions.length + ' live session(s).' });
+        for (const x of sessions) busAppend({ from: 'jarvis', to: x.uid, kind: 'retire-request', text: 'WIND-DOWN: post a /handoff then /retire with successor:false. Goodnight.' });
+        json(res, 200, { ok: true, sessions, graceMs: WINDDOWN_GRACE_MS });
+        setTimeout(() => {
+            try {
+                for (const x of sessions) if (aliveNow(x.uid)) retireSession(x.uid, 'Wound down for the night', { successor: false });
+                try { writeFileSync(join(DATA, 'STOP'), new Date().toISOString()); } catch { } // tell the watchdog this is a real STOP, not a restart
+                record({ kind: 'sys', text: 'WIND-DOWN complete; stopping hub. Goodnight.' });
+                enqueueSay('Goodnight, Big Chris. Winding down for the night.', 'jarvis');
+                running = false;
+            } catch (e) { try { record({ kind: 'sys', text: 'wind-down error: ' + e.message }); } catch { } }
+        }, WINDDOWN_GRACE_MS);
+        return;
+    }
+    if (key === 'POST /restart') {
+        record({ kind: 'sys', text: 'RESTART requested from console.' });
+        enqueueSay('Restarting.', 'jarvis');
+        try { unlinkSync(join(DATA, 'STOP')); } catch { } // ensure the watchdog relaunches, not stops
+        json(res, 200, { ok: true });
+        setTimeout(() => { running = false; }, 300);
+        return;
+    }
+    // no-store: the console is redeployed by restarting the hub, so the browser must always
+    // re-fetch fresh assets on reload — a cached console.js silently runs stale UI code.
+    const NOCACHE = 'no-store, no-cache, must-revalidate';
+    if (key === 'GET /console.css') { res.writeHead(200, { 'content-type': 'text/css; charset=utf-8', 'cache-control': NOCACHE }); return res.end(freshAsset('console.css', CONSOLE_CSS)); }
+    if (key === 'GET /console.js') { res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': NOCACHE }); return res.end(freshAsset('console.js', CONSOLE_JS)); }
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': NOCACHE });
+    res.end(freshAsset('console.html', CONSOLE_HTML));
 }
 
 async function main() {
@@ -1555,7 +1881,7 @@ async function main() {
         speakingNow = true;
         const item = sayQueue.shift();
         record({ kind: 'tts', text: item.text, from: item.from });
-        if (consolePage && !muted && !voiceMutedFrom(item.from)) {
+        if (consolePage && (!muted || item.force) && !voiceMutedFrom(item.from)) {
             consolePage.evaluate(t => window.__speak(t), item.spoken || item.text)
                 .catch(() => { })
                 .finally(() => { speakingNow = false; });
