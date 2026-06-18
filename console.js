@@ -307,7 +307,8 @@ function renderBoards(d) {
             const e = lastSched.next, ms = Date.parse(e.start) - now, soon = ms <= 300000;
             if (soon) imminent = true;
             const cd = ms <= 0 ? 'starting now' : fmtCountdown(ms);
-            rows.push('<div class="evrow nmrow"><span><span class="nmlabel next' + (soon ? ' soon' : '') + '">NEXT</span> ' + esc(e.title)
+            const isRem = e.kind === 'reminder';
+            rows.push('<div class="evrow nmrow"><span><span class="nmlabel next' + (soon ? ' soon' : '') + '">' + (isRem ? 'REMINDER' : 'NEXT') + '</span> ' + (isRem ? '⏰ ' : '') + esc(e.title)
                 + ' <span class="nmtime nmcd' + (soon ? ' soon' : '') + '">' + cd + ' · ' + fmtClock(e.start) + '</span></span>' + evIcons(e) + '</div>');
         }
         top = rows.join('');
@@ -316,9 +317,18 @@ function renderBoards(d) {
         top = '<div class="nmclear">&#127881; That\'s the lot - day\'s clear.</div>';
     }
     let sched = '';
-    if (lastSched && lastSched.events && lastSched.events.length) {
+    const _rem = (lastSched && lastSched.reminders) || [];
+    if (lastSched && (((lastSched.events || []).length) || _rem.length)) {
         const now = Date.now();
-        sched = '<div class="bhead" style="margin-top:0">SCHEDULE</div>' + lastSched.events.map(e => {
+        // Merge meetings + reminders into one time-sorted list; reminders render with a clock glyph.
+        const items = [...((lastSched.events) || []).map(e => ({ ...e, _k: 'm' })), ..._rem.map(r => ({ ...r, _k: 'r' }))]
+            .sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
+        sched = '<div class="bhead" style="margin-top:0">SCHEDULE</div>' + items.map(e => {
+            if (e._k === 'r') {
+                const due = Date.parse(e.start) <= now, fired = !!e.firedAt;
+                const col = (due || fired) ? '#7d6fb0' : '#b9a7e6';
+                return '<div class="witem evrow" style="color:' + col + '"><span>' + fmtClock(e.start) + '  ⏰ ' + esc(e.title) + (fired ? ' ✓' : '') + '</span></div>';
+            }
             const s = Date.parse(e.start), en = Date.parse(e.end);
             const past = en < now, cur = s <= now && now < en;
             const col = past ? '#566270' : cur ? '#e8c35a' : '#9bb0c4';
@@ -363,8 +373,10 @@ function renderBoards(d) {
         let bctx = b.context;
         if (cs === 'jarvis' && typeof bctx !== 'number') { const jw = (d.boards || []).find(x => x.alive && /jarvis-core/i.test(x.cwd || '') && typeof x.context === 'number'); if (jw) bctx = jw.context; }
         const ctx = (typeof bctx === 'number') ? ' <span style="color:' + (bctx >= 80 ? '#e06c6c' : bctx >= 60 ? '#d9a05d' : '#5dd97c') + '">' + bctx + '%</span>' : '';
+        // Project card: show which session (NATO callsign) is currently driving it, e.g. JARVIS · XRAY · 30%.
+        const worker = b.worker ? ' <span class="cworker">' + esc(b.worker.toUpperCase()) + '</span>' : '';
         const cwdChip = b.cwd ? '<span class="cpybtn pathtok" data-copy="' + b64(b.cwd) + '" title="copy path: ' + escAttr(b.cwd) + '">📋</span>' : '';
-        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + ctx + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
+        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + worker + ctx + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
         const purpose = b.purpose ? '<div class="cpurpose">' + esc(b.purpose) + '</div>' : '';
         const doing = (b.needsYou || b.doing) ? '<div class="bdoing">' + (b.needsYou ? '<span class="needs">NEEDS YOU</span> ' : '') + esc(b.doing || '') + '</div>' : '';
         const counts = (working.length || queued.length || review.length || done.length) ? '<div class="ccount">'
@@ -495,8 +507,17 @@ function submitAddTask() {
     const text = (ti.value || '').trim();
     if (!text) return;
     const cs = (sel && sel.value) || 'jarvis';
-    fetch('/worklist', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op: 'add', callsign: cs, text }) })
-        .then(() => { ti.value = ''; ti.focus(); }).catch(() => { });
+    const clear = () => { ti.value = ''; ti.focus(); };
+    const addToBoard = () => fetch('/worklist', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op: 'add', callsign: cs, text }) }).then(clear);
+    // Reminder-looking text ("remind…", "…in 10 min", "…at 3pm") becomes a timed calendar
+    // reminder; everything else is a board to-do. Falls back to the board if /remind can't parse it.
+    const looksReminder = /^\s*(remind|timer|set (a|an) timer)\b/i.test(text) || /\b(?:in|for)\s+\d+\s*(min|mins|minute|minutes|hour|hours|hr|hrs)\b/i.test(text) || /\bat\s+\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(text);
+    if (looksReminder) {
+        fetch('/remind', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }) })
+            .then(r => r.json()).then(j => { if (j && j.ok) { clear(); } else { return addToBoard(); } }).catch(() => { });
+        return;
+    }
+    addToBoard().catch(() => { });
 }
 document.getElementById('atadd').onclick = submitAddTask;
 document.getElementById('atext').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submitAddTask(); } e.stopPropagation(); });

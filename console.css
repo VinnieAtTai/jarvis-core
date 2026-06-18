@@ -96,6 +96,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .card.cneeds{border-color:#e06c6c;box-shadow:0 0 6px rgba(224,108,108,.4)}
 .chead{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .ctitle{font-weight:bold;letter-spacing:1px;font-size:13px;color:#d7e3f0}
+.cworker{color:#8aa0c8;font-weight:normal;font-size:11px;letter-spacing:.5px}
 .card.cfocus .ctitle{color:#5db4d9}
 .cbtns{display:flex;gap:5px;white-space:nowrap}
 .cbtn{cursor:pointer;font-size:13px;opacity:.5;user-select:none}

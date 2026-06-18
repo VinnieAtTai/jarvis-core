@@ -136,32 +136,45 @@ if (REAL_USAGE) {
 setInterval(refreshTokens, 30000).unref();
 setInterval(() => {
     const s = loadSchedule();
-    if (!s.events || !s.events.length || s.date !== new Date().toDateString()) return;
     const now = Date.now();
     let dirty = false;
-    for (const e of s.events) {
-        const st = Date.parse(e.start), en = Date.parse(e.end);
-        const k5 = e.title + ':5', k0 = e.title + ':0', kEnd = e.title + ':end';
-        if (now >= st - 300000 && now < st && !s.announced[k5]) {
-            s.announced[k5] = true;
-            dirty = true;
-            enqueueSay('Heads up: ' + e.title + ' in ' + Math.max(1, Math.round((st - now) / 60000)) + ' minutes.', 'jarvis');
+    // Reminders fire once at their due time, whether or not a meeting schedule is loaded today.
+    if (Array.isArray(s.reminders) && s.reminders.length) {
+        for (const r of s.reminders) {
+            if (r && r.start && !r.firedAt && now >= Date.parse(r.start)) {
+                r.firedAt = new Date().toISOString();
+                dirty = true;
+                enqueueSay('Reminder: ' + r.title + '.', 'jarvis');
+            }
         }
-        if (now >= st && now < st + 60000 && !s.announced[k0]) {
-            s.announced[k0] = true;
-            dirty = true;
-            enqueueSay(e.title + ' is starting now.', 'jarvis');
-            if (!muted) setMute(true, e.title);
-        }
-        if (now >= en && !s.announced[kEnd]) {
-            s.announced[kEnd] = true;
-            dirty = true;
-            if (muted && autoMutedBy === e.title) {
-                // Chris's rule: NEVER auto-unmute him. The meeting muted him; prompt him to
-                // unmute himself (force:true so it speaks through the mute) and drop our claim
-                // so the mute is now his to lift whenever he is ready.
-                autoMutedBy = null;
-                sayQueue.push({ text: e.title + ' is over. Say unmute whenever you are ready.', from: 'jarvis', force: true });
+        const n0 = s.reminders.length; pruneReminders(s); if (s.reminders.length !== n0) dirty = true;
+    }
+    // Meetings: only the schedule paste loaded for today.
+    if (s.events && s.events.length && s.date === new Date().toDateString()) {
+        for (const e of s.events) {
+            const st = Date.parse(e.start), en = Date.parse(e.end);
+            const k5 = e.title + ':5', k0 = e.title + ':0', kEnd = e.title + ':end';
+            if (now >= st - 300000 && now < st && !s.announced[k5]) {
+                s.announced[k5] = true;
+                dirty = true;
+                enqueueSay('Heads up: ' + e.title + ' in ' + Math.max(1, Math.round((st - now) / 60000)) + ' minutes.', 'jarvis');
+            }
+            if (now >= st && now < st + 60000 && !s.announced[k0]) {
+                s.announced[k0] = true;
+                dirty = true;
+                enqueueSay(e.title + ' is starting now.', 'jarvis');
+                if (!muted) setMute(true, e.title);
+            }
+            if (now >= en && !s.announced[kEnd]) {
+                s.announced[kEnd] = true;
+                dirty = true;
+                if (muted && autoMutedBy === e.title) {
+                    // Chris's rule: NEVER auto-unmute him. The meeting muted him; prompt him to
+                    // unmute himself (force:true so it speaks through the mute) and drop our claim
+                    // so the mute is now his to lift whenever he is ready.
+                    autoMutedBy = null;
+                    sayQueue.push({ text: e.title + ' is over. Say unmute whenever you are ready.', from: 'jarvis', force: true });
+                }
             }
         }
     }
@@ -381,6 +394,63 @@ function parseScheduleText(text) {
     }
     events.sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
     return { date: new Date().toDateString(), events, announced: {} };
+}
+// —— Reminders: ad-hoc timed to-dos that live in the calendar next to meetings. Unlike the
+// meeting list (volatile, re-pasted daily, date-gated), a reminder carries an absolute time,
+// survives a schedule re-paste, and announces ONCE when due. Stored in schedule.reminders[]. ——
+function clk(iso) {
+    const d = new Date(iso); let h = d.getHours(); const m = d.getMinutes();
+    const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12;
+    return h + (m ? ':' + String(m).padStart(2, '0') : '') + ' ' + ap;
+}
+// Strip the command framing ("remind me", "set a timer for", the time clause, a leading "to")
+// to recover just the thing to be reminded of. Heuristic, but good enough for spoken input.
+function remTitle(t) {
+    const base = String(t || '')
+        .replace(/^\s*jarvis[\s,.!]+/i, '')
+        .replace(/^\s*(please\s+)?(can you\s+|could you\s+)?(set\s+(a|an)\s+)?(remind(er)?(\s+me)?|timer(\s+for)?)\b/i, '')
+        .replace(/\b(?:in|for)\s+(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten)\s*(min|mins|minute|minutes|hour|hours|hr|hrs)\b/i, '')
+        .replace(/\bat\s+\d{1,2}(?::\d{2})?\s*(am|pm)\b/i, '')
+        .replace(/^\s*(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten)\s*(min|mins|minute|minutes|hour|hours|hr|hrs)\b/i, '')   // leftover bare duration ("timer for 5 minutes")
+        .replace(/^\s*(to|that|about|for)\s+/i, '')
+        .replace(/^[\s,.:;-]+|[\s,.:;-]+$/g, '')
+        .trim();
+    return base || (/\btimer\b/i.test(String(t || '')) ? 'Timer' : 'Reminder');
+}
+// Parse a relative ("in 10 minutes") or absolute ("at 3:30pm") reminder out of free text.
+// Returns { title, start(ISO) } or null when no time is found.
+function parseReminder(text) {
+    const low = String(text || '').toLowerCase();
+    const num = w => (w === 'a' || w === 'an') ? 1 : (NUMWORDS[w] != null ? NUMWORDS[w] : (/^\d+$/.test(w) ? Number(w) : null));
+    let m;
+    if ((m = low.match(/\b(?:in|for)\s+(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten)\s*(min|mins|minute|minutes|hour|hours|hr|hrs)\b/))) {
+        const n = num(m[1]); if (n == null || n <= 0) return null;
+        const unit = m[2][0] === 'h' ? 3600000 : 60000;
+        return { title: remTitle(text), start: new Date(Date.now() + n * unit).toISOString() };
+    }
+    if ((m = low.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/))) {
+        let H = Number(m[1]) % 12; if (m[3] === 'pm') H += 12;
+        const d = new Date(); d.setHours(H, Number(m[2] || 0), 0, 0);
+        if (d.getTime() < Date.now() - 60000) d.setDate(d.getDate() + 1);   // already past today -> tomorrow
+        return { title: remTitle(text), start: d.toISOString() };
+    }
+    return null;
+}
+// Drop reminders whose time elapsed more than 6h ago (fired or not) so the list self-cleans.
+function pruneReminders(s) {
+    if (!Array.isArray(s.reminders)) { s.reminders = []; return; }
+    const cutoff = Date.now() - 6 * 3600000;
+    s.reminders = s.reminders.filter(r => r && r.start && Date.parse(r.start) > cutoff);
+}
+function createReminder(title, start) {
+    const s = loadSchedule();
+    if (!Array.isArray(s.reminders)) s.reminders = [];
+    pruneReminders(s);
+    const r = { id: newTaskId(), title: String(title || 'Reminder').slice(0, 120), start, kind: 'reminder' };
+    s.reminders.push(r);
+    s.reminders.sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
+    saveSchedule(s);
+    return r;
 }
 
 // Display-order task list for a session (matches the console card: review -> working -> queued
@@ -857,6 +927,21 @@ function handleUtterance(rawText, typed) {
     const after = (re) => lower.match(new RegExp(P.source + re.source));
     let m;
 
+    // "remind me in 10 minutes to X" / "remind me at 3pm to X" / "set a timer for 5 min" ->
+    // a calendar reminder that announces once when due.
+    if (/^(?:jarvis[\s,.!]+)?(remind me|remind|set (a|an) timer|timer for)\b/.test(lower)) {
+        const p = parseReminder(text);
+        if (p) {
+            const r = createReminder(p.title, p.start);
+            const mins = Math.max(1, Math.round((Date.parse(r.start) - Date.now()) / 60000));
+            record({ kind: 'sys', text: 'reminder set: ' + r.title + ' @ ' + r.start });
+            enqueueSay('Okay, reminder set: ' + r.title + (mins < 60 ? ', in ' + mins + ' minute' + (mins === 1 ? '' : 's') : ', at ' + clk(r.start)) + '.', 'jarvis');
+        } else {
+            enqueueSay('I did not catch a time. Try, remind me in ten minutes to take a break.', 'jarvis');
+        }
+        return;
+    }
+
     if ((m = after(/(?:focus(?: on)?|switch to|talk to)\s+([a-z-]+)\b/))) {
         const cs = csFrom(m[1]);
         if (cs) {
@@ -1218,6 +1303,9 @@ async function handleRequest(req, res) {
             return {
                 callsign: cs,
                 uid: uid || null,
+                // For a project card (e.g. 'jarvis') the bound worker keeps its own NATO callsign
+                // — surface it so the human can see WHICH session is driving jarvis right now.
+                worker: (uid && roster.sessions[uid] && roster.sessions[uid].callsign && roster.sessions[uid].callsign !== cs) ? roster.sessions[uid].callsign : null,
                 cwd: uid ? (roster.sessions[uid].cwd || '') : '',
                 purpose: uid ? roster.sessions[uid].purpose : '',
                 alive: cs === 'jarvis' ? true : (uid ? aliveNow(uid) : false),
@@ -1802,12 +1890,17 @@ async function handleRequest(req, res) {
     }
     if (key === 'GET /schedule') {
         const s = loadSchedule();
+        const now = Date.now();
         const stale = s.date !== new Date().toDateString();
         const events = stale ? [] : (s.events || []);
-        const now = Date.now();
-        const next = events.find(e => Date.parse(e.start) > now) || null;
-        const current = events.find(e => Date.parse(e.start) <= now && now < Date.parse(e.end)) || null;
-        return json(res, 200, { events, next, current });
+        // Reminders live in the calendar too: keep upcoming ones plus any that fired within the
+        // last hour, so a just-passed reminder lingers briefly instead of vanishing instantly.
+        const reminders = (s.reminders || []).filter(r => r && r.start && Date.parse(r.start) > now - 3600000);
+        // The NEXT banner promotes the soonest upcoming item, meeting OR reminder.
+        const next = [...events, ...reminders].filter(e => Date.parse(e.start) > now)
+            .sort((a, b) => Date.parse(a.start) - Date.parse(b.start))[0] || null;
+        const current = events.find(e => e.end && Date.parse(e.start) <= now && now < Date.parse(e.end)) || null;
+        return json(res, 200, { events, reminders, next, current });
     }
     if (key === 'POST /schedule') {
         const b = await readBody(req);
@@ -1827,12 +1920,33 @@ async function handleRequest(req, res) {
         } else {
             s = parseScheduleText(b.text || '');
         }
+        // Reminders are independent of the (volatile, daily) meeting paste — carry them across.
+        const prevSched = loadSchedule();
+        s.reminders = Array.isArray(prevSched.reminders) ? prevSched.reminders : [];
+        pruneReminders(s);
         if (!s.events.length) return json(res, 400, { error: 'no events parsed - expected title lines followed by H:MM AM-H:MM PM lines, or an events array' });
         saveSchedule(s);
         const upcoming = s.events.filter(e => Date.parse(e.start) > Date.now()).length;
         record({ kind: 'sys', text: 'schedule loaded: ' + s.events.length + ' events, ' + upcoming + ' upcoming' });
         enqueueSay('Schedule loaded. ' + upcoming + ' upcoming.', 'jarvis');
         return json(res, 200, { ok: true, events: s.events.length, upcoming });
+    }
+    if (key === 'POST /remind') {
+        // Set a calendar reminder. Accepts {title,start} directly, or {text} to parse from
+        // natural language ("remind me in 10 minutes to X", "remind me at 3pm to X").
+        const b = await readBody(req);
+        let title = b.title, start = b.start;
+        if ((!title || !start) && b.text) {
+            const p = parseReminder(b.text);
+            if (!p) return json(res, 400, { error: 'could not find a time - try "remind me in 10 minutes to X" or "remind me at 3pm to X"' });
+            title = p.title; start = p.start;
+        }
+        if (!start || isNaN(Date.parse(start))) return json(res, 400, { error: 'a valid start time (or parseable text) is required' });
+        const r = createReminder(title, start);
+        const mins = Math.max(1, Math.round((Date.parse(r.start) - Date.now()) / 60000));
+        record({ kind: 'sys', text: 'reminder set: ' + r.title + ' @ ' + r.start });
+        enqueueSay('Reminder set: ' + r.title + (mins < 60 ? ', in ' + mins + ' minute' + (mins === 1 ? '' : 's') : ', at ' + clk(r.start)) + '.', 'jarvis');
+        return json(res, 200, { ok: true, reminder: r });
     }
     if (key === 'POST /hear') {
         const b = await readBody(req);
