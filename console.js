@@ -143,11 +143,11 @@ function renderChat() {
         return '<div class="row ' + (me ? 'me' : 'them') + '"><div class="bubble">' + chip
             + linkify(g.texts.join('\n')).split('\n').join('<br>')
             + (g.img ? '<br><a href="' + g.img + '" target="_blank"><img src="' + g.img + '" class="thumb"></a>' : '')
-            + '<span class="t">' + (g.ts || '').slice(11, 16) + '</span>'
+            + '<span class="t">' + fmtHM(g.ts) + '</span>'
             + '<span class="copybtn" data-c="' + btoa(unescape(encodeURIComponent(g.texts.join('\n')))) + '" title="copy">📋</span>' + reactBar + '</div></div>';
     }).join('');
     rawEl.innerHTML = chatEvts.slice(-200).reverse().map(e =>
-        '<div>[' + (e.ts || '').slice(11, 19) + '] <b>' + esc(e.kind === 'sys' ? 'SYS' : (e.who === 'you' ? 'YOU' : String(e.who).toUpperCase())) + '</b> ' + esc(e.text) + '</div>'
+        '<div>[' + fmtHMS(e.ts) + '] <b>' + esc(e.kind === 'sys' ? 'SYS' : (e.who === 'you' ? 'YOU' : String(e.who).toUpperCase())) + '</b> ' + esc(e.text) + '</div>'
     ).join('');
     if (pinned) chatEl.scrollTop = chatEl.scrollHeight;
 }
@@ -244,6 +244,11 @@ function fmtClock(iso) {
     h = h % 12 || 12;
     return h + ':' + String(m).padStart(2, '0') + ' ' + ap;
 }
+// Local-time clock for chat + raw-log timestamps. The stored ts is an ISO/UTC instant; new Date()
+// + getHours/getMinutes render it in the viewer's local zone (same basis as fmtClock above), instead
+// of slicing the raw "...Z" string which showed UTC.
+function fmtHM(iso) { if (!iso) return ''; const d = new Date(iso); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
+function fmtHMS(iso) { if (!iso) return ''; const d = new Date(iso); return fmtHM(iso) + ':' + String(d.getSeconds()).padStart(2, '0'); }
 // human countdown to a future ms-delta: "in 8 min" / "in 1 hr 20 min"
 function fmtCountdown(ms) {
     const totalMin = Math.round(ms / 60000);
