@@ -3,10 +3,11 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
 import { spawn, execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { captureScreen } from './screen.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, migrateWork } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, migrateWork, cwdKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -23,6 +24,11 @@ const BUS = join(DATA, 'bus.jsonl');
 const BUSBASE = join(DATA, 'bus.base'); // persisted count of bus events dropped off the front
 const REPOS = join(DATA, 'repos.json');
 const SCHEDULE = join(DATA, 'schedule.json');
+const AI_THREADS = join(DATA, 'ai-threads.json');   // conversational-tab thread store
+const AI_SPEND = join(DATA, 'ai-spend.json');        // conversational-tab monthly spend tracker
+// Hard monthly spend cap for the /ai tab (USD). Configurable; default $20. A non-positive/garbage
+// value means "no cap" (see capExceeded), so a clean default is enforced here.
+const AI_CAP = (() => { const v = Number(process.env.JARVIS_AI_CAP); return v > 0 ? v : 20; })();
 const ARCHIVE = join(DATA, 'archive');
 const WORKER_DOC = join(HERE, 'WORKER.md');
 const PORT = Number(process.env.JARVIS_PORT || 8124);
@@ -49,6 +55,33 @@ if (!existsSync(WORKLIST)) writeFileSync(WORKLIST, JSON.stringify({ version: WOR
 // once at terminal launch, so leftovers from past sessions are just clutter — REVIEW.md LOW).
 try { for (const f of readdirSync(DATA)) if (/^spawn-.*\.cmd$/i.test(f)) { try { unlinkSync(join(DATA, f)); } catch { } } } catch { }
 try { unlinkSync(join(DATA, 'STOP')); } catch { } // clear any wind-down stop sentinel left from a prior run
+
+// Crash survival. The hub is a personal always-on voice copilot: a single unhandled rejection or
+// throw in an event/timer/Playwright callback used to take the WHOLE process down (and every worker
+// long-poll with it) silently, leaving no trace. We now log every such error to crash.log and STAY
+// UP -- uptime beats purity here, and the realistic offenders (closed Playwright page, malformed
+// request body, a TTS eval, an fs race) don't corrupt on-disk state. The watchdog still relaunches
+// on a hard exit; this just stops the soft, recoverable errors from ever getting that far.
+const CRASHLOG = join(DATA, 'crash.log');
+function logCrash(kind, err) {
+    try {
+        const stamp = new Date().toISOString();
+        const detail = (err && err.stack) || (err && err.message) || String(err);
+        appendFileSync(CRASHLOG, `[${stamp}] ${kind}: ${detail}\n`);
+        console.error(`[${stamp}] ${kind}:`, err);
+    } catch { }
+}
+process.on('uncaughtException', (err) => logCrash('uncaughtException', err));
+process.on('unhandledRejection', (err) => logCrash('unhandledRejection', err));
+
+// Signal resilience. The hub kept "crashing" not from a JS fault but from a stray console
+// interrupt (Ctrl+C / Ctrl+Break) reaching the watchdog window and killing node. An always-on
+// copilot must not die to an accidental keypress or a parent shell being reaped. Ignore the
+// interrupt signals and keep running -- intentional shutdown still goes through the console
+// WIND DOWN button (STOP sentinel) and the commands.txt 'stop' path, never Ctrl+C.
+for (const sig of ['SIGINT', 'SIGBREAK', 'SIGHUP']) {
+    try { process.on(sig, () => logCrash('ignored-signal', new Error(sig + ' received; staying up (use WIND DOWN / commands stop to shut down)'))); } catch { }
+}
 
 const CONSOLE_HTML = readFileSync(join(HERE, 'console.html'), 'utf8');
 const CONSOLE_CSS = readFileSync(join(HERE, 'console.css'), 'utf8');
@@ -310,11 +343,9 @@ function findTaskAll(w, needle, lists, prefer) {
 function loadRepos() {
     try { return JSON.parse(readFileSync(REPOS, 'utf8')) || {}; } catch { return {}; }
 }
-// Stable key for a job's working directory (separator/case/trailing-slash insensitive).
-// Handoff records are stored under this so a successor on the same cwd can find them.
-function cwdKey(cwd) {
-    return String(cwd || '').toLowerCase().replace(/\\/g, '/').replace(/\/+$/, '');
-}
+// cwdKey (stable key for a job's working directory: separator/case/trailing-slash insensitive)
+// is imported from jarvis-text.mjs. Handoff records are stored under this so a successor on the
+// same cwd can find them.
 // Resolve a registered repo by cwd, falling back to an ad-hoc repo (same logic /spawn used).
 function resolveRepo(cwd) {
     const repos = loadRepos();
@@ -527,8 +558,6 @@ function retireSession(uid, summary, opts = {}) {
     try { unlinkSync(join(DATA, 'spawn-' + cs + '.cmd')); } catch { } // its launch script is done with
     const w = loadWork();
     const board = w.sessions[cs] || { working: [], queued: [], done: [], review: [] };
-    const unfinished = [...(board.working || []), ...(board.queued || [])];
-    const total = unfinished.length + (board.review || []).length + (board.done || []).length;
     // The handoff record: one-line summary + detailed notes + the FULL board snapshot (all lanes).
     const rec = {
         summary: s.summary || null,
@@ -570,15 +599,15 @@ function retireSession(uid, summary, opts = {}) {
         const nb = ensureBoard(w, succCs);
         // The FULL board travels: working+queued become the successor's queue (front), and the
         // review + done lanes carry over intact so nothing the human still needs to see is lost.
-        nb.queued = [...unfinished, ...nb.queued];
-        nb.review = [...(board.review || []), ...nb.review];
-        nb.done = [...(board.done || []), ...nb.done];
+        // transferBoard owns the merge + the (moved/total) accounting (pure, unit-tested).
+        const t = transferBoard(board, nb);
+        w.sessions[succCs] = t.board;
         if (w.focus === cs) w.focus = succCs;             // focus follows the work
         saveWork(w);
         saveRoster();
-        const moved = nb.working.length + nb.queued.length + nb.review.length + nb.done.length;
-        record({ kind: 'sys', text: cs + ' retired (' + uid + ') -> successor ' + succCs + '; board transferred (' + moved + '/' + total + ' tasks)' });
-        if (moved < total) enqueueSay('Warning: handoff to ' + succCs + ' may have dropped tasks. Check the board.', 'jarvis');
+        const moved = t.moved;
+        record({ kind: 'sys', text: cs + ' retired (' + uid + ') -> successor ' + succCs + '; board transferred (' + moved + '/' + t.total + ' tasks)' });
+        if (t.dropped) enqueueSay('Warning: handoff to ' + succCs + ' may have dropped tasks. Check the board.', 'jarvis');
         enqueueSay(cs + ' handed off to ' + succCs + '.' + (rec.summary ? ' ' + rec.summary : ''), 'jarvis');
         busAppend({ from: 'jarvis', to: uid, kind: 'retired', text: 'retired' });
         return true;
@@ -684,6 +713,41 @@ function resolveClaude() {
     }
     return 'claude';
 }
+// Console-less worker spawning. A worker's only channel to Chris is this hub (board/chat/perm
+// cards over HTTP), so its terminal window is pure crash-exposure: combining DOS/console windows
+// tears that console down and kills the worker. node-pty runs claude inside an invisible ConPTY
+// the hub owns (a real pseudo-TTY, so claude runs its normal persistent interactive session) with
+// NO window for a combine to reach. Default ON; set JARVIS_CONSOLELESS=0 to fall back to wt tabs.
+// Tradeoff: a ConPTY worker is a child of the hub, so it dies if the hub does (wt workers don't) —
+// acceptable now that the hub itself is console-less and crash-surviving.
+const CONSOLELESS = process.env.JARVIS_CONSOLELESS !== '0';
+const requireCjs = createRequire(import.meta.url);
+const workerPtys = new Map();
+let ptyMod = null, ptyTried = false;
+function getPty() {
+    if (!ptyTried) { ptyTried = true; try { ptyMod = requireCjs('node-pty'); } catch { ptyMod = null; } }
+    return ptyMod;
+}
+function spawnWorkerConsoleless(cs, repo, boot, model, hookSettings) {
+    const pty = getPty();
+    if (!pty) return false;
+    const args = [];
+    if (repo.permissionMode) args.push('--permission-mode', repo.permissionMode);
+    const md = model || repo.model;
+    if (md) args.push('--model', md);
+    if (hookSettings) args.push('--settings', hookSettings);
+    args.push(boot);
+    const log = join(DATA, 'worker-' + cs + '.log');
+    try { writeFileSync(log, ''); } catch { }
+    const proc = pty.spawn(resolveClaude(), args, {
+        name: 'xterm-color', cols: 140, rows: 40, cwd: repo.cwd,
+        env: { ...process.env, JARVIS_CALLSIGN: cs, JARVIS_PORT: String(PORT) },
+    });
+    proc.onData((d) => { try { appendFileSync(log, d); } catch { } });
+    proc.onExit(() => { workerPtys.delete(cs); });
+    workerPtys.set(cs, proc);
+    return true;
+}
 function spawnWorker(repo, purpose, model, handoff, tier, project) {
     const cs = assignCallsign();
     pendingPins.set(cs, Date.now());
@@ -707,11 +771,16 @@ function spawnWorker(repo, purpose, model, handoff, tier, project) {
     }
     if (project) boot += ' You are the ' + project + ' PROJECT worker: your task board IS the ' + project + ' column - use callsign "' + project + '" for every /worklist op (add/start/done/etc), not your own callsign, and speech the human points at ' + project + ' arrives on your poll loop. When you must hand off, /retire with successor:true so a fresh ' + project + ' worker takes over.';
     boot += ' Permissions: read-only and routine build commands (git status/diff/log, npm run lint, node --check, ls/cat/grep/rg, dotnet build/test) run WITHOUT asking the human; only risky or out-of-repo actions prompt. Favor those pre-approved commands, batch shell calls, and self-verify (run the lint gate yourself) instead of asking. If you fan out subagents, keep them to the same safe command set so they do not each trigger a prompt.' + (effTier ? ' You are a TRUSTED session: your non-risky actions are auto-approved — work autonomously and only surface genuine decisions.' : '');
+    const hookSettings = repo.permissionMode === 'bypassPermissions' ? null : join(DATA, 'perm-settings.json');
+    if (CONSOLELESS && spawnWorkerConsoleless(cs, repo, boot, model, hookSettings)) {
+        record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + repo.cwd + ' (' + repo.key + ') [console-less]' });
+        return cs;
+    }
     const pm = repo.permissionMode ? ' --permission-mode ' + repo.permissionMode : '';
     const md = model || repo.model;
     const mm = md ? ' --model ' + md : '';
     const scriptPath = join(DATA, 'spawn-' + cs + '.cmd');
-    const hookFlag = repo.permissionMode === 'bypassPermissions' ? '' : ' --settings "' + join(DATA, 'perm-settings.json') + '"';
+    const hookFlag = hookSettings ? ' --settings "' + hookSettings + '"' : '';
     writeFileSync(scriptPath, [
         '@echo off',
         'title ' + tabTitle,
@@ -1677,9 +1746,8 @@ async function handleRequest(req, res) {
         let successor = false;
         if (s && !s.ended) {
             const board = loadWork().sessions[s.callsign] || { working: [], queued: [] };
-            const hasWork = (board.working || []).length + (board.queued || []).length > 0;
             // auto-successor on retire when work remains; explicit successor:true/false overrides
-            successor = b.successor === true || (b.successor !== false && hasWork);
+            successor = shouldSpawnSuccessor(b.successor, boardHasWork(board));
         }
         const ok = retireSession(b.uid, String(b.summary || '').trim() || null, { successor });
         return json(res, ok ? 200 : 404, ok ? { ok: true, successor } : { error: 'unknown or already retired uid' });
@@ -1908,16 +1976,25 @@ async function main() {
     let consolePage = null;
     let context = null;
     if (!NO_UI) {
-        const { chromium } = await import('playwright');
-        context = await chromium.launchPersistentContext(USER_DATA, {
-            channel: 'chrome', headless: false, viewport: null,
-            args: ['--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required', `--app=${ORIGIN}`],
-        });
-        await context.grantPermissions(['microphone', 'clipboard-read', 'clipboard-write'], { origin: ORIGIN }).catch(() => { });
-        consolePage = context.pages()[0] || await context.newPage();
-        if (!consolePage.url().startsWith(ORIGIN)) await consolePage.goto(ORIGIN, { waitUntil: 'domcontentloaded' });
-        await consolePage.exposeFunction('__jarvisHear', (text) => handleUtterance(text));
-        consolePageRef = consolePage;
+        // The HTTP server is already listening above. A console/mic launch failure (locked
+        // chrome-profile from an orphaned window, missing Chrome, Playwright fault) must NOT take
+        // the server down -- workers depend on it for polling. Degrade to headless and stay up.
+        try {
+            const { chromium } = await import('playwright');
+            context = await chromium.launchPersistentContext(USER_DATA, {
+                channel: 'chrome', headless: false, viewport: null,
+                args: ['--use-fake-ui-for-media-stream', '--autoplay-policy=no-user-gesture-required', `--app=${ORIGIN}`],
+            });
+            await context.grantPermissions(['microphone', 'clipboard-read', 'clipboard-write'], { origin: ORIGIN }).catch(() => { });
+            consolePage = context.pages()[0] || await context.newPage();
+            if (!consolePage.url().startsWith(ORIGIN)) await consolePage.goto(ORIGIN, { waitUntil: 'domcontentloaded' });
+            await consolePage.exposeFunction('__jarvisHear', (text) => handleUtterance(text));
+            consolePageRef = consolePage;
+        } catch (e) {
+            logCrash('ui-launch-failed (running headless; HTTP + workers still up)', e);
+            consolePage = null;
+            context = null;
+        }
     }
 
     let speakingNow = false;

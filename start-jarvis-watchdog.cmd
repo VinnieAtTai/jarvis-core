@@ -30,7 +30,8 @@ set JARVIS_LINK_EMAIL=chris.vinciguerra@tai-software.com
 cd /d "%~dp0"
 :loop
 echo [watchdog] starting jarvis-core at %date% %time%
-node jarvis-core.mjs
+echo ===== watchdog launch %date% %time% ===== >> "%LOCALAPPDATA%\jarvis\watchdog.log"
+node jarvis-core.mjs >> "%LOCALAPPDATA%\jarvis\watchdog.log" 2>&1
 REM A wind-down writes a STOP sentinel (in %LOCALAPPDATA%\jarvis, the default JARVIS_DATA) to
 REM signal a REAL stop rather than a restart. If present, delete it and exit instead of relaunching.
 if exist "%LOCALAPPDATA%\jarvis\STOP" ( echo [watchdog] WIND-DOWN stop sentinel found -- stopping for the night. & del /q "%LOCALAPPDATA%\jarvis\STOP" >nul 2>&1 & goto end )

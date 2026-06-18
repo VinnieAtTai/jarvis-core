@@ -15,7 +15,7 @@ surface, and how a worker session lives and dies. Source of truth is `jarvis-cor
         │   (chat, board, schedule, perms)   │   │  :8124  sole writer   │
         └── POST /send /say /focus /worklist ─┘   │  of all state files   │
                                                   └───────────┬──────────┘
-                                              spawnWorker (wt.exe new tab)
+                              spawnWorker (console-less ConPTY; wt tab fallback)
                        routeTo() → bus.jsonl ─────────────────┤
                                                               ▼
                  Worker sessions (Claude Code CLIs): register, GET /poll (long-poll
@@ -56,7 +56,7 @@ Grouped by purpose; all JSON unless noted.
   `POST /hear` (inbound utterance → `handleUtterance`).
 - **Board:** `GET /worklist`, `GET /board` (console poll), `POST /worklist` (add/start/
   done/drop/move/clear-done), `GET /roster`, `GET /archive`.
-- **Sessions:** `POST /spawn` (open a worker in a new terminal tab), `POST /focus`,
+- **Sessions:** `POST /spawn` (launch a worker — console-less ConPTY by default), `POST /focus`,
   `POST /forget`, `GET/POST /hold` + `POST /unhold` (park/resume), `POST /voicemute`,
   `POST /attach`.
 - **Calendar:** `GET/POST /schedule` (meetings), `POST /remind` (reminders), surfaced via
@@ -70,9 +70,14 @@ Grouped by purpose; all JSON unless noted.
 
 ## Session lifecycle
 
-1. **Spawn** — `POST /spawn` (or the console rocket) runs `spawnWorker()`, which opens a new
-   Windows Terminal tab whose boot prompt tells the CLI to GET `/protocol` and register with a
-   pre-assigned NATO callsign (`pin`). Manual "open a terminal and start Claude" works too.
+1. **Spawn** — `POST /spawn` (or the console rocket) runs `spawnWorker()`, which launches the
+   Claude Code CLI with a boot prompt telling it to GET `/protocol` and register with a
+   pre-assigned NATO callsign (`pin`). By default the worker runs **console-less**: an invisible
+   ConPTY (`node-pty`) the hub owns, so there is no terminal window for a console combine/close to
+   tear down (set `JARVIS_CONSOLELESS=0` to fall back to a Windows Terminal tab). A console-less
+   worker is a child of the hub and dies with it — acceptable because the hub is itself
+   console-less + crash-surviving (see Resilience). Manual "open a terminal and start Claude"
+   works too.
 2. **Register** — `POST /register {cwd, purpose, pin?, project?}` → `{uid, callsign}`. A uid
    (`s_NNNN`) is the identity on every later call; the callsign is how the human refers to it
    by voice. If a predecessor on the same cwd/callsign left a handoff, it rides back on the
@@ -116,3 +121,26 @@ sessions auto-approve their non-risky actions.
 to `jarvis-core.mjs` / console assets take effect only on restart: `POST /restart` (the console
 **Rebuild** button) relaunches the hub with the latest code — live sessions ride it out (their
 poll/heartbeat loops retry through the gap). The in-memory token gauge resets on restart.
+
+In production the hub runs under a supervisor that relaunches it on a hard exit:
+`spawn-hub-detached.mjs` (a console-less, detached supervisor — preferred) or the older
+`start-jarvis-watchdog.cmd` loop. Both log to `%LOCALAPPDATA%\jarvis\watchdog.log`.
+
+## Resilience
+
+The hub is a personal always-on copilot, so uptime is a feature, not a nicety:
+
+- **Console-less.** The hub (and, by default, every worker) runs with no console window.
+  Combining or closing a Windows console fires `CTRL_CLOSE`/`SIGHUP` across every process
+  attached to it; with no console there is nothing to tear down. `spawn-hub-detached.mjs`
+  launches the hub detached for exactly this reason.
+- **Survives soft faults.** `uncaughtException` / `unhandledRejection` are logged to
+  `crash.log` and swallowed — the realistic offenders (a closed Playwright page, a malformed
+  request body, an fs race) don't corrupt on-disk state, so staying up beats dying. The
+  watchdog still catches genuine hard exits.
+- **Ignores interrupt signals.** `SIGINT` / `SIGBREAK` / `SIGHUP` are ignored so a stray
+  Ctrl+C or a reaped parent shell can't kill it. Intentional shutdown goes through WIND DOWN
+  (a `STOP` sentinel) or the `commands.txt` stop path.
+- **Degrades to headless.** If the console/mic launch fails (locked chrome profile, missing
+  Chrome, a Playwright fault) the hub logs it and runs headless rather than taking the HTTP
+  server — and every worker's poll loop — down with it.

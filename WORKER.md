@@ -22,8 +22,8 @@ If the response also carries a `handoff` field, a predecessor on your cwd left y
 chat line that you've picked up the handoff, then resume that work (see §5).
 
 If your boot instructions name a pin (e.g. "Register with pin: golf"), include
-`"pin":"golf"` in the register body — your terminal tab is already titled with that
-callsign, so claiming it keeps the tab and the board in sync.
+`"pin":"golf"` in the register body — the hub pre-assigned you that callsign when it
+spawned you, so claiming it keeps your session, the roster, and the board in sync.
 
 Both fields are REQUIRED and the purpose matters: it is the description the human sees next
 to your callsign on the board and hears in every announcement, and callsigns alone mean
@@ -127,7 +127,9 @@ curl.exe -s -X POST http://127.0.0.1:8124/retire -H "content-type: application/j
 
 The `summary` is your epitaph — what the human hears months later when they ask what the old
 you did; make it count. The `notes` are your detailed handoff (state, gotchas, what's left,
-where you were mid-thought). Then stop polling and end your turn. Leave the terminal open.
+where you were mid-thought). Then stop polling and end your turn — the hub manages your
+session from here (by default you have no terminal window of your own to close; you run
+console-less inside a ConPTY the hub owns).
 
 **Auto-successor.** If your board still has working/queued tasks when you retire, the hub
 spawns a SUCCESSOR on the same job, hands it your summary + notes + your unfinished board,
