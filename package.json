@@ -3,7 +3,9 @@
     "private": true,
     "type": "module",
     "scripts": {
-        "start": "node jarvis-core.mjs"
+        "start": "node jarvis-core.mjs",
+        "check": "node --check jarvis-core.mjs && node --check console.js",
+        "test": "node --test"
     },
     "dependencies": {
         "playwright": "^1.48.0"
