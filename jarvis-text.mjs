@@ -77,3 +77,54 @@ export function parseScheduleText(text) {
     events.sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
     return { date: new Date().toDateString(), events, announced: {} };
 }
+
+// ---- worklist shape helpers ----------------------------------------------------------------
+// Pure (no I/O) helpers for the on-disk worklist. migrateWork is injectable: the caller passes
+// its own makeTask/newTaskId so the id/time generation stays in jarvis-core, keeping this module
+// free of module-level state and unit-testable without booting the server.
+
+// Current worklist schema version. Bumped when the on-disk shape changes; migrateWork upgrades
+// older files to it. Single source of truth (jarvis-core imports this).
+export const WORK_VERSION = 3;
+
+// Read the text out of a task that may still be a bare string (defensive during/after migration).
+export function textOf(t) {
+    return (t && typeof t === 'object') ? (t.text == null ? '' : t.text) : (t == null ? '' : t);
+}
+
+// Bring any on-disk worklist up to the current shape. Idempotent: existing task objects
+// keep their ids (so ids are stable across reloads); only missing fields are backfilled.
+// Returns { w, changed } so the loader can persist a one-time upgrade. makeTask(text)->task and
+// newTaskId()->id are injected by the caller (they generate ids/timestamps, not pure).
+export function migrateWork(w, makeTask, newTaskId) {
+    let changed = false;
+    // v1 (flat board, no sessions) -> v2 (sessions keyed by callsign)
+    if (w && !w.sessions && (w.working || w.queued || w.done)) {
+        w = { focus: 'jarvis', sessions: { jarvis: { working: w.working || [], queued: w.queued || [], done: w.done || [] } } };
+        changed = true;
+    }
+    if (!w || !w.sessions || typeof w.sessions !== 'object') {
+        return { w: { version: WORK_VERSION, focus: 'jarvis', sessions: { jarvis: { working: [], queued: [], done: [] } } }, changed: true };
+    }
+    // v2 (string tasks) -> v3 (task objects)
+    for (const cs of Object.keys(w.sessions)) {
+        const b = w.sessions[cs];
+        if (!b || typeof b !== 'object') { w.sessions[cs] = { working: [], queued: [], done: [], review: [] }; changed = true; continue; }
+        for (const list of ['working', 'queued', 'done', 'review']) {
+            if (!Array.isArray(b[list])) { b[list] = []; changed = true; continue; }
+            b[list] = b[list].map(t => {
+                if (typeof t === 'string') { changed = true; return makeTask(t); }
+                if (t && typeof t === 'object') {
+                    if (!t.id) { t.id = newTaskId(); changed = true; }
+                    if (!t.addedAt) { t.addedAt = new Date().toISOString(); changed = true; }
+                    if (typeof t.text !== 'string') { t.text = String(t.text == null ? '' : t.text); changed = true; }
+                    return t;
+                }
+                changed = true; return makeTask(t);
+            });
+        }
+    }
+    if (!w.focus) { w.focus = 'jarvis'; changed = true; }
+    if (w.version !== WORK_VERSION) { w.version = WORK_VERSION; changed = true; }
+    return { w, changed };
+}

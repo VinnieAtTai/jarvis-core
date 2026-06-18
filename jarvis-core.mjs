@@ -6,7 +6,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { captureScreen } from './screen.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, migrateWork } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -30,7 +30,6 @@ const ORIGIN = `http://127.0.0.1:${PORT}`;
 const NO_UI = !!process.env.JARVIS_NO_UI;
 const PROJECTS = process.env.JARVIS_PROJECTS || join(process.env.USERPROFILE || '', '.claude', 'projects');
 const NATO = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel', 'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa', 'quebec', 'romeo', 'sierra', 'tango', 'uniform', 'victor', 'whiskey', 'xray', 'yankee', 'zulu'];
-const WORK_VERSION = 3;
 // Bound the in-memory event arrays AND their .jsonl files so a long-lived hub doesn't grow
 // without limit. We keep at most CACHE_CAP entries and only compact once we drift CACHE_SLACK
 // past it, so the (atomic) file rewrite happens every ~SLACK events, not on every append.
@@ -277,52 +276,13 @@ function makeTask(text, extra) {
     }
     return t;
 }
-// Read the text out of a task that may still be a bare string (defensive during/after migration).
-function textOf(t) {
-    return (t && typeof t === 'object') ? (t.text == null ? '' : t.text) : (t == null ? '' : t);
-}
-// Bring any on-disk worklist up to the current shape. Idempotent: existing task objects
-// keep their ids (so ids are stable across reloads); only missing fields are backfilled.
-// Returns { w, changed } so the loader can persist a one-time upgrade.
-function migrateWork(w) {
-    let changed = false;
-    // v1 (flat board, no sessions) -> v2 (sessions keyed by callsign)
-    if (w && !w.sessions && (w.working || w.queued || w.done)) {
-        w = { focus: 'jarvis', sessions: { jarvis: { working: w.working || [], queued: w.queued || [], done: w.done || [] } } };
-        changed = true;
-    }
-    if (!w || !w.sessions || typeof w.sessions !== 'object') {
-        return { w: { version: WORK_VERSION, focus: 'jarvis', sessions: { jarvis: { working: [], queued: [], done: [] } } }, changed: true };
-    }
-    // v2 (string tasks) -> v3 (task objects)
-    for (const cs of Object.keys(w.sessions)) {
-        const b = w.sessions[cs];
-        if (!b || typeof b !== 'object') { w.sessions[cs] = { working: [], queued: [], done: [], review: [] }; changed = true; continue; }
-        for (const list of ['working', 'queued', 'done', 'review']) {
-            if (!Array.isArray(b[list])) { b[list] = []; changed = true; continue; }
-            b[list] = b[list].map(t => {
-                if (typeof t === 'string') { changed = true; return makeTask(t); }
-                if (t && typeof t === 'object') {
-                    if (!t.id) { t.id = newTaskId(); changed = true; }
-                    if (!t.addedAt) { t.addedAt = new Date().toISOString(); changed = true; }
-                    if (typeof t.text !== 'string') { t.text = String(t.text == null ? '' : t.text); changed = true; }
-                    return t;
-                }
-                changed = true; return makeTask(t);
-            });
-        }
-    }
-    if (!w.focus) { w.focus = 'jarvis'; changed = true; }
-    if (w.version !== WORK_VERSION) { w.version = WORK_VERSION; changed = true; }
-    return { w, changed };
-}
 function loadWork() {
     let raw = null;
     if (existsSync(WORKLIST)) {
         try { raw = JSON.parse(readFileSync(WORKLIST, 'utf8')); }
         catch { backupCorrupt(WORKLIST); raw = null; }   // don't silently zero the only copy
     }
-    const { w, changed } = migrateWork(raw);
+    const { w, changed } = migrateWork(raw, makeTask, newTaskId);
     if (changed) { try { saveWork(w); } catch { } }
     return w;
 }
