@@ -556,6 +556,12 @@ function retireSession(uid, summary, opts = {}) {
     if (summary) s.summary = summary;
     const cs = s.callsign;
     try { unlinkSync(join(DATA, 'spawn-' + cs + '.cmd')); } catch { } // its launch script is done with
+    // A console-less worker runs in a ConPTY the hub owns; with no window to close, its idle
+    // claude process would otherwise linger as a hub child forever after retire. Kill it here so
+    // retiring actually reclaims the process. A successor (if any) is a separate pty under a new
+    // callsign, so this never touches the replacement. Falls through harmlessly for wt-tab workers
+    // (not in the map). onExit prunes the map; the delete is belt-and-suspenders.
+    try { const wp = workerPtys.get(cs); if (wp) { wp.kill(); workerPtys.delete(cs); } } catch { }
     const w = loadWork();
     const board = w.sessions[cs] || { working: [], queued: [], done: [], review: [] };
     // The handoff record: one-line summary + detailed notes + the FULL board snapshot (all lanes).
