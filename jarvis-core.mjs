@@ -2117,10 +2117,18 @@ async function main() {
 
     let consolePage = null;
     let context = null;
-    if (!NO_UI) {
-        // The HTTP server is already listening above. A console/mic launch failure (locked
-        // chrome-profile from an orphaned window, missing Chrome, Playwright fault) must NOT take
-        // the server down -- workers depend on it for polling. Degrade to headless and stay up.
+    let reopening = false;
+    let lastConsoleTry = 0;
+    // The HTTP server is already listening above. A console/mic launch failure (locked chrome-profile,
+    // missing Chrome, Playwright fault) must NOT take the server down -- workers depend on it for
+    // polling. AND because the hub now runs console-less, if the console window ever dies there is no
+    // terminal to fall back on, so we must REOPEN it automatically. openConsole() (re)launches the
+    // mic-wired Playwright window; the while-loop below health-checks it and calls this again within
+    // seconds of any death -- user-close, window-combine, hard kill, or the launch-race on restart
+    // (which just retries until the old Chrome frees the profile lock). Degrades to headless meanwhile.
+    async function openConsole() {
+        if (NO_UI || reopening) return;
+        reopening = true;
         try {
             const { chromium } = await import('playwright');
             context = await chromium.launchPersistentContext(USER_DATA, {
@@ -2133,11 +2141,15 @@ async function main() {
             await consolePage.exposeFunction('__jarvisHear', (text) => handleUtterance(text));
             consolePageRef = consolePage;
         } catch (e) {
-            logCrash('ui-launch-failed (running headless; HTTP + workers still up)', e);
-            consolePage = null;
-            context = null;
+            logCrash('ui-launch-failed (will retry; HTTP + workers still up)', e);
+            try { if (context) await context.close(); } catch { }
+            consolePage = null; context = null; consolePageRef = null;
+        } finally {
+            reopening = false;
         }
     }
+    const consoleAlive = () => { try { return !!consolePage && !consolePage.isClosed(); } catch { return false; } };
+    await openConsole();
 
     let speakingNow = false;
     const pump = () => {
@@ -2167,6 +2179,10 @@ async function main() {
             if (raw.trim()) raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean).forEach(l => enqueueSay(l, 'jarvis'));
         }
         pump();
+        if (!NO_UI && !reopening && !consoleAlive() && Date.now() - lastConsoleTry > 4000) {
+            lastConsoleTry = Date.now();
+            openConsole().catch(() => { });
+        }
         const cmds = drainWholeFile(CMD);
         if (cmds.split(/\r?\n/).some(l => l.trim() === 'stop')) running = false;
         await new Promise(r => setTimeout(r, 250));
