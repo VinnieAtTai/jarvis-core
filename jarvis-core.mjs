@@ -404,6 +404,17 @@ function liveUidOf(cs) {
     const s = roster.sessions[l[0]];
     return s && !s.ended ? l[0] : null;
 }
+// A project (e.g. 'jarvis') is a durable board card that can host ONE live worker. The worker
+// is a normal session (own uid + NATO callsign for the perm-hook) but carries .project, which
+// binds its board + routing to the project card instead of giving it its own separate card.
+function projectWorkerUid(name) {
+    if (!name) return null;
+    for (const uid in roster.sessions) {
+        const s = roster.sessions[uid];
+        if (s && !s.ended && s.project === name) return uid;
+    }
+    return null;
+}
 function liveCallsigns() {
     return NATO.filter(cs => liveUidOf(cs));
 }
@@ -503,7 +514,7 @@ function eventsFor(uid, cursor) {
     }
     return { cursor: busBase + bus.length, events };
 }
-function registerSession(cwd, purpose, pin) {
+function registerSession(cwd, purpose, pin, project) {
     const cs = assignCallsign(pin);
     pendingPins.delete(cs);
     let tier = pendingTier.get(cs); pendingTier.delete(cs);
@@ -511,17 +522,25 @@ function registerSession(cwd, purpose, pin) {
     tier = tier === 'trusted' ? 'trusted' : 'guarded';
     const uid = 's_' + String(roster.nextUid++).padStart(4, '0');
     const now = new Date().toISOString();
+    const proj = project ? String(project).toLowerCase().trim() : null;
     roster.callsigns[cs] = [uid, ...(roster.callsigns[cs] || [])];
-    roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier };
+    roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier, ...(proj ? { project: proj } : {}) };
     saveRoster();
     const w = loadWork();
-    ensureBoard(w, cs);
+    // A project worker binds to the project's durable card/column and gets NO separate card.
+    ensureBoard(w, proj || cs);
     let focusedNote = '';
-    if (liveCallsigns().length === 1) { w.focus = cs; focusedNote = ' Focused on it.'; }
+    if (proj) { w.focus = proj; focusedNote = ' Focused on ' + proj + '.'; }
+    else if (liveCallsigns().length === 1) { w.focus = cs; focusedNote = ' Focused on it.'; }
     saveWork(w);
     const reborn = roster.callsigns[cs].length > 1;
-    record({ kind: 'sys', text: 'registered ' + uid + ' as ' + cs + ': ' + (purpose || '') });
-    enqueueSay((reborn ? cs + ' is now ' : 'New session. ' + cs + ' is ') + (purpose || 'unnamed work') + '.' + focusedNote, 'jarvis');
+    if (proj) {
+        record({ kind: 'sys', text: 'registered ' + uid + ' as ' + proj + ' worker (' + cs + '): ' + (purpose || '') });
+        enqueueSay(proj + ' worker is up: ' + (purpose || 'the punchlist') + '.' + focusedNote, 'jarvis');
+    } else {
+        record({ kind: 'sys', text: 'registered ' + uid + ' as ' + cs + ': ' + (purpose || '') });
+        enqueueSay((reborn ? cs + ' is now ' : 'New session. ' + cs + ' is ') + (purpose || 'unnamed work') + '.' + focusedNote, 'jarvis');
+    }
     const out = { uid, callsign: cs };
     // Tell a fresh session if a predecessor on this cwd left a handoff — covers the manual
     // "kill the terminal and start over" path that never goes through spawnWorker.
@@ -560,6 +579,21 @@ function retireSession(uid, summary, opts = {}) {
         handoff: s.handoff || null, board,
     }, null, 1));
 
+    if (s.project) {
+        // Project worker: the durable project column stays put; just spawn the successor
+        // (which re-attaches to the project on register). No NATO column to delete/transfer.
+        let psucc = null;
+        if (opts.successor && s.cwd && s.purpose) {
+            try { psucc = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec, undefined, s.project); } catch { psucc = null; }
+        }
+        saveWork(w);
+        saveRoster();
+        record({ kind: 'sys', text: cs + ' (' + s.project + ' worker) retired (' + uid + ')' + (psucc ? ' -> successor ' + psucc : '') });
+        enqueueSay(psucc ? s.project + ' worker handed off.' : s.project + ' worker retired; the card is idle.', 'jarvis');
+        busAppend({ from: 'jarvis', to: uid, kind: 'retired', text: 'retired' });
+        return true;
+    }
+
     let succCs = null;
     if (opts.successor && s.cwd && s.purpose) {
         try { succCs = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec); }
@@ -595,7 +629,7 @@ function retireSession(uid, summary, opts = {}) {
 const SPEECH_DEBOUNCE = Number(process.env.JARVIS_SPEECH_DEBOUNCE || 4000);
 const nagAt = {};
 function routeTo(cs, msg) {
-    const uid = liveUidOf(cs);
+    const uid = liveUidOf(cs) || projectWorkerUid(cs);
     if (!uid) return false;
     busAppend({ from: 'human', to: uid, kind: 'speech', text: msg }, SPEECH_DEBOUNCE);
     record({ kind: 'speech', text: msg, to: cs });
@@ -684,7 +718,7 @@ function resolveClaude() {
     }
     return 'claude';
 }
-function spawnWorker(repo, purpose, model, handoff, tier) {
+function spawnWorker(repo, purpose, model, handoff, tier, project) {
     const cs = assignCallsign();
     pendingPins.set(cs, Date.now());
     const effTier = (tier || repo.tier) === 'trusted' ? 'trusted' : null;
@@ -694,7 +728,7 @@ function spawnWorker(repo, purpose, model, handoff, tier) {
     // phantom callsign. Strip it alongside the other shell/wt specials.
     const safePurpose = purpose.replace(/["'^&<>|%;]/g, '');
     const tabTitle = cs + ' - ' + safePurpose;
-    let boot = 'You are a JARVIS worker session. Fetch http://127.0.0.1:' + PORT + '/protocol with a plain GET request and follow it exactly. Register with pin: ' + cs + ' and purpose: ' + safePurpose + '.';
+    let boot = 'You are a JARVIS worker session. Fetch http://127.0.0.1:' + PORT + '/protocol with a plain GET request and follow it exactly. Register with pin: ' + cs + ' and purpose: ' + safePurpose + (project ? ' and project: ' + project : '') + '.';
     if (handoff) {
         // Stash the handoff under this callsign (plain letters -> safe in the .cmd, no %-encoding)
         // so the successor can pull it the moment it boots and resume without a human re-brief.
@@ -705,6 +739,7 @@ function spawnWorker(repo, purpose, model, handoff, tier) {
     } else {
         boot += ' Then wait for instructions on the poll loop.';
     }
+    if (project) boot += ' You are the ' + project + ' PROJECT worker: your task board IS the ' + project + ' column - use callsign "' + project + '" for every /worklist op (add/start/done/etc), not your own callsign, and speech the human points at ' + project + ' arrives on your poll loop. When you must hand off, /retire with successor:true so a fresh ' + project + ' worker takes over.';
     boot += ' Permissions: read-only and routine build commands (git status/diff/log, npm run lint, node --check, ls/cat/grep/rg, dotnet build/test) run WITHOUT asking the human; only risky or out-of-repo actions prompt. Favor those pre-approved commands, batch shell calls, and self-verify (run the lint gate yourself) instead of asking. If you fan out subagents, keep them to the same safe command set so they do not each trigger a prompt.' + (effTier ? ' You are a TRUSTED session: your non-risky actions are auto-approved — work autonomously and only surface genuine decisions.' : '');
     const pm = repo.permissionMode ? ' --permission-mode ' + repo.permissionMode : '';
     const md = model || repo.model;
@@ -1120,15 +1155,15 @@ function handleUtterance(rawText, typed) {
     if ((m = canon(text).match(/^on\s+(\S+)[\s,.!]+(.+)$/i))) {
         const cs = csFrom(m[1]);
         if (cs && cs !== 'jarvis') { routeTo(cs, m[2].trim()); return; }
-        if (cs === 'jarvis') { record({ kind: 'speech', text: m[2].trim() }); return; }
+        if (cs === 'jarvis') { if (!routeTo('jarvis', m[2].trim())) record({ kind: 'speech', text: m[2].trim() }); return; }
     }
     if (/^jarvis[\s,.!]+/i.test(text)) {
         const t = text.replace(/^jarvis[\s,.!]+/i, '').trim();
-        if (t) record({ kind: 'speech', text: t });
+        if (t) { if (!routeTo('jarvis', t)) record({ kind: 'speech', text: t }); }
         return;
     }
     const focus = loadWork().focus;
-    if (focus !== 'jarvis' && liveUidOf(focus)) {
+    if (liveUidOf(focus) || projectWorkerUid(focus)) {
         routeTo(focus, text);
         return;
     }
@@ -1173,12 +1208,12 @@ async function handleRequest(req, res) {
     if (key === 'GET /worklist') return json(res, 200, loadWork());
     if (key === 'GET /board') {
         const w = loadWork();
-        const lives = liveCallsigns();
+        const lives = liveCallsigns().filter(c => !(roster.sessions[liveUidOf(c)] || {}).project);
         const order = [w.focus, ...lives.filter(cs => cs !== w.focus), ...(w.focus === 'jarvis' ? [] : ['jarvis'])];
         const extras = Object.keys(w.sessions).filter(cs => !order.includes(cs));
         const boards = [...new Set([...order, ...extras])].map(cs => {
             const b = w.sessions[cs] || { working: [], queued: [], done: [], review: [] };
-            const uid = cs === 'jarvis' ? null : liveUidOf(cs);
+            const uid = liveUidOf(cs) || projectWorkerUid(cs);
             const pends = uid ? [...pendingPerms.values()].filter(p => p.uid === uid) : [];
             return {
                 callsign: cs,
@@ -1395,7 +1430,7 @@ async function handleRequest(req, res) {
         if (!String(b.purpose || '').trim() || !String(b.cwd || '').trim()) {
             return json(res, 400, { error: 'purpose and cwd are required. purpose is the one-line description the human sees on the board and hears in announcements; make it specific. Re-POST with both.' });
         }
-        try { return json(res, 200, registerSession(b.cwd, b.purpose, b.pin)); }
+        try { return json(res, 200, registerSession(b.cwd, b.purpose, b.pin, b.project)); }
         catch (e) { return json(res, 409, { error: e.message }); }
     }
     if (key === 'POST /health') {
@@ -1498,8 +1533,8 @@ async function handleRequest(req, res) {
         const repo = resolveRepo(cwd);
         roster.handoffs = roster.handoffs || {};
         const handoff = roster.handoffs[cwdKey(cwd)] || null;
-        const cs = spawnWorker(repo, purpose, b.model, handoff, b.tier);
-        enqueueSay('Launching ' + cs + ' in ' + repo.key + (handoff ? ', resuming the handoff' : '') + '.', 'jarvis');
+        const cs = spawnWorker(repo, purpose, b.model, handoff, b.tier, b.project);
+        enqueueSay('Launching ' + (b.project ? b.project + ' worker' : cs) + ' in ' + repo.key + (handoff ? ', resuming the handoff' : '') + '.', 'jarvis');
         return json(res, 200, { ok: true, callsign: cs });
     }
     if (key === 'POST /permission') {

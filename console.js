@@ -277,6 +277,7 @@ function chipFor(text) {
 function renderBoards(d) {
     focusCS = d.focus;
     lastBoard = d;
+    populateAddTaskCols(d);
     if (typeof d.muted === 'boolean' && d.muted !== isMuted) window.__setMute(d.muted);
     if (typeof d.paused === 'boolean' && d.paused !== isPaused) window.__setPause(d.paused);
     renderHeat();
@@ -347,7 +348,16 @@ function renderBoards(d) {
             btns += '<span class="cbtn" data-act="restart" data-uid="' + esc(b.uid || '') + '" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="restart: retire then relaunch">↻</span>';
             btns += '<span class="cbtn" data-act="close" data-cs="' + esc(cs) + '" title="close / retire">✕</span>';
         } else if (cs === 'jarvis') {
-            btns += '<span class="cbtn" data-act="spawnjarvis" title="stand up a worker on jarvis-core to work the punchlist">🚀</span>';
+            if (b.uid) {
+                // a jarvis PROJECT worker is attached -> full session controls, never Close
+                // (jarvis is permanent; when the worker retires the card idles on the punchlist).
+                if (!focused) btns += '<span class="cbtn" data-act="focus" data-cs="jarvis" title="focus">★</span>';
+                btns += '<span class="cbtn" data-act="voicemute" data-cs="jarvis" data-uid="' + esc(b.uid) + '" data-on="' + (b.voiceMuted ? '0' : '1') + '" title="' + (b.voiceMuted ? 'voice muted - click to unmute' : 'silence this session voice') + '">' + (b.voiceMuted ? '🔇' : '🔊') + '</span>';
+                btns += '<span class="cbtn" data-act="hold" data-cs="jarvis" data-uid="' + esc(b.uid) + '" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="park the jarvis worker - resume later">💤</span>';
+                btns += '<span class="cbtn" data-act="restart" data-uid="' + esc(b.uid) + '" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="restart the jarvis worker (retire + relaunch)">↻</span>';
+            } else {
+                btns += '<span class="cbtn" data-act="spawnjarvis" title="spin up the jarvis worker to work the punchlist">🚀</span>';
+            }
             btns += '<span class="cbtn" data-act="rebuild" title="rebuild: restart the hub with the latest jarvis-core code">↻</span>';
         }
         let bctx = b.context;
@@ -439,11 +449,11 @@ workEl.onclick = (e) => {
     if (act === 'focus') post('/focus', { callsign: t.getAttribute('data-cs') });
     else if (act === 'close') post('/forget', { callsign: t.getAttribute('data-cs') });
     else if (act === 'continue') post('/spawn', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
-    else if (act === 'spawnjarvis') post('/spawn', { cwd: 'd:/claude/jarvis-core', purpose: 'JARVIS punchlist' });
+    else if (act === 'spawnjarvis') post('/spawn', { cwd: 'd:/claude/jarvis-core', purpose: 'JARVIS punchlist', project: 'jarvis' });
     else if (act === 'rebuild') { if (confirm('Rebuild JARVIS now? Restarts the hub with the latest jarvis-core code. Live sessions ride it out. Heads-up: this resets the in-memory token gauge.')) post('/restart', {}); }
     else if (act === 'restart') post('/retire', { uid: t.getAttribute('data-uid'), summary: 'Restarted from console.', successor: true });
-    else if (act === 'hold') post('/hold', { callsign: t.getAttribute('data-cs'), cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
-    else if (act === 'voicemute') post('/voicemute', { callsign: t.getAttribute('data-cs'), on: t.getAttribute('data-on') === '1' });
+    else if (act === 'hold') post('/hold', { uid: t.getAttribute('data-uid') || undefined, callsign: t.getAttribute('data-cs'), cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
+    else if (act === 'voicemute') post('/voicemute', { uid: t.getAttribute('data-uid') || undefined, callsign: t.getAttribute('data-cs'), on: t.getAttribute('data-on') === '1' });
     else if (act === 'continueall' && lastBoard) lastBoard.boards.filter(b => b.alive === false && b.callsign !== 'jarvis' && b.cwd && b.purpose).forEach(b => post('/spawn', { cwd: b.cwd, purpose: b.purpose }));
     else if (act === 'approve') post('/permission-answer', { id: t.getAttribute('data-permid'), decision: 'allow' });
     else if (act === 'deny') post('/permission-answer', { id: t.getAttribute('data-permid'), decision: 'deny' });
@@ -462,6 +472,34 @@ document.addEventListener('click', (e) => {
     const title = unb64(t.getAttribute('data-mtask'));
     fetch('/worklist', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op: 'add', text: title, callsign: 'jarvis' }) }).then(() => { t.style.color = '#5dd97c'; t.textContent = '✓'; }).catch(() => { });
 });
+// Add-task / to-do bar: human-side task entry (sessions add via the /worklist API; the
+// console had no way to). Persistent (lives in console.html, not the 1.5s board re-render),
+// so focus/typing survive. Target selector defaults to the focused session and always
+// offers a general "jarvis" to-do list. Category tags (BUG:/FEATURE:/…) chip automatically.
+function populateAddTaskCols(d) {
+    const sel = document.getElementById('atcol');
+    if (!sel || sel === document.activeElement) return; // don't yank an open dropdown
+    const names = [];
+    (d.boards || []).forEach(b => { if (b.callsign && !names.includes(b.callsign)) names.push(b.callsign); });
+    if (!names.includes('jarvis')) names.unshift('jarvis');
+    const cur = sel.value;
+    const want = (cur && names.includes(cur)) ? cur : ((d.focus && names.includes(d.focus)) ? d.focus : 'jarvis');
+    const sig = names.join('|') + '>' + want;
+    if (sel.dataset.sig === sig) return; // nothing changed — leave the DOM (and selection) alone
+    sel.dataset.sig = sig;
+    sel.innerHTML = names.map(n => '<option value="' + escAttr(n) + '"' + (n === want ? ' selected' : '') + '>' + esc(n === 'jarvis' ? 'jarvis (to-do)' : n) + '</option>').join('');
+    sel.value = want;
+}
+function submitAddTask() {
+    const ti = document.getElementById('atext'), sel = document.getElementById('atcol');
+    const text = (ti.value || '').trim();
+    if (!text) return;
+    const cs = (sel && sel.value) || 'jarvis';
+    fetch('/worklist', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op: 'add', callsign: cs, text }) })
+        .then(() => { ti.value = ''; ti.focus(); }).catch(() => { });
+}
+document.getElementById('atadd').onclick = submitAddTask;
+document.getElementById('atext').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submitAddTask(); } e.stopPropagation(); });
 let isMuted = false;
 window.__setMute = (on) => {
     isMuted = !!on;
