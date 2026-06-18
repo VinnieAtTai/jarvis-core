@@ -113,10 +113,11 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .holdhead{color:#d9a05d}
 #holdpanel{border-color:#3a3122}
 .ctoggle{cursor:pointer;color:#5db4d9;font-size:11px;user-select:none;margin:2px 0}
-.witem{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.witem{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;border-radius:4px;margin:0 -6px;padding:0 6px;transition:background .12s}
 .wleft{display:flex;align-items:center;gap:5px;min-width:0;flex:1}
 .wtext{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .rowacts{opacity:0;white-space:nowrap;transition:opacity .12s}
+.witem:hover{background:#16222f}
 .witem:hover .rowacts{opacity:1}
 .ract{cursor:pointer;margin-left:6px;font-size:12px;opacity:.7}
 .ract:hover{opacity:1}

@@ -237,16 +237,10 @@ loadNotify();
 
 const boardExpand = new Set();
 let lastBoard = null, lastSched = null;
-function fmtClock(iso) {
-    const d = new Date(iso);
-    let h = d.getHours();
-    const m = d.getMinutes(), ap = h >= 12 ? 'PM' : 'AM';
-    h = h % 12 || 12;
-    return h + ':' + String(m).padStart(2, '0') + ' ' + ap;
-}
-// Local-time clock for chat + raw-log timestamps. The stored ts is an ISO/UTC instant; new Date()
-// + getHours/getMinutes render it in the viewer's local zone (same basis as fmtClock above), instead
-// of slicing the raw "...Z" string which showed UTC.
+// Local-time 24-hour clock (HH:MM) for chat, raw-log, and schedule timestamps. The stored ts is an
+// ISO/UTC instant; new Date() + getHours/getMinutes render it in the viewer's local zone, instead of
+// slicing the raw "...Z" string which showed UTC. 24-hour keeps every time a fixed 5 chars so the
+// schedule column right-aligns cleanly (no ragged "9:00 AM" vs "12:00 PM").
 function fmtHM(iso) { if (!iso) return ''; const d = new Date(iso); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
 function fmtHMS(iso) { if (!iso) return ''; const d = new Date(iso); return fmtHM(iso) + ':' + String(d.getSeconds()).padStart(2, '0'); }
 // human countdown to a future ms-delta: "in 8 min" / "in 1 hr 20 min"
@@ -314,7 +308,7 @@ function renderBoards(d) {
             const cd = ms <= 0 ? 'starting now' : fmtCountdown(ms);
             const isRem = e.kind === 'reminder';
             rows.push('<div class="evrow nmrow"><span><span class="nmlabel next' + (soon ? ' soon' : '') + '">' + (isRem ? 'REMINDER' : 'NEXT') + '</span> ' + (isRem ? '⏰ ' : '') + esc(e.title)
-                + ' <span class="nmtime nmcd' + (soon ? ' soon' : '') + '">' + cd + ' · ' + fmtClock(e.start) + '</span></span>' + evIcons(e) + '</div>');
+                + ' <span class="nmtime nmcd' + (soon ? ' soon' : '') + '">' + cd + ' · ' + fmtHM(e.start) + '</span></span>' + evIcons(e) + '</div>');
         }
         top = rows.join('');
     }
@@ -332,12 +326,12 @@ function renderBoards(d) {
             if (e._k === 'r') {
                 const due = Date.parse(e.start) <= now, fired = !!e.firedAt;
                 const col = (due || fired) ? '#7d6fb0' : '#b9a7e6';
-                return '<div class="witem evrow" style="color:' + col + '"><span>' + fmtClock(e.start) + '  ⏰ ' + esc(e.title) + (fired ? ' ✓' : '') + '</span></div>';
+                return '<div class="witem evrow" style="color:' + col + '"><span>' + fmtHM(e.start) + '  ⏰ ' + esc(e.title) + (fired ? ' ✓' : '') + '</span></div>';
             }
             const s = Date.parse(e.start), en = Date.parse(e.end);
             const past = en < now, cur = s <= now && now < en;
             const col = past ? '#566270' : cur ? '#e8c35a' : '#9bb0c4';
-            return '<div class="witem evrow" style="color:' + col + (cur ? ';font-weight:bold' : '') + '"><span>' + fmtClock(e.start) + '  ' + esc(e.title) + '</span>' + (past ? '' : evIcons(e)) + '</div>';
+            return '<div class="witem evrow" style="color:' + col + (cur ? ';font-weight:bold' : '') + '"><span>' + fmtHM(e.start) + '  ' + esc(e.title) + '</span>' + (past ? '' : evIcons(e)) + '</div>';
         }).join('');
     }
     const np = document.getElementById('nextpanel'), sp = document.getElementById('schedpanel');
@@ -457,7 +451,9 @@ function renderBoards(d) {
 workEl.onclick = (e) => {
     const t = e.target.closest ? e.target.closest('[data-x],[data-op],[data-act]') : null;
     if (!t) return;
-    const post = (url, body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).catch(() => { });
+    const post = (url, body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) })
+        .then(r => { if (!r.ok) alert('Action failed (' + r.status + ') on ' + url + ' — the hub rejected it, nothing was saved.'); return r; })
+        .catch(() => alert('Could not reach the hub for ' + url + ' — it is down or restarting, so NOTHING was saved. Reload the console once it is back, then retry.'));
     const x = t.getAttribute('data-x');
     if (x) { if (boardExpand.has(x)) boardExpand.delete(x); else boardExpand.add(x); if (lastBoard) renderBoards(lastBoard); return; }
     const op = t.getAttribute('data-op');
@@ -690,8 +686,12 @@ document.getElementById('holdpanel').onclick = (e) => {
 };
 function eventsForTab() {
     if (activeTab === 'all') return chatEvts;
-    if (activeTab === 'general') return chatEvts.filter(e => e.kind === 'sys' || e.who === 'jarvis' || (e.who === 'you' && !e.to));
-    if (activeTab === 'jarvis') return chatEvts.filter(e => e.who === 'jarvis' || (e.who === 'you' && (!e.to || e.to === 'jarvis')));
+    // The jarvis PROJECT worker speaks under its own callsign (e.g. "uniform"), but it IS jarvis —
+    // surface its messages on the JARVIS/GENERAL tabs by treating the bound worker callsign as jarvis.
+    const _jb = lastBoard && lastBoard.boards.find(b => b.callsign === 'jarvis');
+    const _jw = _jb && _jb.worker;
+    if (activeTab === 'general') return chatEvts.filter(e => e.kind === 'sys' || e.who === 'jarvis' || (_jw && e.who === _jw) || (e.who === 'you' && !e.to));
+    if (activeTab === 'jarvis') return chatEvts.filter(e => e.who === 'jarvis' || (_jw && e.who === _jw) || (e.who === 'you' && (!e.to || e.to === 'jarvis' || (_jw && e.to === _jw))));
     return chatEvts.filter(e => e.kind !== 'sys' && (e.who === activeTab || (e.who === 'you' && e.to === activeTab)));
 }
 function renderTabs() {
