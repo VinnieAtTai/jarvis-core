@@ -111,7 +111,7 @@ meeting mode. `jarvis shutdown` is the only true mute. All state persists on dis
   so there's no terminal window per worker. Set `JARVIS_CONSOLELESS=0` to fall back to a
   Windows Terminal (`wt`) tab.
 - The hub survives soft faults and ignored interrupt signals (logs to `crash.log`) and runs
-  headless if the console/mic fails to launch — see ARCHITECTURE.md → Resilience. For an
+  headless if the console/mic fails to launch — see docs/ARCHITECTURE.md → Resilience. For an
   always-on supervisor, launch via `spawn-hub-detached.mjs` (console-less, detached).
 - Closing the console window kills the ears; the hub keeps running — restart with `npm start`.
-- Design history and decisions: [DESIGN.md](DESIGN.md).
+- Design history and decisions: [DESIGN.md](docs/DESIGN.md).
