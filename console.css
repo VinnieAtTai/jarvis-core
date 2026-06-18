@@ -162,3 +162,13 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .ntlabel{font-size:15px}
 .ntstatus{font-size:11px;color:#7a8a9c;white-space:nowrap}
 .ntstatus.on{color:#5dd97c}
+/* Conversational ASK tab — direct model chat (talks to /ai/*, not the speech bus) */
+#aibar{gap:8px;align-items:center;flex-wrap:wrap;padding:2px 0}
+#aibar select{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:5px 8px;font:12px Consolas,monospace;max-width:220px}
+#aithreads{flex:1;min-width:90px}
+#aichat{flex-direction:column;gap:6px;overflow-y:auto;height:60vh;background:#0d1420;border-radius:6px;padding:10px}
+.aispend{margin-left:auto;font-size:12px;color:#7a8a9c;white-space:nowrap;font-variant-numeric:tabular-nums}
+.aispend.near{color:#d9a05d}
+.aispend.over{color:#e06c6c;font-weight:bold}
+.aiempty{color:#7a8a9c;font-style:italic;font-size:12px;padding:8px}
+.aiwait{color:#7a8a9c;font-style:italic}

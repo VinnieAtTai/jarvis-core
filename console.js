@@ -571,6 +571,7 @@ document.getElementById('jvwind').onclick = async () => {
 };
 const typeBox = document.getElementById('typebox');
 function sendTyped() {
+    if (activeTab === 'ask') { sendAi(); return; }   // ASK tab posts to /ai/send, not the speech bus
     const t = typeBox.value.trim();
     if (!t) return;
     typeBox.value = '';
@@ -578,6 +579,145 @@ function sendTyped() {
     const out = activeTab === 'jarvis' ? ('jarvis ' + t) : sess ? ('on ' + activeTab + ', ' + t) : t;
     fetch('/hear', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: out, typed: true }) }).catch(() => { });
 }
+// —— Conversational ASK tab. A direct model chat that talks to /ai/* (not the speech bus): its
+// own thread list, model picker (Sonnet default, Opus one click away), and a running spend/cap
+// readout. Reuses the chat input box; sendTyped() routes here when the ASK tab is active.
+const MODEL_LABELS = { 'claude-haiku-4-5': 'Haiku · fast', 'claude-sonnet-4-6': 'Sonnet · default', 'claude-opus-4-8': 'Opus · deep' };
+const aiState = { threads: [], models: [], defaultModel: 'claude-sonnet-4-6', curThreadId: null, messages: [], model: '', spend: null, hasKey: false, busy: false };
+let askActive = false;
+const aichatEl = document.getElementById('aichat');
+const aibarEl = document.getElementById('aibar');
+const aiThreadsSel = document.getElementById('aithreads');
+const aiModelSel = document.getElementById('aimodel');
+const aispendEl = document.getElementById('aispend');
+// Toggle the left panel between the speech chat and the ASK chat. Idempotent + cheap: only acts
+// on a real mode change, so the 1.5s board re-render (which calls renderTabs) never reloads it.
+function applyTabMode() {
+    const want = activeTab === 'ask';
+    if (want === askActive) return;
+    askActive = want;
+    if (want) {
+        chatEl.style.display = 'none'; rawEl.style.display = 'none';
+        document.getElementById('bar').style.display = 'none';
+        document.getElementById('newsessbox').style.display = 'none';
+        aibarEl.style.display = 'flex'; aichatEl.style.display = 'flex';
+        typeBox.placeholder = 'Ask JARVIS — direct model chat, separate from the voice bus';
+        loadAiThreads(true);
+    } else {
+        aibarEl.style.display = 'none'; aichatEl.style.display = 'none';
+        document.getElementById('bar').style.display = 'flex';
+        setRaw(rawMode);   // restores #chat / #rawlog visibility
+        renderTabs();      // resets the input placeholder for the new tab
+    }
+}
+function renderSpend() {
+    if (!aiState.spend) { aispendEl.textContent = ''; aispendEl.className = 'aispend'; return; }
+    const usd = aiState.spend.usd || 0, cap = aiState.spend.cap || 0;
+    const over = cap > 0 && usd >= cap, near = cap > 0 && usd >= cap * 0.8;
+    aispendEl.textContent = '$' + usd.toFixed(2) + (cap > 0 ? ' / $' + cap.toFixed(0) : '');
+    aispendEl.className = 'aispend' + (over ? ' over' : near ? ' near' : '');
+}
+function renderModelSel() {
+    if (!aiState.models.length) return;
+    const want = aiState.model || aiState.defaultModel;
+    const sig = aiState.models.join('|') + '>' + want;
+    if (aiModelSel.dataset.sig === sig) return;
+    aiModelSel.dataset.sig = sig;
+    aiModelSel.innerHTML = aiState.models.map(m => '<option value="' + escAttr(m) + '"' + (m === want ? ' selected' : '') + '>' + esc(MODEL_LABELS[m] || m) + '</option>').join('');
+    aiModelSel.value = want;
+}
+function renderThreadSel() {
+    const opts = ['<option value="">+ new chat</option>'].concat(aiState.threads.map(t =>
+        '<option value="' + escAttr(t.id) + '"' + (t.id === aiState.curThreadId ? ' selected' : '') + '>' + esc((t.title || 'chat').slice(0, 42)) + '</option>'));
+    aiThreadsSel.innerHTML = opts.join('');
+    aiThreadsSel.value = aiState.curThreadId || '';
+}
+function renderAiMessages() {
+    if (!aiState.messages.length) {
+        aichatEl.innerHTML = '<div class="aiempty">' + (aiState.hasKey
+            ? 'New chat. Pick a model and ask anything — this talks straight to the Claude API, not the voice bus.'
+            : '&#9888; No API key found. Paste one into <b>anthropic-key.txt</b> at the repo root (or set ANTHROPIC_API_KEY) to use this tab.') + '</div>';
+        return;
+    }
+    let h = aiState.messages.map(m => {
+        const me = m.role === 'user';
+        const tag = (!me && m.model) ? '<span class="chip">' + esc((MODEL_LABELS[m.model] || m.model).split(' ')[0].toUpperCase()) + ' &#183; </span>' : '';
+        return '<div class="row ' + (me ? 'me' : 'them') + '"><div class="bubble">' + tag
+            + linkify(m.content || '').split('\n').join('<br>')
+            + (m.ts ? '<span class="t">' + fmtHM(m.ts) + '</span>' : '')
+            + '<span class="copybtn" data-c="' + b64(m.content || '') + '" title="copy">📋</span></div></div>';
+    }).join('');
+    if (aiState.busy) h += '<div class="row them"><div class="bubble aiwait">…thinking</div></div>';
+    aichatEl.innerHTML = h;
+    aichatEl.scrollTop = aichatEl.scrollHeight;
+}
+async function loadAiThreads(selectLatest) {
+    try {
+        const r = await (await fetch('/ai/threads')).json();
+        aiState.threads = r.threads || [];
+        aiState.models = r.models || [];
+        aiState.defaultModel = r.defaultModel || 'claude-sonnet-4-6';
+        aiState.spend = r.spend || null;
+        aiState.hasKey = !!r.hasKey;
+        if (!aiState.model) aiState.model = aiState.defaultModel;
+        if (selectLatest && aiState.curThreadId == null && aiState.threads.length) { await openAiThread(aiState.threads[0].id); return; }
+        renderThreadSel(); renderModelSel(); renderSpend();
+        if (aiState.curThreadId == null) renderAiMessages();
+    } catch { }
+}
+async function openAiThread(id) {
+    if (!id) { aiState.curThreadId = null; aiState.messages = []; renderThreadSel(); renderModelSel(); renderAiMessages(); return; }
+    try {
+        const r = await (await fetch('/ai/thread?id=' + encodeURIComponent(id))).json();
+        if (r.error) return;
+        aiState.curThreadId = id;
+        aiState.messages = r.messages || [];
+        aiState.model = r.model || aiState.defaultModel;
+        renderThreadSel(); renderModelSel(); renderAiMessages();
+    } catch { }
+}
+async function sendAi() {
+    const t = typeBox.value.trim();
+    if (!t || aiState.busy) return;
+    typeBox.value = '';
+    aiState.model = aiModelSel.value || aiState.defaultModel;
+    aiState.messages.push({ role: 'user', content: t, ts: new Date().toISOString() });
+    aiState.busy = true; renderAiMessages();
+    try {
+        const r = await fetch('/ai/send', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ threadId: aiState.curThreadId || undefined, text: t, model: aiState.model }) });
+        const j = await r.json().catch(() => ({}));
+        aiState.busy = false;
+        if (j.threadId) aiState.curThreadId = j.threadId;
+        if (j.spend) aiState.spend = j.spend;
+        if (!r.ok) {
+            aiState.messages.push({ role: 'assistant', content: '⚠ ' + (j.error || ('error ' + r.status)), ts: new Date().toISOString() });
+            renderAiMessages(); renderSpend();
+            return;
+        }
+        aiState.messages.push({ role: 'assistant', content: j.reply, ts: new Date().toISOString(), model: j.model });
+        renderAiMessages(); renderSpend();
+        loadAiThreads(false);   // refresh thread titles/order without disturbing the open chat
+    } catch {
+        aiState.busy = false;
+        aiState.messages.push({ role: 'assistant', content: '⚠ could not reach the hub', ts: new Date().toISOString() });
+        renderAiMessages();
+    }
+}
+aiThreadsSel.onchange = () => openAiThread(aiThreadsSel.value);
+aiModelSel.onchange = () => { aiState.model = aiModelSel.value; };
+aichatEl.addEventListener('click', (e) => {   // copy button on ASK messages (chatEl's handler is bound to #chat only)
+    const c = e.target.closest ? e.target.closest('.copybtn') : null;
+    if (c) doCopy(unb64(c.getAttribute('data-c')), c);
+});
+document.getElementById('ainew').onclick = () => { aiState.curThreadId = null; aiState.messages = []; renderThreadSel(); renderAiMessages(); typeBox.focus(); };
+document.getElementById('aidel').onclick = async () => {
+    if (!aiState.curThreadId) return;
+    if (!confirm('Delete this chat?')) return;
+    const id = aiState.curThreadId;
+    aiState.curThreadId = null; aiState.messages = [];
+    try { await fetch('/ai/deletethread', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) }); } catch { }
+    loadAiThreads(false); renderAiMessages();
+};
 typeBox.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); sendTyped(); } e.stopPropagation(); });
 document.getElementById('btype').onclick = sendTyped;
 function attachFile(f) {
@@ -685,6 +825,7 @@ document.getElementById('holdpanel').onclick = (e) => {
     else if (act === 'drophold') post('/unhold', { key: t.getAttribute('data-key'), callsign: t.getAttribute('data-cs'), drop: true });
 };
 function eventsForTab() {
+    if (activeTab === 'ask') return [];   // ASK is a separate model chat, not the speech transcript
     if (activeTab === 'all') return chatEvts;
     // The jarvis PROJECT worker speaks under its own callsign (e.g. "uniform"), but it IS jarvis —
     // surface its messages on the JARVIS/GENERAL tabs by treating the bound worker callsign as jarvis.
@@ -696,14 +837,18 @@ function eventsForTab() {
 }
 function renderTabs() {
     const sessions = lastBoard ? lastBoard.boards.filter(b => b.callsign !== 'jarvis' && b.alive !== false) : [];
-    const ids = ['all', 'general', 'jarvis'].concat(sessions.map(b => b.callsign));
+    const base = ['all', 'general', 'jarvis', 'ask'];
+    const ids = base.concat(sessions.map(b => b.callsign));
     if (!ids.includes(activeTab)) activeTab = 'all';
-    let html = ['all', 'general', 'jarvis'].map(id => '<span class="stab' + (id === activeTab ? ' active' : '') + '" data-tab="' + id + '">' + id.toUpperCase() + '</span>').join('');
+    let html = base.map(id => '<span class="stab' + (id === activeTab ? ' active' : '') + '" data-tab="' + id + '">' + id.toUpperCase() + '</span>').join('');
     html += sessions.map(b => '<span class="stab' + (b.callsign === activeTab ? ' active' : '') + (b.needsYou ? ' needs' : '') + '" data-tab="' + esc(b.callsign) + '">' + esc(b.callsign.toUpperCase()) + (b.needsYou ? '<span class="sbadge">!</span>' : '') + '</span>').join('');
     html += '<span class="stab plus" data-newsession="1" title="new session: spin up a fresh worker">+</span>';
     document.getElementById('stabs').innerHTML = html;
-    const sess = activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
-    typeBox.placeholder = sess ? ('Message ' + activeTab + ' - no focus change') : 'Type to jarvis (routes like speech; works while paused/muted)';
+    if (activeTab !== 'ask') {   // ASK manages its own placeholder (see applyTabMode)
+        const sess = activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
+        typeBox.placeholder = sess ? ('Message ' + activeTab + ' - no focus change') : 'Type to jarvis (routes like speech; works while paused/muted)';
+    }
+    applyTabMode();
 }
 document.getElementById('stabs').onclick = (e) => {
     const plus = e.target.closest ? e.target.closest('[data-newsession]') : null;

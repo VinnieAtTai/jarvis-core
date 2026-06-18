@@ -14,3 +14,7 @@ screen/
 schedule.json
 attachments/
 bus.base
+anthropic-key.txt
+*.key
+ai-threads.json
+ai-spend.json

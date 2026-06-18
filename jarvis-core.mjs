@@ -380,6 +380,72 @@ function createReminder(title, start) {
     return r;
 }
 
+// —— Conversational ASK tab (/ai/*). A model-backed chat that talks to the Anthropic API
+// directly (not the speech bus / a Claude Code seat). Pure cost/cap/month math lives in
+// jarvis-text.mjs (AI_MODELS, aiCost, monthKey, rollSpend, capExceeded); the stateful store I/O
+// and the Anthropic fetch (both side-effecting) stay here. The key is read from a gitignored
+// repo-root file and NEVER logged, committed, or sent to the client.
+function loadThreads() {
+    let raw = null;
+    if (existsSync(AI_THREADS)) {
+        try { raw = JSON.parse(readFileSync(AI_THREADS, 'utf8')); }
+        catch { backupCorrupt(AI_THREADS); raw = null; }   // preserve the only copy, don't zero it
+    }
+    if (!raw || typeof raw !== 'object' || !raw.threads || typeof raw.threads !== 'object') return { threads: {} };
+    return raw;
+}
+function saveThreads(t) { atomicWrite(AI_THREADS, JSON.stringify(t, null, 1)); }
+// Always returned rolled to the current month: rollSpend zeroes usd when the stored month differs,
+// so a stale file reads as $0 spent for the new month without a separate reset step.
+function loadSpend() {
+    let raw = null;
+    if (existsSync(AI_SPEND)) {
+        try { raw = JSON.parse(readFileSync(AI_SPEND, 'utf8')); }
+        catch { backupCorrupt(AI_SPEND); raw = null; }
+    }
+    return rollSpend(raw, monthKey());
+}
+function saveSpend(s) { atomicWrite(AI_SPEND, JSON.stringify(s, null, 1)); }
+let threadSeq = 0;
+function newThreadId() { return 'th_' + Date.now().toString(36) + (threadSeq++).toString(36) + Math.random().toString(36).slice(2, 5); }
+// The API key: gitignored repo-root anthropic-key.txt first (Chris pastes it there), then env.
+// Read fresh each call so a newly-pasted key is picked up without a restart. Never logged.
+function anthropicKey() {
+    try { const k = readFileSync(join(HERE, 'anthropic-key.txt'), 'utf8').trim(); if (k) return k; } catch { }
+    return process.env.ANTHROPIC_API_KEY || '';
+}
+// Short JARVIS persona for the tab — deliberately NOT the worker system prompt; this is a direct
+// chat with no tools. Kept terse so it stays cheap on every turn.
+const AI_SYSTEM = "You are JARVIS, Chris's terse, capable AI copilot, answering inside his command console. This is a direct chat — you have no tools and cannot run code or read files here. Lead with the conclusion, then only the reasoning that earns its place. Be concrete and brief; spell things out only when it genuinely helps. If you don't know or can't tell from the conversation, say so plainly.";
+// One non-streaming Anthropic call. Opus gets adaptive thinking + effort (per CONVERSATIONAL-TAB.md
+// and the claude-api skill); Sonnet/Haiku go plain (effort/adaptive 400s on Haiku). Returns the
+// joined text blocks (thinking blocks come back empty-text by default and are skipped) + usage.
+async function callAnthropic(model, messages) {
+    const key = anthropicKey();
+    if (!key) { const e = new Error('no Anthropic API key'); e.code = 'NO_KEY'; throw e; }
+    const isOpus = model === 'claude-opus-4-8';
+    const body = { model, max_tokens: isOpus ? 8192 : 2048, system: AI_SYSTEM, messages };
+    if (isOpus) { body.thinking = { type: 'adaptive' }; body.output_config = { effort: 'high' }; }
+    let r, data;
+    try {
+        r = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+            body: JSON.stringify(body),
+        });
+        data = await r.json().catch(() => ({}));
+    } catch (e) { const err = new Error('network: ' + e.message); err.code = 'NET'; throw err; }
+    if (!r.ok) {
+        const msg = (data && data.error && data.error.message) || ('HTTP ' + r.status);
+        const e = new Error(msg); e.code = 'API'; e.status = r.status; throw e;
+    }
+    const text = Array.isArray(data.content)
+        ? data.content.filter(b => b && b.type === 'text').map(b => b.text || '').join('').trim()
+        : '';
+    const u = data.usage || {};
+    return { text, inTok: u.input_tokens || 0, outTok: u.output_tokens || 0, stop: data.stop_reason };
+}
+
 // Display-order task list for a session (matches the console card: review -> working -> queued
 // -> done). The position in this array is the 1-based index the human sees and speaks.
 function orderedTasks(board) {
@@ -1857,6 +1923,76 @@ async function handleRequest(req, res) {
         child.unref();
         record({ kind: 'sys', text: 'revealed: ' + p.slice(0, 90) });
         return json(res, 200, { ok: true });
+    }
+    if (key === 'GET /ai/threads') {
+        const store = loadThreads();
+        const threads = Object.keys(store.threads).map(id => {
+            const t = store.threads[id] || {};
+            const msgs = Array.isArray(t.messages) ? t.messages : [];
+            const last = msgs.length ? msgs[msgs.length - 1] : null;
+            return { id, title: t.title || '(untitled)', model: t.model || AI_DEFAULT_MODEL, lastTs: last ? last.ts : null, count: msgs.length };
+        }).sort((a, b) => (Date.parse(b.lastTs || 0) || 0) - (Date.parse(a.lastTs || 0) || 0));
+        const spend = loadSpend();
+        return json(res, 200, { threads, spend: { usd: spend.usd, cap: AI_CAP }, models: Object.keys(AI_MODELS), defaultModel: AI_DEFAULT_MODEL, hasKey: !!anthropicKey() });
+    }
+    if (key === 'GET /ai/thread') {
+        const id = u.searchParams.get('id') || '';
+        const t = loadThreads().threads[id];
+        if (!t) return json(res, 404, { error: 'no such thread' });
+        return json(res, 200, { id, title: t.title || '', model: t.model || AI_DEFAULT_MODEL, messages: (t.messages || []).map(m => ({ role: m.role, content: m.content, ts: m.ts, model: m.model })) });
+    }
+    if (key === 'POST /ai/newthread') {
+        const b = await readBody(req);
+        let model = String(b.model || AI_DEFAULT_MODEL); if (!AI_MODELS[model]) model = AI_DEFAULT_MODEL;
+        const store = loadThreads();
+        const id = newThreadId();
+        store.threads[id] = { title: 'New chat', model, messages: [] };
+        saveThreads(store);
+        return json(res, 200, { ok: true, threadId: id });
+    }
+    if (key === 'POST /ai/deletethread') {
+        const b = await readBody(req);
+        const store = loadThreads();
+        if (b.id && store.threads[b.id]) { delete store.threads[b.id]; saveThreads(store); }
+        return json(res, 200, { ok: true });
+    }
+    if (key === 'POST /ai/send') {
+        const b = await readBody(req);
+        const text = String(b.text == null ? '' : b.text).trim();
+        if (!text) return json(res, 400, { error: 'text is required' });
+        let model = String(b.model || AI_DEFAULT_MODEL); if (!AI_MODELS[model]) model = AI_DEFAULT_MODEL;
+        // Hard cap: refuse BEFORE spending if we're already at/over the monthly limit.
+        let spend = loadSpend();
+        if (capExceeded(spend.usd, AI_CAP)) {
+            return json(res, 402, { error: 'Monthly AI spend cap reached ($' + AI_CAP.toFixed(2) + '). It resets next month, or raise JARVIS_AI_CAP.', spend: { usd: spend.usd, cap: AI_CAP } });
+        }
+        const store = loadThreads();
+        let id = (b.threadId && store.threads[b.threadId]) ? b.threadId : null;
+        if (!id) { id = newThreadId(); store.threads[id] = { title: text.slice(0, 60), model, messages: [] }; }
+        const thread = store.threads[id];
+        thread.model = model;   // remember the last model used on this thread
+        thread.messages.push({ role: 'user', content: text, ts: new Date().toISOString() });
+        const history = thread.messages.map(m => ({ role: m.role, content: m.content }));
+        let reply;
+        try {
+            reply = await callAnthropic(model, history);
+        } catch (e) {
+            saveThreads(store);   // keep the user message so the thread isn't lost on a transient error
+            const code = e.code === 'NO_KEY' ? 503 : 502;
+            const msg = e.code === 'NO_KEY'
+                ? 'No Anthropic API key found. Paste one into anthropic-key.txt at the repo root (or set ANTHROPIC_API_KEY), then try again.'
+                : ('Anthropic call failed: ' + e.message);
+            return json(res, code, { error: msg, threadId: id });
+        }
+        const replyText = reply.text || (reply.stop === 'refusal' ? '(the model declined to respond)' : '(no text returned)');
+        thread.messages.push({ role: 'assistant', content: replyText, ts: new Date().toISOString(), model });
+        saveThreads(store);
+        // Add the call's cost to the monthly tracker (re-read fresh to minimize a concurrent-send race).
+        const cost = aiCost(model, reply.inTok, reply.outTok);
+        spend = loadSpend();
+        spend.usd = Math.round((spend.usd + cost) * 1e6) / 1e6;
+        saveSpend(spend);
+        return json(res, 200, { threadId: id, reply: replyText, model, title: thread.title, usage: { in: reply.inTok, out: reply.outTok, cost }, spend: { usd: spend.usd, cap: AI_CAP } });
     }
     if (key === 'GET /schedule') {
         const s = loadSchedule();
