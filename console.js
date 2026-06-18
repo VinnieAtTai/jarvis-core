@@ -398,7 +398,7 @@ function renderBoards(d) {
             const txt = obj ? (i.text == null ? '' : i.text) : i;
             const id = obj ? (i.id || '') : '';
             const notes = obj ? (i.notes || '') : '';
-            const a = (op, sym, title) => '<span class="ract" data-op="' + op + '" data-cs="' + esc(cs) + '" data-t="' + escAttr(txt) + '" title="' + title + '">' + sym + '</span>';
+            const a = (op, sym, title) => '<span class="ract" data-op="' + op + '" data-cs="' + esc(cs) + '" data-t="' + escAttr(txt) + '" title="' + title + ' — ' + escAttr(txt) + '">' + sym + '</span>';
             let acts = '';
             if (list === 'queued') acts += a('top', '&#9650;', 'move to top of queue');
             if (list === 'review') {
@@ -410,7 +410,7 @@ function renderBoards(d) {
                 if (list !== 'done') acts += a('done', '&#10003;', 'done');
                 if (list !== 'queued') acts += a('ready', '&#8634;', 'back to ready');
             }
-            acts += '<span class="ract del" data-op="drop" data-cs="' + esc(cs) + '" data-t="' + escAttr(txt) + '" title="delete">&#128465;</span>';
+            acts += '<span class="ract del" data-op="drop" data-cs="' + esc(cs) + '" data-t="' + escAttr(txt) + '" title="delete — ' + escAttr(txt) + '">&#128465;</span>';
             const noteOpen = notes && boardExpand.has('note:' + id);
             const dot = notes ? '<span class="ndot">' + (noteOpen ? '&#9662;' : '&#8250;') + '</span>' : '';
             const noteBody = noteOpen ? '<div class="wnote">' + esc(notes).split('\n').join('<br>') + '</div>' : '';
@@ -419,7 +419,7 @@ function renderBoards(d) {
             // chip is derived from a leading TAG: and stripped from the visible text; data-t above
             // keeps the FULL original text so op matching is unaffected.
             const tc = chipFor(txt);
-            return '<div class="witem ' + list + '"' + dx + '><span class="wleft"><span class="wtext"><span class="wnum">' + num + '</span> ' + mark + ' ' + tc.chip + esc(tc.rest) + '</span>' + dot + '</span><span class="rowacts">' + acts + '</span>' + noteBody + '</div>';
+            return '<div class="witem ' + list + '"' + dx + ' title="' + escAttr(txt) + '"><span class="wleft"><span class="wtext"><span class="wnum">' + num + '</span> ' + mark + ' ' + tc.chip + esc(tc.rest) + '</span>' + dot + '</span><span class="rowacts">' + acts + '</span>' + noteBody + '</div>';
         };
         // Top 3 per lane + a "N more" expander; the done lane defaults to FULLY collapsed (history).
         const lane = (items, list, mark) => {
