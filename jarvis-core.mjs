@@ -1442,8 +1442,10 @@ async function handleRequest(req, res) {
         return json(res, 200, { ok: true, key: k });
     }
     if (key === 'POST /unhold') {
-        // Pull a parked project back: drop it from On Hold and (unless {drop:true}) spawn a fresh
-        // worker on it, which inherits the handoff via its cwd — same as the Archive "continue".
+        // Pull a parked project back. {drop:true} just removes it; otherwise spawn a fresh worker
+        // (inheriting the handoff via its cwd, same as Archive "continue"). INVARIANT: the card is
+        // only removed from On Hold once that successor is actually live — spawn first, delete after
+        // — so a failed or impossible respawn can never delete the card and leave nothing behind.
         const b = await readBody(req);
         roster.held = roster.held || [];
         const wantKey = b.key || (b.cwd ? cwdKey(b.cwd) : null);
@@ -1451,20 +1453,30 @@ async function handleRequest(req, res) {
         const idx = roster.held.findIndex(h => (wantKey && h.key === wantKey) || (b.cwd && cwdKey(h.cwd) === cwdKey(b.cwd)) || (wantCs && h.callsign === wantCs));
         if (idx < 0) return json(res, 404, { error: 'not on hold' });
         const h = roster.held[idx];
-        roster.held.splice(idx, 1);
-        saveRoster();
         if (b.drop) {
+            roster.held.splice(idx, 1);
+            saveRoster();
             record({ kind: 'sys', text: (h.callsign || h.purpose || 'project') + ' removed from on-hold' });
             return json(res, 200, { ok: true, dropped: true });
         }
-        let cs = null;
-        if (h.cwd && h.purpose) {
-            roster.handoffs = roster.handoffs || {};
-            const handoff = roster.handoffs[cwdKey(h.cwd)] || null;
-            try { cs = spawnWorker(resolveRepo(h.cwd), h.purpose, b.model, handoff); } catch { cs = null; }
+        // A reminder card has no working directory, so there is nothing to spawn. Keep it parked
+        // instead of silently deleting it, and tell the caller it needs a repo (or a drop).
+        if (!h.cwd || !h.purpose) {
+            enqueueSay((h.callsign || 'That') + ' is a reminder with no repo to spin up. Tell me which repo to launch it in, or drop it.', 'jarvis');
+            return json(res, 200, { ok: true, callsign: null, needsRepo: true, key: h.key, purpose: h.purpose || '', summary: h.summary || '' });
         }
-        record({ kind: 'sys', text: (h.callsign || h.purpose || 'project') + ' pulled back from on-hold' + (cs ? ' -> ' + cs : '') });
-        enqueueSay((h.callsign || 'That project') + ' is back' + (cs ? ', ' + cs + ' is spinning up' : '') + '.', 'jarvis');
+        let cs = null;
+        roster.handoffs = roster.handoffs || {};
+        const handoff = roster.handoffs[cwdKey(h.cwd)] || null;
+        try { cs = spawnWorker(resolveRepo(h.cwd), h.purpose, b.model, handoff); } catch { cs = null; }
+        if (!cs) {
+            enqueueSay('I could not spin that back up, so it is still on hold. Try again.', 'jarvis');
+            return json(res, 500, { error: 'spawn failed', stillHeld: true, key: h.key });
+        }
+        roster.held.splice(idx, 1);
+        saveRoster();
+        record({ kind: 'sys', text: (h.callsign || h.purpose || 'project') + ' pulled back from on-hold -> ' + cs });
+        enqueueSay((h.callsign || 'That project') + ' is back, ' + cs + ' is spinning up.', 'jarvis');
         return json(res, 200, { ok: true, callsign: cs });
     }
     if (key === 'GET /att') {
