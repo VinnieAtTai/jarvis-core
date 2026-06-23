@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { openSync, existsSync, unlinkSync } from 'node:fs';
+import { openSync, existsSync, unlinkSync, writeFileSync, readFileSync, closeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -21,6 +21,7 @@ const SELF = fileURLToPath(import.meta.url);
 const DATA = process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'jarvis') : HERE;
 const LOG = join(DATA, 'watchdog.log');
 const STOP = join(DATA, 'STOP');
+const LOCK = join(DATA, 'supervisor.lock');
 const ENV = { ...process.env, JARVIS_REAL_USAGE: '1', JARVIS_LINK_EMAIL: 'chris.vinciguerra@tai-software.com' };
 const ts = () => new Date().toISOString();
 
@@ -35,6 +36,39 @@ if (process.env.JARVIS_SUPERVISOR !== '1') {
     console.log('jarvis supervisor detached (console-less), pid ' + child.pid);
     process.exit(0);
 }
+
+// --- Singleton guard (Stage 2 only) -----------------------------------------------------------
+// Without this, every `node spawn-hub-detached.mjs` spawns ANOTHER detached supervisor, and each
+// supervisor races to spawn a hub on the same port. The loser used to hang forever at listen()
+// (see jarvis-core.mjs), leaving wedged orphan supervisor+hub pairs that accumulate silently.
+// Allow exactly one live supervisor: the lockfile holds the owner's pid; a 2nd supervisor that
+// finds a LIVE owner bows out. A stale lock (owner dead) is taken over.
+function pidAlive(pid) {
+    if (!pid || pid === process.pid) return false;
+    try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+function acquireSingleton() {
+    try {
+        const fd = openSync(LOCK, 'wx'); // atomic create; throws EEXIST if a lock is already there
+        writeFileSync(fd, String(process.pid));
+        closeSync(fd);
+        return true;
+    } catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+        let owner = 0;
+        try { owner = parseInt(String(readFileSync(LOCK, 'utf8')).trim(), 10) || 0; } catch { }
+        if (pidAlive(owner)) return false;             // a live supervisor already owns it
+        try { writeFileSync(LOCK, String(process.pid)); } catch { } // stale lock -> take it over
+        return true;
+    }
+}
+if (!acquireSingleton()) {
+    process.stdout.write('[supervisor] another supervisor already owns ' + LOCK + ' -> exiting\n');
+    process.exit(0);
+}
+process.on('exit', () => {
+    try { if (parseInt(String(readFileSync(LOCK, 'utf8')).trim(), 10) === process.pid) unlinkSync(LOCK); } catch { }
+});
 
 let running = true;
 async function loop() {

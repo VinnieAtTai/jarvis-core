@@ -251,6 +251,20 @@ function backupCorrupt(path) {
 function saveRoster() {
     atomicWrite(SESSIONS, JSON.stringify(roster, null, 1));
 }
+const AWAY_DEFAULT_HOURS = 4;
+// Away mode: trust every live worker (auto-approve non-danger) so the board keeps moving while
+// Chris is gone — the danger floor in POST /permission still gates destructive actions regardless.
+// Persisted on the roster so it survives a hub restart mid-absence. setAway(false) reverts all
+// workers to guarded; new workers that register during the window are trusted in registerSession.
+function setAway(on, hours) {
+    const until = on ? Date.now() + (Number(hours) > 0 ? Number(hours) : AWAY_DEFAULT_HOURS) * 3600000 : 0;
+    roster.awayUntil = until;
+    for (const uid in roster.sessions) {
+        if (!roster.sessions[uid].ended) roster.sessions[uid].trustUntil = until;
+    }
+    saveRoster();
+    return until;
+}
 // Throttled persistence for the per-poll lastSeen churn: liveness uses the in-memory roster,
 // so on-disk lastSeen only needs to be roughly current. Caps full sessions.json rewrites to
 // once / ROSTER_FLUSH_MS instead of one per poll per session. Meaningful changes (register,
@@ -588,6 +602,7 @@ function registerSession(cwd, purpose, pin, project) {
     const proj = project ? String(project).toLowerCase().trim() : null;
     roster.callsigns[cs] = [uid, ...(roster.callsigns[cs] || [])];
     roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier, ...(proj ? { project: proj } : {}) };
+    if (roster.awayUntil && Date.now() < roster.awayUntil) roster.sessions[uid].trustUntil = roster.awayUntil;
     saveRoster();
     const w = loadWork();
     // A project worker binds to the project's durable card/column and gets NO separate card.
@@ -1134,6 +1149,18 @@ function handleUtterance(rawText, typed) {
         enqueueSay('Trusting ' + cs + ' for ' + (isHr ? n + ' hour' + (n > 1 ? 's' : '') : mins + ' minutes') + '. I will auto-approve its non-risky actions.', 'jarvis');
         return;
     }
+    if (/\b(stepping away|step away|going away|away mode on|enable away mode|i'?m heading out)\b/.test(lower)) {
+        const until = setAway(true);
+        enqueueSay('Away mode on. Workers will keep going on their own and only stop for destructive actions. Say I am back when you return.', 'jarvis');
+        record({ kind: 'sys', text: 'AWAY MODE on until ' + new Date(until).toISOString() });
+        return;
+    }
+    if (/\b(i'?m back|i am back|away mode off|disable away mode|back at (my |the )?(desk|keyboard))\b/.test(lower)) {
+        setAway(false);
+        enqueueSay('Welcome back. Away mode off, I will ask again on non-routine actions.', 'jarvis');
+        record({ kind: 'sys', text: 'AWAY MODE off' });
+        return;
+    }
     if ((m = after(/(?:let'?s\s+)?(?:start(?:\s+working)?(?:\s+on)?|work(?:ing)?\s+on)\s+(?:([a-z-]+)\s+)?(?:item\s+|number\s+|no\.?\s*|#)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b/))) {
         const w = loadWork();
         const word = m[1];
@@ -1355,7 +1382,7 @@ async function handleRequest(req, res) {
                 working: b.working, queued: b.queued, done: b.done, review: b.review || [],
             };
         });
-        return json(res, 200, { focus: w.focus, muted, paused: discard, boards });
+        return json(res, 200, { focus: w.focus, muted, paused: discard, boards, awayUntil: roster.awayUntil || 0 });
     }
     if (key === 'GET /roster') {
         const live = liveCallsigns().map(cs => {
@@ -1569,6 +1596,11 @@ async function handleRequest(req, res) {
         }
         try { return json(res, 200, registerSession(b.cwd, b.purpose, b.pin, b.project)); }
         catch (e) { return json(res, 409, { error: e.message }); }
+    }
+    if (key === 'POST /away') {
+        const b = await readBody(req);
+        const until = setAway(!!b.on, b.hours);
+        return json(res, 200, { ok: true, awayUntil: until });
     }
     if (key === 'POST /health') {
         const b = await readBody(req);
@@ -2125,7 +2157,19 @@ async function main() {
             try { json(res, 500, { error: e.message }); } catch { }
         });
     });
-    await new Promise(r => server.listen(PORT, '127.0.0.1', r));
+    await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(PORT, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); });
+    }).catch(e => {
+        // Bind failed -- almost always EADDRINUSE: another hub already owns the port (a duplicate
+        // launch, or a restart before the old port fully released). Previously listen()'s 'error'
+        // had no handler, so it was swallowed by the global uncaughtException handler while THIS
+        // promise never resolved -- main() hung here forever, a wedged process the supervisor then
+        // blocked on. Exit instead so the supervisor relaunches cleanly; paired with the supervisor's
+        // singleton lock, only the legitimate hub ever holds the port.
+        logCrash('listen-failed (' + ((e && e.code) || '?') + ') on ' + PORT + ' -- another hub may own it; exiting for the supervisor', e);
+        process.exit(e && e.code === 'EADDRINUSE' ? 3 : 1);
+    });
 
     let consolePage = null;
     let context = null;
