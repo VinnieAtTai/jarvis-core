@@ -1,23 +1,28 @@
 
-body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;padding:16px}
-#status{font-size:22px;font-weight:bold;padding:10px 14px;border-radius:8px;background:#16202c;margin-bottom:10px}
+/* Viewport-locked app shell: the page itself never scrolls. body is a flex column whose
+   #main fills the remaining height; the only scroll regions are the chat log (#left) and the
+   board list (#right), each bounded by min-height:0 + its own overflow. No page-level stacking. */
+html,body{height:100%}
+body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;padding:16px;box-sizing:border-box;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+#status{flex:none;font-size:22px;font-weight:bold;padding:10px 14px;border-radius:8px;background:#16202c;margin-bottom:10px}
 #status.listening{color:#5dd97c}#status.speaking{color:#5db4d9}#status.muted{color:#d9a05d}#status.paused{color:#d9a05d}#status.error{color:#e06c6c}
-#interim{display:flex;align-items:center;gap:10px;color:#7a8a9c;min-height:1.5em;margin-bottom:10px;font-style:italic}
+#interim{flex:none;display:flex;align-items:center;gap:10px;color:#7a8a9c;min-height:1.5em;margin-bottom:10px;font-style:italic}
 #itext{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #mutedcue{display:none;flex:none;font-style:normal;color:#d9a05d;font-size:11px;letter-spacing:.5px}
 #icancel{display:none;flex:none;font-style:normal;color:#e06c6c;border-color:#e06c6c}
-#main{display:flex;gap:20px;align-items:flex-start}
-#left{flex:3;min-width:0}
+#main{display:flex;gap:20px;flex:1 1 auto;min-height:0;overflow:hidden}
+#left{flex:3;min-width:0;display:flex;flex-direction:column;min-height:0}
 #bar{display:flex;gap:8px;margin-top:0;align-items:center}
 .btn{background:#16202c;border:1px solid #1f2c3a;color:#7a8a9c;border-radius:6px;padding:2px 10px;font:12px Consolas,monospace;cursor:pointer}
 .btn.on{color:#5db4d9;border-color:#5db4d9}
 .btn.wind{color:#e0b050;border-color:#5a4a2a}
 .btn.wind:hover{color:#ffcc5a;border-color:#e0b050;background:#241d12}
-#chat{display:flex;flex-direction:column;gap:6px;overflow-y:auto;height:60vh;background:#0d1420;border:none;border-radius:6px;padding:10px}
-#rawlog{display:none;overflow-y:auto;height:60vh;background:#0d1420;border:none;border-radius:6px;padding:10px;font-size:12px;color:#9bb0c4}
-#chatpanel{display:flex;flex-direction:column;gap:8px;padding:10px}
+#chat{display:flex;flex-direction:column;gap:6px;overflow-y:auto;flex:1;min-height:0;background:#0d1420;border:none;border-radius:6px;padding:10px}
+#rawlog{display:none;overflow-y:auto;flex:1;min-height:0;background:#0d1420;border:none;border-radius:6px;padding:10px;font-size:12px;color:#9bb0c4}
+#chatpanel{display:flex;flex-direction:column;gap:8px;padding:10px;flex:1;min-height:0;overflow:hidden}
 #chatinput{display:flex;gap:8px;align-items:center}
 #chatinput #typebox{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:8px 12px;font-size:14px;font-family:inherit}
+#chatinput #sendto{flex:none;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:7px 8px;font:12px Consolas,monospace;max-width:120px}
 #calcard{display:flex;flex-direction:column;gap:8px}
 #calbar{display:flex;gap:8px}
 #addtask{display:flex;gap:8px;align-items:center;padding:8px 10px}
@@ -39,7 +44,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .rx.on{opacity:1;filter:none}
 .thumb{max-width:240px;max-height:180px;border-radius:6px;margin-top:4px;display:block;cursor:pointer;border:1px solid #1f2c3a}
 .divider{text-align:center;color:#d9a05d;font-size:11px;margin:2px 0}
-#right{flex:2;position:sticky;top:8px;max-height:92vh;overflow-y:auto;display:flex;flex-direction:column;gap:10px}
+#right{flex:2;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:10px}
 .panel{background:#101822;border:1px solid #1f2c3a;border-radius:8px;padding:12px}
 .bhead{font-weight:bold;font-size:13px;letter-spacing:1px;margin:12px 0 2px;color:#d7e3f0;border-bottom:1px solid #1f2c3a;padding-bottom:2px}
 .bhead.focused{color:#5db4d9}
@@ -86,6 +91,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 #nsrepo{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:13px Consolas,monospace}
 #nspurpose{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:8px 12px;font:14px Consolas,monospace}
 .stab.dead{color:#566270}
+.stabsub{flex-basis:100%;color:#7a8a9c;font:11px Consolas,monospace;letter-spacing:0;margin:3px 2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .stab.needs{color:#fff;background:#a33;border-color:#e06c6c;animation:needpulse 1.4s infinite}
 .sbadge{color:#fff;background:#a33;border-radius:8px;padding:0 5px;margin-left:6px;font-size:10px}
 @keyframes needpulse{0%,100%{box-shadow:0 0 0 0 rgba(224,108,108,.55)}50%{box-shadow:0 0 7px 2px rgba(224,108,108,.8)}}
@@ -95,12 +101,19 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .card.cdead{opacity:.55}
 .card.cneeds{border-color:#e06c6c;box-shadow:0 0 6px rgba(224,108,108,.4)}
 .chead{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.ctitle{font-weight:bold;letter-spacing:1px;font-size:13px;color:#d7e3f0}
+.ctitle{font-weight:bold;letter-spacing:1px;font-size:13px;color:#d7e3f0;cursor:pointer}
+.card[data-cs]{cursor:pointer}
+.card[data-cs] .permreq,.card[data-cs] .wnote,.card[data-cs] input{cursor:auto}
 .cworker{color:#8aa0c8;font-weight:normal;font-size:11px;letter-spacing:.5px}
 .card.cfocus .ctitle{color:#5db4d9}
 .cbtns{display:flex;gap:5px;white-space:nowrap}
 .cbtn{cursor:pointer;font-size:13px;opacity:.5;user-select:none}
 .cbtn:hover{opacity:1}
+/* per-session activity glyph by the callsign: spinner = working, 💤 = idle/quiet */
+.actspin{display:inline-block;width:8px;height:8px;margin:0 3px;vertical-align:middle;border:2px solid #5dd97c;border-top-color:transparent;border-radius:50%;animation:actspin .8s linear infinite}
+.actspin.stuck{border-color:#e0a34d;border-top-color:transparent;animation-duration:1.6s}
+@keyframes actspin{to{transform:rotate(360deg)}}
+.actidle{font-size:10px;margin:0 2px;vertical-align:middle;opacity:.45}
 .cpurpose{color:#7a8a9c;font-size:11px;margin:2px 0;letter-spacing:0;font-weight:normal}
 .ccount{font-size:11px;margin:3px 0;display:flex;gap:12px}
 .cnum{font-weight:bold}
@@ -110,6 +123,9 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .asum{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
 .atitle{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#c3d2df;line-height:16px}
 .aepi{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#6a7a8c;line-height:14px}
+.archfilter{width:100%;box-sizing:border-box;background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:5px 9px;font:12px Consolas,monospace;margin:4px 0 6px}
+.archfilter:focus{outline:none;border-color:#5db4d9}
+.archempty{color:#7a8a9c;font-size:11px;font-style:italic;padding:4px 2px}
 .holdhead{color:#d9a05d}
 #holdpanel{border-color:#3a3122}
 .ctoggle{cursor:pointer;color:#5db4d9;font-size:11px;user-select:none;margin:2px 0}
@@ -166,9 +182,25 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 #aibar{gap:8px;align-items:center;flex-wrap:wrap;padding:2px 0}
 #aibar select{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:5px 8px;font:12px Consolas,monospace;max-width:220px}
 #aithreads{flex:1;min-width:90px}
-#aichat{flex-direction:column;gap:6px;overflow-y:auto;height:60vh;background:#0d1420;border-radius:6px;padding:10px}
+#aichat{flex-direction:column;gap:6px;overflow-y:auto;flex:1;min-height:0;background:#0d1420;border-radius:6px;padding:10px}
 .aispend{margin-left:auto;font-size:12px;color:#7a8a9c;white-space:nowrap;font-variant-numeric:tabular-nums}
 .aispend.near{color:#d9a05d}
 .aispend.over{color:#e06c6c;font-weight:bold}
 .aiempty{color:#7a8a9c;font-style:italic;font-size:12px;padding:8px}
 .aiwait{color:#7a8a9c;font-style:italic}
+/* In-page confirm modal (replaces window.confirm, which the Playwright window auto-dismisses) */
+.modal-overlay{position:fixed;inset:0;background:rgba(4,7,11,.66);display:flex;align-items:center;justify-content:center;z-index:1000}
+.modal-box{background:#121a24;border:1px solid #2a3947;border-radius:10px;padding:18px 20px;max-width:460px;box-shadow:0 14px 44px rgba(0,0,0,.55)}
+.modal-msg{color:#d7e3f0;font-size:14px;line-height:1.55;margin-bottom:16px}
+.modal-btns{display:flex;gap:10px;justify-content:flex-end}
+.modal-btns .btn{font-size:13px;padding:5px 16px}
+.modal-ok{color:#5db4d9;border-color:#5db4d9}
+.modal-ok.danger{color:#ffd9df;border-color:#7d3344;background:#3a1620}
+.modal-ok.danger:hover{background:#52202c}
+.modal-cancel:hover{color:#cdd9e5;border-color:#3a4a5a}
+/* Non-blocking toasts (replaces window.alert, also dead in the Playwright window) */
+#toasts{position:fixed;top:14px;right:14px;display:flex;flex-direction:column;gap:8px;z-index:1100;max-width:360px}
+.toast{background:#16202c;border:1px solid #2a3947;border-left-width:3px;border-radius:7px;padding:9px 12px;font-size:12px;line-height:1.4;color:#d7e3f0;box-shadow:0 6px 20px rgba(0,0,0,.45);cursor:pointer;transition:opacity .25s}
+.toast.err{border-left-color:#e06c6c}
+.toast.ok{border-left-color:#5dd97c}
+.toast.gone{opacity:0}

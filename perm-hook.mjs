@@ -91,6 +91,10 @@ if (isWrite) {
         const cwd = norm(ev.cwd || process.cwd());
         const target = norm(fp);
         if (cwd && (target === cwd || target.startsWith(cwd + '/'))) out('allow', 'write within worker cwd');
+        // A worker also owns its private Claude Code session scratchpad (…/Temp/claude/<project>/
+        // <session>/…). A worker writes there during boot, BEFORE it registers — so a stall here
+        // produces a permission card no session can surface, and the worker hangs invisibly.
+        if (target.includes('/temp/claude/')) out('allow', 'write to own session scratchpad');
     }
 }
 
@@ -111,10 +115,13 @@ const req = http.request({ host: '127.0.0.1', port, path: '/permission', method:
         try { r = JSON.parse(d); } catch { }
         if (r.decision === 'allow') out('allow', 'Approved in JARVIS hub');
         else if (r.decision === 'deny') out('deny', 'Denied in JARVIS hub');
-        else out('ask');
+        // No verdict (the hub timed out the card, or returned something unexpected). A hub worker
+        // is console-less, so 'ask' would hang it forever at a native prompt nobody can answer.
+        // 'deny' is recoverable: the worker gets a denial it can adapt to or re-request.
+        else out('deny', 'JARVIS hub gave no verdict (timed out); denying so a console-less worker cannot hang');
     });
 });
-req.on('error', () => out('ask'));
-req.setTimeout(590000, () => { try { req.destroy(); } catch { } out('ask'); });
+req.on('error', () => out('deny', 'JARVIS hub unreachable; denying so a console-less worker cannot hang'));
+req.setTimeout(590000, () => { try { req.destroy(); } catch { } out('deny', 'JARVIS hub timed out; denying so a console-less worker cannot hang'); });
 req.write(body);
 req.end();

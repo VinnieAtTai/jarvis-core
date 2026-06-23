@@ -15,6 +15,7 @@ let expanded = false, rawMode = false, pinned = true;
 let focusCS = 'jarvis', chatEvts = [], lastChatPayload = '';
 let lastTokens = null;
 let lastArchive = null;
+let archFilter = '';
 let lastHold = null;
 let activeTab = 'all';
 let nsRepos = [];
@@ -116,6 +117,58 @@ function linkify(raw) {
     out += esc(raw.slice(last));
     return out;
 }
+// In-page confirm modal. window.confirm() is auto-dismissed (returns false) inside the
+// Playwright app window, so every confirm()-gated button — Rebuild, Restart & deploy,
+// Wind-down, delete-chat — silently no-opped (this is why the UI could never deploy a
+// batch). uiConfirm replaces it with a promise: OK resolves true; Cancel / backdrop /
+// Escape resolve false; Enter confirms. Messages keep their newlines. Capture-phase key
+// handling so Enter/Escape don't leak to the global t/r/Escape shortcuts behind the modal.
+function uiConfirm(message, opts) {
+    opts = opts || {};
+    return new Promise((resolve) => {
+        const ov = document.createElement('div');
+        ov.className = 'modal-overlay';
+        ov.innerHTML = '<div class="modal-box" role="dialog" aria-modal="true">'
+            + '<div class="modal-msg">' + esc(message).split('\n').join('<br>') + '</div>'
+            + '<div class="modal-btns">'
+            + '<button class="btn modal-cancel">' + esc(opts.cancel || 'Cancel') + '</button>'
+            + '<button class="btn modal-ok' + (opts.danger ? ' danger' : '') + '">' + esc(opts.ok || 'OK') + '</button>'
+            + '</div></div>';
+        document.body.appendChild(ov);
+        let done = false;
+        const close = (val) => {
+            if (done) return; done = true;
+            document.removeEventListener('keydown', onKey, true);
+            ov.remove();
+            resolve(val);
+        };
+        const onKey = (e) => {
+            if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(false); }
+            else if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); close(true); }
+        };
+        ov.querySelector('.modal-ok').onclick = () => close(true);
+        ov.querySelector('.modal-cancel').onclick = () => close(false);
+        ov.addEventListener('click', (e) => { if (e.target === ov) close(false); });
+        document.addEventListener('keydown', onKey, true);
+        const okBtn = ov.querySelector('.modal-ok');
+        if (okBtn && okBtn.focus) okBtn.focus();
+    });
+}
+// Non-blocking toast. window.alert() is ALSO auto-dismissed in the Playwright window, so the
+// board-action / schedule-parse / spawn error notices vanished unseen (same root cause as the
+// dead confirm buttons). uiToast surfaces them top-right; click or auto-timeout dismisses.
+function uiToast(message, kind) {
+    let host = document.getElementById('toasts');
+    if (!host) { host = document.createElement('div'); host.id = 'toasts'; document.body.appendChild(host); }
+    const el = document.createElement('div');
+    el.className = 'toast' + (kind === 'error' ? ' err' : kind === 'ok' ? ' ok' : '');
+    el.textContent = message;
+    host.appendChild(el);
+    let killed = false;
+    const kill = () => { if (killed) return; killed = true; el.classList.add('gone'); setTimeout(() => { try { el.remove(); } catch { } }, 260); };
+    el.onclick = kill;
+    setTimeout(kill, kind === 'error' ? 8000 : 4500);
+}
 
 const REMOJI = { up: '👍', love: '❤️', squee: '🤩', fire: '🔥', down: '👎', poop: '💩' };
 function renderChat() {
@@ -203,7 +256,7 @@ document.getElementById('bcalsave').onclick = async () => {
     try {
         const r = await (await fetch('/schedule', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: ta.value }) })).json();
         if (r.ok) { ta.value = ''; document.getElementById('calbox').style.display = 'none'; }
-        else alert(r.error || 'parse failed');
+        else uiToast(r.error || 'schedule parse failed', 'error');
     } catch { }
 };
 document.addEventListener('keydown', e => {
@@ -272,6 +325,31 @@ function chipFor(text) {
     const c = TCHIPS[m[1].toUpperCase()];
     if (!c) return { chip: '', rest: text };
     return { chip: '<span class="tchip ' + c[2] + '" title="' + c[1] + '">' + c[0] + '</span>', rest: text.slice(m[0].length) };
+}
+// Per-session activity glyph shown next to the callsign: a spinner while the session
+// is actively working, 💤 when it is idle or quiet (heartbeat gone stale). Driven by
+// the server's `alive` flag (lastSeen < 2 min) plus the session's `doing` phrase. A
+// NEEDS YOU card already carries a loud badge, so we leave its glyph off. We track how
+// long a card has been continuously working (client-side) to flag one stuck working too
+// long — amber, slower spin; the streak clock resets on reload.
+const STUCK_WORK_MS = 45 * 60 * 1000;
+const IDLE_DOING = /idle|standing by|stand[ -]?by|waiting|awaiting|blocked|paused|on hold|wound down|retir|sleeping|zzz/i;
+const _workSince = new Map();   // callsign -> ms timestamp its current working streak began
+function activityIndicator(b) {
+    const cs = b.callsign;
+    if (!b.uid || b.needsYou) { _workSince.delete(cs); return ''; }
+    const doing = b.doing || '';
+    if (b.alive && doing && !IDLE_DOING.test(doing)) {
+        const now = Date.now();
+        if (!_workSince.has(cs)) _workSince.set(cs, now);
+        const mins = Math.round((now - _workSince.get(cs)) / 60000);
+        const stuck = (now - _workSince.get(cs)) > STUCK_WORK_MS;
+        const title = stuck ? 'working ~' + mins + ' min - looks stuck' : 'working' + (mins >= 1 ? ' ~' + mins + ' min' : '');
+        return ' <span class="actspin' + (stuck ? ' stuck' : '') + '" title="' + escAttr(title) + '"></span>';
+    }
+    _workSince.delete(cs);
+    const title = (b.uid && !b.alive) ? 'quiet - no heartbeat in 2+ min' : 'idle';
+    return ' <span class="actidle" title="' + title + '">&#128164;</span>';
 }
 function renderBoards(d) {
     focusCS = d.focus;
@@ -375,7 +453,8 @@ function renderBoards(d) {
         // Project card: show which session (NATO callsign) is currently driving it, e.g. JARVIS · XRAY · 30%.
         const worker = b.worker ? ' <span class="cworker">' + esc(b.worker.toUpperCase()) + '</span>' : '';
         const cwdChip = b.cwd ? '<span class="cpybtn pathtok" data-copy="' + b64(b.cwd) + '" title="copy path: ' + escAttr(b.cwd) + '">📋</span>' : '';
-        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + worker + ctx + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
+        const act = activityIndicator(b);
+        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + act + worker + ctx + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
         const purpose = b.purpose ? '<div class="cpurpose">' + esc(b.purpose) + '</div>' : '';
         const doing = (b.needsYou || b.doing) ? '<div class="bdoing">' + (b.needsYou ? '<span class="needs">NEEDS YOU</span> ' : '') + esc(b.doing || '') + '</div>' : '';
         const counts = (working.length || queued.length || review.length || done.length) ? '<div class="ccount">'
@@ -442,7 +521,7 @@ function renderBoards(d) {
         const pcount = b.pendingPermCount || 0;
         const batch = pcount > 1 ? '<div class="permbatch"><span class="pbtn ok" data-act="approveall" data-cs="' + esc(b.callsign) + '">Approve all (' + pcount + ')</span><span class="pbtn no" data-act="denyall" data-cs="' + esc(b.callsign) + '">Deny all</span></div>' : '';
         const perm = pp ? '<div class="permreq' + (pp.klass === 'danger' ? ' permdanger' : '') + '"><div class="permhead">' + (pp.klass === 'danger' ? '&#9888; RISKY: ' : '&#9888; ') + 'wants to run <b>' + esc(pp.tool) + '</b></div><div class="permdetail">' + esc((pp.detail || '').slice(0, 240)) + '</div><div class="permbtns"><span class="pbtn ok" data-act="approve" data-permid="' + esc(pp.id) + '">Approve</span><span class="pbtn no" data-act="deny" data-permid="' + esc(pp.id) + '">Deny</span><span class="pbtn" data-act="always" data-permid="' + esc(pp.id) + '" title="auto-allow this command family from now on">Always: ' + esc(pp.label || pp.tool) + '</span></div>' + batch + '</div>' : '';
-        return '<div class="card' + (focused ? ' cfocus' : '') + (dead ? ' cdead' : '') + ((b.needsYou || b.pendingPerm) ? ' cneeds' : '') + '">' + head + purpose + perm + doing + counts + tasks + '</div>';
+        return '<div class="card' + (focused ? ' cfocus' : '') + (dead ? ' cdead' : '') + ((b.needsYou || b.pendingPerm) ? ' cneeds' : '') + '" data-cs="' + esc(cs) + '">' + head + purpose + perm + doing + counts + tasks + '</div>';
     }).join('');
     const deadN = d.boards.filter(b => b.alive === false && b.callsign !== 'jarvis').length;
     if (deadN > 1) workEl.innerHTML = '<div style="margin-bottom:8px"><span class="cbtn" data-act="continueall" style="opacity:1;color:#5db4d9;font-weight:bold;font-size:12px">🚀 continue all (' + deadN + ')</span></div>' + workEl.innerHTML;
@@ -450,10 +529,19 @@ function renderBoards(d) {
 }
 workEl.onclick = (e) => {
     const t = e.target.closest ? e.target.closest('[data-x],[data-op],[data-act]') : null;
-    if (!t) return;
+    if (!t) {
+        // A click on a card body (not on any action control) opens that session's chat tab.
+        const card = e.target.closest ? e.target.closest('.card[data-cs]') : null;
+        if (card) {
+            const cs = card.getAttribute('data-cs');
+            const valid = cs === 'jarvis' || (lastBoard && lastBoard.boards.some(b => b.callsign === cs && b.alive !== false));
+            if (valid && cs && cs !== activeTab) { activeTab = cs; renderChat(); }
+        }
+        return;
+    }
     const post = (url, body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) })
-        .then(r => { if (!r.ok) alert('Action failed (' + r.status + ') on ' + url + ' — the hub rejected it, nothing was saved.'); return r; })
-        .catch(() => alert('Could not reach the hub for ' + url + ' — it is down or restarting, so NOTHING was saved. Reload the console once it is back, then retry.'));
+        .then(r => { if (!r.ok) uiToast('Action failed (' + r.status + ') on ' + url + ' — the hub rejected it, nothing was saved.', 'error'); return r; })
+        .catch(() => uiToast('Could not reach the hub for ' + url + ' — it is down or restarting, so NOTHING was saved. Reload the console once it is back, then retry.', 'error'));
     const x = t.getAttribute('data-x');
     if (x) { if (boardExpand.has(x)) boardExpand.delete(x); else boardExpand.add(x); if (lastBoard) renderBoards(lastBoard); return; }
     const op = t.getAttribute('data-op');
@@ -463,7 +551,7 @@ workEl.onclick = (e) => {
     else if (act === 'close') post('/forget', { callsign: t.getAttribute('data-cs') });
     else if (act === 'continue') post('/spawn', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
     else if (act === 'spawnjarvis') post('/spawn', { cwd: 'd:/claude/jarvis-core', purpose: 'JARVIS punchlist', project: 'jarvis' });
-    else if (act === 'rebuild') { if (confirm('Rebuild JARVIS now? Restarts the hub with the latest jarvis-core code. Live sessions ride it out. Heads-up: this resets the in-memory token gauge.')) post('/restart', {}); }
+    else if (act === 'rebuild') { uiConfirm('Rebuild JARVIS now? Restarts the hub with the latest jarvis-core code. Live sessions ride it out. Heads-up: this resets the in-memory token gauge.', { ok: 'Rebuild', danger: true }).then(ok => { if (ok) post('/restart', {}); }); }
     else if (act === 'restart') post('/retire', { uid: t.getAttribute('data-uid'), summary: 'Restarted from console.', successor: true });
     else if (act === 'hold') post('/hold', { uid: t.getAttribute('data-uid') || undefined, callsign: t.getAttribute('data-cs'), cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
     else if (act === 'voicemute') post('/voicemute', { uid: t.getAttribute('data-uid') || undefined, callsign: t.getAttribute('data-cs'), on: t.getAttribute('data-on') === '1' });
@@ -548,9 +636,9 @@ document.getElementById('bpause').onclick = () => {
 const jvmenu = document.getElementById('jvmenu');
 document.getElementById('bjv').onclick = (e) => { e.stopPropagation(); jvmenu.style.display = jvmenu.style.display === 'none' ? 'block' : 'none'; };
 document.addEventListener('click', () => { if (jvmenu) jvmenu.style.display = 'none'; });
-document.getElementById('jvrestart').onclick = () => {
+document.getElementById('jvrestart').onclick = async () => {
     jvmenu.style.display = 'none';
-    if (!confirm('Restart JARVIS now?\n\nRelaunches the hub with the latest code. Live sessions keep running (their poll loops ride out the bounce). Any pending permission prompt is dropped and will re-ask.')) return;
+    if (!await uiConfirm('Restart JARVIS now?\n\nRelaunches the hub with the latest code. Live sessions keep running (their poll loops ride out the bounce). Any pending permission prompt is dropped and will re-ask.', { ok: 'Restart & deploy', danger: true })) return;
     fetch('/restart', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }).catch(() => { });
     if (typeof setStatus === 'function') setStatus('muted', 'RESTARTING…');
 };
@@ -565,7 +653,7 @@ document.getElementById('jvwind').onclick = async () => {
         const dirty = plan.sessions.filter(s => s.dirty && s.dirty !== 0);
         if (dirty.length) msg += '\n\nWARNING - uncommitted work in: ' + dirty.map(s => s.cs + ' [' + s.cwd + ']').join('; ') + '\nCommit/push those first if you want them saved.';
     }
-    if (!confirm(msg)) return;
+    if (!await uiConfirm(msg, { ok: 'Wind down', danger: true })) return;
     fetch('/winddown', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) }).catch(() => { });
     if (typeof setStatus === 'function') setStatus('muted', 'WINDING DOWN…');
 };
@@ -575,9 +663,35 @@ function sendTyped() {
     const t = typeBox.value.trim();
     if (!t) return;
     typeBox.value = '';
-    const sess = activeTab && activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
-    const out = activeTab === 'jarvis' ? ('jarvis ' + t) : sess ? ('on ' + activeTab + ', ' + t) : t;
+    // Where the message goes: the #sendto dropdown wins; empty means "follow the open tab"
+    // (original behavior). All targets reuse the hub's existing speech routing — "jarvis …"
+    // for the hub, "on <cs>, …" for a session (no focus change), bare text for the general bus.
+    const sel = document.getElementById('sendto');
+    const target = sel ? sel.value : '';
+    let out;
+    if (target === 'general') out = t;
+    else if (target === 'jarvis') out = 'jarvis ' + t;
+    else if (target) out = 'on ' + target + ', ' + t;
+    else {
+        const sess = activeTab && activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
+        out = activeTab === 'jarvis' ? ('jarvis ' + t) : sess ? ('on ' + activeTab + ', ' + t) : t;
+    }
     fetch('/hear', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: out, typed: true }) }).catch(() => { });
+}
+// The send-target dropdown: "↪ tab" (follow the open tab), the general bus, jarvis, then every
+// live session — so you can message a session without leaving the tab you are reading. Guarded
+// like the add-task selector so the 1.5s board re-render never yanks an open dropdown or selection.
+function populateSendTo() {
+    const sel = document.getElementById('sendto');
+    if (!sel || sel === document.activeElement) return;
+    const sessions = lastBoard ? lastBoard.boards.filter(b => b.callsign !== 'jarvis' && b.alive !== false).map(b => b.callsign) : [];
+    const opts = [['', '↪ tab'], ['general', 'general'], ['jarvis', 'jarvis']].concat(sessions.map(c => [c, c]));
+    const sig = opts.map(o => o[0]).join('|');
+    if (sel.dataset.sig === sig) return;
+    const cur = sel.value;
+    sel.dataset.sig = sig;
+    sel.innerHTML = opts.map(([v, label]) => '<option value="' + escAttr(v) + '"' + (v === cur ? ' selected' : '') + '>' + esc(label) + '</option>').join('');
+    sel.value = opts.some(o => o[0] === cur) ? cur : '';
 }
 // —— Conversational ASK tab. A direct model chat that talks to /ai/* (not the speech bus): its
 // own thread list, model picker (Sonnet default, Opus one click away), and a running spend/cap
@@ -712,7 +826,7 @@ aichatEl.addEventListener('click', (e) => {   // copy button on ASK messages (ch
 document.getElementById('ainew').onclick = () => { aiState.curThreadId = null; aiState.messages = []; renderThreadSel(); renderAiMessages(); typeBox.focus(); };
 document.getElementById('aidel').onclick = async () => {
     if (!aiState.curThreadId) return;
-    if (!confirm('Delete this chat?')) return;
+    if (!await uiConfirm('Delete this chat?', { ok: 'Delete', danger: true })) return;
     const id = aiState.curThreadId;
     aiState.curThreadId = null; aiState.messages = [];
     try { await fetch('/ai/deletethread', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) }); } catch { }
@@ -755,9 +869,16 @@ function renderArchive(d) {
     const items = (d && d.items) || [];
     if (!items.length) { ap.style.display = 'none'; return; }
     const open = boardExpand.has('archive:open');
-    let html = '<div class="bhead" style="cursor:pointer;margin-top:0" data-x="archive:open">' + (open ? '&#9662;' : '&#9656;') + ' ARCHIVE (' + items.length + ')</div>';
+    // Client-side substring filter over callsign + purpose + summary. The list re-renders on
+    // every keystroke and on the 8s poll, so we snapshot+restore the input's focus/caret below.
+    const fq = archFilter.trim().toLowerCase();
+    const shown = fq ? items.filter(a => ((a.callsign || '') + ' ' + (a.purpose || '') + ' ' + (a.summary || '')).toLowerCase().includes(fq)) : items;
+    const count = fq ? shown.length + '/' + items.length : String(items.length);
+    let html = '<div class="bhead" style="cursor:pointer;margin-top:0" data-x="archive:open">' + (open ? '&#9662;' : '&#9656;') + ' ARCHIVE (' + count + ')</div>';
     if (open) {
-        html += items.slice(0, 50).map(a => {
+        html += '<input id="archfilter" class="archfilter" placeholder="filter by callsign / purpose / summary" autocomplete="off" value="' + escAttr(archFilter) + '">';
+        if (!shown.length) html += '<div class="archempty">no archived sessions match &ldquo;' + esc(archFilter) + '&rdquo;</div>';
+        html += shown.slice(0, 50).map(a => {
             const cont = (a.cwd && a.purpose) ? '<span class="ract" data-act="continue" data-cwd="' + escAttr(a.cwd) + '" data-purpose="' + escAttr(a.purpose) + '" title="continue this job (restores its handoff)">&#128640;</span>' : '';
             const park = (a.cwd && a.purpose) ? '<span class="ract" data-act="holdarchive" data-cwd="' + escAttr(a.cwd) + '" data-purpose="' + escAttr(a.purpose) + '" data-cs="' + esc(a.callsign || '') + '" title="put this project on hold (resume later)">&#128164;</span>' : '';
             const hf = a.hasHandoff ? '<span style="color:#5db4d9" title="left handoff notes">&#9678;</span>' : '';
@@ -770,13 +891,23 @@ function renderArchive(d) {
             return '<div class="arow"><span class="achip">' + esc((a.callsign || '?').toUpperCase()) + '</span><span class="asum"><span class="atitle" title="' + escAttr(tip) + '">' + esc(title) + '</span>' + epi + '</span>' + acwd + hf + park + cont + '</div>';
         }).join('');
     }
+    // Keep the filter box usable across the 8s poll re-render: snapshot focus + caret, restore after.
+    const wasFocused = document.activeElement && document.activeElement.id === 'archfilter';
+    const caret = wasFocused ? document.activeElement.selectionStart : null;
     ap.innerHTML = html;
     ap.style.display = 'block';
+    if (wasFocused) { const fi = document.getElementById('archfilter'); if (fi) { fi.focus(); try { fi.setSelectionRange(caret, caret); } catch { } } }
 }
 async function pollArchive() {
     try { renderArchive(await (await fetch('/archive')).json()); } catch { }
     setTimeout(pollArchive, 8000);
 }
+// Archive filter: re-render on each keystroke; stopPropagation so typing "t"/"r" here doesn't
+// trip the global expand/raw shortcuts.
+document.getElementById('archpanel').addEventListener('input', (e) => {
+    if (e.target && e.target.id === 'archfilter') { archFilter = e.target.value; if (lastArchive) renderArchive(lastArchive); }
+});
+document.getElementById('archpanel').addEventListener('keydown', (e) => { if (e.target && e.target.id === 'archfilter') e.stopPropagation(); });
 document.getElementById('archpanel').onclick = (e) => {
     const t = e.target.closest ? e.target.closest('[data-x],[data-act]') : null;
     if (!t) return;
@@ -836,14 +967,28 @@ function eventsForTab() {
     return chatEvts.filter(e => e.kind !== 'sys' && (e.who === activeTab || (e.who === 'you' && e.to === activeTab)));
 }
 function renderTabs() {
-    const sessions = lastBoard ? lastBoard.boards.filter(b => b.callsign !== 'jarvis' && b.alive !== false) : [];
+    // Order session tabs the same way the cards are ordered (perm/needs-you float to the top,
+    // board order otherwise) so the tab strip and the card column read top-to-bottom alike.
+    const _tprio = b => b.pendingPerm ? 2 : b.needsYou ? 1 : 0;
+    const sessions = lastBoard ? lastBoard.boards.filter(b => b.callsign !== 'jarvis' && b.alive !== false).slice().sort((a, b) => _tprio(b) - _tprio(a)) : [];
     const base = ['all', 'general', 'jarvis', 'ask'];
     const ids = base.concat(sessions.map(b => b.callsign));
     if (!ids.includes(activeTab)) activeTab = 'all';
     let html = base.map(id => '<span class="stab' + (id === activeTab ? ' active' : '') + '" data-tab="' + id + '">' + id.toUpperCase() + '</span>').join('');
-    html += sessions.map(b => '<span class="stab' + (b.callsign === activeTab ? ' active' : '') + (b.needsYou ? ' needs' : '') + '" data-tab="' + esc(b.callsign) + '">' + esc(b.callsign.toUpperCase()) + (b.needsYou ? '<span class="sbadge">!</span>' : '') + '</span>').join('');
+    // Full purpose rides as a title tooltip on every session tab so multiple same-named jobs
+    // (e.g. three TMS-20079 sessions) are distinguishable on hover.
+    html += sessions.map(b => '<span class="stab' + (b.callsign === activeTab ? ' active' : '') + (b.needsYou ? ' needs' : '') + '" data-tab="' + esc(b.callsign) + '"' + (b.purpose ? ' title="' + escAttr(b.callsign.toUpperCase() + ' · ' + b.purpose) + '"' : '') + '>' + esc(b.callsign.toUpperCase()) + (b.needsYou ? '<span class="sbadge">!</span>' : '') + '</span>').join('');
     html += '<span class="stab plus" data-newsession="1" title="new session: spin up a fresh worker">+</span>';
+    // Active session's purpose as a sub-line under the strip (real session tabs + the JARVIS
+    // tab, which borrows its bound worker's purpose). all/general/ask have no single purpose.
+    const _activeB = sessions.find(b => b.callsign === activeTab);
+    const _jb = lastBoard && lastBoard.boards.find(b => b.callsign === 'jarvis');
+    let _sub = '';
+    if (_activeB && _activeB.purpose) _sub = _activeB.callsign.toUpperCase() + ' · ' + _activeB.purpose;
+    else if (activeTab === 'jarvis' && _jb && _jb.purpose) _sub = (_jb.worker ? _jb.worker.toUpperCase() + ' · ' : '') + _jb.purpose;
+    if (_sub) html += '<span class="stabsub" title="' + escAttr(_sub) + '">' + esc(_sub) + '</span>';
     document.getElementById('stabs').innerHTML = html;
+    populateSendTo();
     if (activeTab !== 'ask') {   // ASK manages its own placeholder (see applyTabMode)
         const sess = activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
         typeBox.placeholder = sess ? ('Message ' + activeTab + ' - no focus change') : 'Type to jarvis (routes like speech; works while paused/muted)';
@@ -875,7 +1020,7 @@ function toggleNewSession() {
 }
 function spawnNewSession() {
     const repo = nsRepos[Number(document.getElementById('nsrepo').value)] || nsRepos[0];
-    if (!repo) { alert('No repos registered yet — register one before spinning up a session.'); return; }
+    if (!repo) { uiToast('No repos registered yet — register one before spinning up a session.', 'error'); return; }
     const purpose = document.getElementById('nspurpose').value.trim() || repo.defaultPurpose || repo.key;
     fetch('/spawn', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cwd: repo.cwd, purpose }) }).catch(() => { });
     document.getElementById('nspurpose').value = '';
