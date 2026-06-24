@@ -1092,7 +1092,11 @@ pollHold();
 
 let buf = [];
 let flushTimer = null;
+// The only voice the hub acts on while muted (mirrors the server's mute gate). Used to let a
+// spoken "unmute" through while everything else spoken is shown as NOT sent.
+const UNMUTE_RE = /\b(unmute|resume listening|start listening)\b/i;
 const INSTANT = [
+    /\bunmute\b/i,
     /\b(pause|stop|resume|start) listening\b/i,
     /\bjarvis\b.*\b(shut ?down|shutdown)\b/i,
     /\bend (the )?session\b/i,
@@ -1130,6 +1134,14 @@ function flushBuf() {
     if (!buf.length) return;
     const text = buf.join(' ').trim();
     buf = [];
+    // Muted = mic off for routing: the hub drops everything spoken except "unmute". So never
+    // clear the transcript as if it sent — leave the words on screen with the "NOT sent" cue
+    // (setInterim keeps #mutedcue visible) so Chris is never misled into answering into the
+    // void. Typing still routes while muted; only the unmute command is forwarded by voice.
+    if (isMuted && !UNMUTE_RE.test(text.toLowerCase())) {
+        if (text) setInterim(text);
+        return;
+    }
     setInterim('');
     if (text) window.__jarvisHear(text);
 }
