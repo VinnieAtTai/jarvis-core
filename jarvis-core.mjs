@@ -190,7 +190,8 @@ setInterval(() => {
             if (now >= st - 300000 && now < st && !s.announced[k5]) {
                 s.announced[k5] = true;
                 dirty = true;
-                enqueueSay('Heads up: ' + e.title + ' in ' + Math.max(1, Math.round((st - now) / 60000)) + ' minutes.', 'jarvis');
+                enqueueSay('Heads up: ' + e.title + ' in ' + Math.max(1, Math.round((st - now) / 60000)) + ' minutes. Want a meeting worker for it?', 'jarvis');
+                record({ kind: 'chat', from: 'jarvis', text: 'Meeting in ~5 min: "' + e.title + '". Spin up a meeting worker from the + tab → Meeting (it pre-selects this one), or skip.' });
             }
             if (now >= st && now < st + 60000 && !s.announced[k0]) {
                 s.announced[k0] = true;
@@ -835,7 +836,7 @@ function spawnWorkerConsoleless(cs, repo, boot, model, hookSettings) {
     workerPtys.set(cs, proc);
     return true;
 }
-function spawnWorker(repo, purpose, model, handoff, tier, project) {
+function spawnWorker(repo, purpose, model, handoff, tier, project, meeting) {
     const cs = assignCallsign();
     pendingPins.set(cs, Date.now());
     const effTier = (tier || repo.tier) === 'trusted' ? 'trusted' : null;
@@ -857,6 +858,12 @@ function spawnWorker(repo, purpose, model, handoff, tier, project) {
         boot += ' Then wait for instructions on the poll loop.';
     }
     if (project) boot += ' You are the ' + project + ' PROJECT worker: your task board IS the ' + project + ' column - use callsign "' + project + '" for every /worklist op (add/start/done/etc), not your own callsign, and speech the human points at ' + project + ' arrives on your poll loop. When you must hand off, /retire with successor:true so a fresh ' + project + ' worker takes over.';
+    if (meeting && meeting.title) {
+        boot += ' You are a MEETING worker for "' + meeting.title + '"' + (meeting.start && meeting.end ? ' (' + meeting.start + ' to ' + meeting.end + ')' : '') + '. Assist Chris live during this call: capture decisions and action items, draft Jira items when he asks, and pull up references.';
+        if (meeting.join) boot += ' Meet link: ' + meeting.join + '.';
+        if (meeting.link) boot += ' Calendar event: ' + meeting.link + '.';
+        boot += ' You have Google Calendar, Google Drive, and Jira MCP tools - use them. Look this event up in Google Calendar by its title and today\'s date to get the attendees, agenda/description, and any attached notes doc; if a notes doc is attached, READ it now for context. Draft Jira items only when Chris asks. Interaction is typing-first: keep spoken /say lines to short headlines and put notes, action items, drafts, and lists in chat via /send to human. When the meeting ends, post a concise summary - decisions, action items, and any drafted Jira items - and /retire with that as your handoff.';
+    }
     boot += ' Permissions: read-only and routine build commands (git status/diff/log, npm run lint, node --check, ls/cat/grep/rg, dotnet build/test) run WITHOUT asking the human; only risky or out-of-repo actions prompt. Favor those pre-approved commands, batch shell calls, and self-verify (run the lint gate yourself) instead of asking. If you fan out subagents, keep them to the same safe command set so they do not each trigger a prompt.' + (effTier ? ' You are a TRUSTED session: your non-risky actions are auto-approved — work autonomously and only surface genuine decisions.' : '');
     const hookSettings = repo.permissionMode === 'bypassPermissions' ? null : join(DATA, 'perm-settings.json');
     if (CONSOLELESS && spawnWorkerConsoleless(cs, repo, boot, model, hookSettings)) {
@@ -1702,8 +1709,9 @@ async function handleRequest(req, res) {
         const repo = resolveRepo(cwd);
         roster.handoffs = roster.handoffs || {};
         const handoff = roster.handoffs[cwdKey(cwd)] || null;
-        const cs = spawnWorker(repo, purpose, b.model, handoff, b.tier, b.project);
-        enqueueSay('Launching ' + (b.project ? b.project + ' worker' : cs) + ' in ' + repo.key + (handoff ? ', resuming the handoff' : '') + '.', 'jarvis');
+        const cs = spawnWorker(repo, purpose, b.model, handoff, b.tier, b.project, b.meeting);
+        const launchWhat = b.meeting && b.meeting.title ? 'meeting worker for ' + b.meeting.title : (b.project ? b.project + ' worker' : cs);
+        enqueueSay('Launching ' + launchWhat + ' in ' + repo.key + (handoff ? ', resuming the handoff' : '') + '.', 'jarvis');
         return json(res, 200, { ok: true, callsign: cs });
     }
     if (key === 'POST /permission') {

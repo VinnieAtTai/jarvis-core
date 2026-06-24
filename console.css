@@ -88,6 +88,10 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .stab.plus{color:#5dd97c;font-size:15px;font-weight:bold;padding:2px 13px}
 .stab.plus:hover{color:#7dffa0;border-color:#5dd97c}
 #newsessbox{display:flex;gap:8px;margin:6px 0 0;align-items:center}
+.nsmode{display:flex;border:1px solid #1f2c3a;border-radius:6px;overflow:hidden;flex:none}
+.nsmodebtn{padding:6px 10px;font:12px Consolas,monospace;color:#7a8a9c;cursor:pointer;background:#0d1420}
+.nsmodebtn.on{color:#5db4d9;background:#16202c}
+#nsmeeting{max-width:240px;background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:13px Consolas,monospace}
 #nsrepo{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:13px Consolas,monospace}
 #nspurpose{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:8px 12px;font:14px Consolas,monospace}
 .stab.dead{color:#566270}

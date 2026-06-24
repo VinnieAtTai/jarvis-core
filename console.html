@@ -6,7 +6,7 @@
 <div id="left">
 <div id="chatpanel" class="panel">
 <div id="stabs"></div>
-<div id="newsessbox" style="display:none"><select id="nsrepo"></select><input id="nspurpose" placeholder="what should it work on?" autocomplete="off"><button class="btn" id="nsgo">SPIN UP</button><span class="btn" id="nscancel" title="cancel">&#10005;</span></div>
+<div id="newsessbox" style="display:none"><span class="nsmode"><span class="nsmodebtn on" data-nsmode="repo">Repo</span><span class="nsmodebtn" data-nsmode="meeting">Meeting</span></span><select id="nsmeeting" style="display:none"></select><select id="nsrepo"></select><input id="nspurpose" placeholder="what should it work on?" autocomplete="off"><button class="btn" id="nsgo">SPIN UP</button><span class="btn" id="nscancel" title="cancel">&#10005;</span></div>
 <div id="chat"></div>
 <div id="rawlog"></div>
 <div id="aibar" style="display:none"><select id="aithreads" title="conversation"></select><button class="btn" id="ainew" title="start a fresh chat">+ NEW</button><button class="btn" id="aidel" title="delete this chat">&#128465;</button><select id="aimodel" title="model — Sonnet by default, Opus for hard reasoning"></select><span id="aispend" class="aispend" title="this month's API spend vs the monthly cap"></span></div>

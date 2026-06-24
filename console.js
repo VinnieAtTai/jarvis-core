@@ -1003,8 +1003,11 @@ document.getElementById('stabs').onclick = (e) => {
     activeTab = t.getAttribute('data-tab');
     renderChat();
 };
-// "+" tab → inline composer: pick a repo, type a purpose, spin up a fresh worker via /spawn.
-// The new session appears as its own tab within a few seconds (renderTabs polls /board).
+// "+" tab → inline composer with two modes. Repo: pick a repo + purpose. Meeting: pick a
+// calendar event from today's schedule (or blank/ad-hoc), seeded into a meeting-assistant
+// worker via a `meeting` context object. Both spawn via /spawn; the new session appears as
+// its own tab within a few seconds (renderTabs polls /board).
+let nsMode = 'repo';
 async function loadNsRepos() {
     try { const r = await (await fetch('/repos')).json(); nsRepos = r.items || []; } catch { nsRepos = []; }
     const sel = document.getElementById('nsrepo');
@@ -1012,23 +1015,75 @@ async function loadNsRepos() {
         ? nsRepos.map((r, i) => '<option value="' + i + '">' + esc(r.key) + (r.defaultPurpose ? ' — ' + esc(r.defaultPurpose) : '') + '</option>').join('')
         : '<option value="">(no repos registered)</option>';
 }
+function nsEvents() { return (lastSched && lastSched.events) || []; }
+function nsSelectedMeeting() {
+    if (nsMode !== 'meeting') return null;
+    const v = document.getElementById('nsmeeting').value;
+    if (v === '' || v === 'blank') return null;
+    return nsEvents()[Number(v)] || null;
+}
+function nsBuildMeetingOpts() {
+    const sel = document.getElementById('nsmeeting');
+    const evs = nsEvents();
+    const now = Date.now();
+    const cur = (lastSched && lastSched.current) ? (lastSched.current.title + lastSched.current.start) : null;
+    let html = evs.map((e, i) => '<option value="' + i + '">' + fmtHM(e.start) + ' ' + esc(e.title) + ((e.title + e.start) === cur ? ' (now)' : '') + '</option>').join('');
+    html += '<option value="blank">— blank / ad-hoc meeting —</option>';
+    sel.innerHTML = html;
+    // Pre-select the current meeting, else the next upcoming one, else blank.
+    let pick = evs.findIndex(e => (e.title + e.start) === cur);
+    if (pick < 0) pick = evs.findIndex(e => Date.parse(e.start) > now);
+    sel.value = pick >= 0 ? String(pick) : 'blank';
+    nsSyncPurpose();
+}
+function nsSyncPurpose() {
+    const inp = document.getElementById('nspurpose');
+    if (nsMode === 'meeting') {
+        const ev = nsSelectedMeeting();
+        inp.value = ev ? ('Meeting: ' + ev.title) : '';
+        inp.placeholder = 'meeting topic (blank / ad-hoc)';
+    } else {
+        inp.placeholder = 'what should it work on?';
+    }
+}
+function nsSetMode(m) {
+    nsMode = m;
+    document.querySelectorAll('.nsmodebtn').forEach(b => b.classList.toggle('on', b.getAttribute('data-nsmode') === m));
+    document.getElementById('nsmeeting').style.display = (m === 'meeting') ? '' : 'none';
+    if (m === 'meeting') nsBuildMeetingOpts(); else nsSyncPurpose();
+}
 function toggleNewSession() {
     const box = document.getElementById('newsessbox');
     const show = box.style.display === 'none' || !box.style.display;
     box.style.display = show ? 'flex' : 'none';
-    if (show) loadNsRepos().then(() => document.getElementById('nspurpose').focus());
+    if (show) { nsSetMode('repo'); loadNsRepos().then(() => document.getElementById('nspurpose').focus()); }
 }
 function spawnNewSession() {
     const repo = nsRepos[Number(document.getElementById('nsrepo').value)] || nsRepos[0];
     if (!repo) { uiToast('No repos registered yet — register one before spinning up a session.', 'error'); return; }
-    const purpose = document.getElementById('nspurpose').value.trim() || repo.defaultPurpose || repo.key;
-    fetch('/spawn', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cwd: repo.cwd, purpose }) }).catch(() => { });
+    let body;
+    if (nsMode === 'meeting') {
+        const ev = nsSelectedMeeting();
+        const typed = document.getElementById('nspurpose').value.trim().replace(/^meeting:\s*/i, '');
+        const title = ev ? ev.title : (typed || 'ad-hoc meeting');
+        const meeting = ev
+            ? { title: ev.title, start: ev.start, end: ev.end, ...(ev.join ? { join: ev.join } : {}), ...(ev.link ? { link: ev.link } : {}) }
+            : { title };
+        body = { cwd: repo.cwd, purpose: 'Meeting: ' + title, meeting };
+    } else {
+        const purpose = document.getElementById('nspurpose').value.trim() || repo.defaultPurpose || repo.key;
+        body = { cwd: repo.cwd, purpose };
+    }
+    fetch('/spawn', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).catch(() => { });
     document.getElementById('nspurpose').value = '';
     document.getElementById('newsessbox').style.display = 'none';
+    nsSetMode('repo');
 }
 document.getElementById('nsgo').onclick = spawnNewSession;
-document.getElementById('nscancel').onclick = () => { document.getElementById('newsessbox').style.display = 'none'; };
+document.getElementById('nscancel').onclick = () => { document.getElementById('newsessbox').style.display = 'none'; nsSetMode('repo'); };
 document.getElementById('nspurpose').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); spawnNewSession(); } e.stopPropagation(); });
+document.querySelector('.nsmode').addEventListener('click', e => { const b = e.target.closest('[data-nsmode]'); if (b) nsSetMode(b.getAttribute('data-nsmode')); });
+document.getElementById('nsmeeting').addEventListener('change', nsSyncPurpose);
 pollChat();
 pollWork();
 pollHeat();
