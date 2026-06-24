@@ -21,7 +21,7 @@ function log(msg) { try { appendFileSync(GLOG, new Date().toISOString() + ' ' + 
 
 function probe() {
     return new Promise((resolve) => {
-        const req = http.get({ host: '127.0.0.1', port: PORT, path: '/heartbeat', timeout: 2500 }, (res) => { res.resume(); resolve(res.statusCode === 200); });
+        const req = http.get({ host: '127.0.0.1', port: PORT, path: '/console.html', timeout: 2500 }, (res) => { res.resume(); resolve(res.statusCode === 200); });
         req.on('error', () => resolve(false));
         req.on('timeout', () => { req.destroy(); resolve(false); });
     });
@@ -45,7 +45,7 @@ function pidAlive(pid) {
     try {
         if (existsSync(LOCK)) {
             const pid = parseInt(String(readFileSync(LOCK, 'utf8')).trim(), 10) || 0;
-            if (pid && pidAlive(pid)) { try { execSync('taskkill /F /PID ' + pid); note = ' (killed wedged supervisor ' + pid + ')'; } catch { } }
+            if (pid && pidAlive(pid)) { try { execSync('taskkill /F /T /PID ' + pid); note = ' (killed wedged supervisor tree ' + pid + ')'; } catch { } }
             try { unlinkSync(LOCK); } catch { }
         }
     } catch { }
