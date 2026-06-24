@@ -575,6 +575,7 @@ function busAppend(ev, debounceMs) {
     const e = { ...ev, ts: new Date().toISOString() };
     bus.push(e);
     appendFileSync(BUS, JSON.stringify(e) + '\n');
+    trimBus(); // bound bus + bus.jsonl at runtime, mirroring record()->trimTranscript()
     if (!debounceMs) {
         if (speechReleaseTimer) { clearTimeout(speechReleaseTimer); speechReleaseTimer = null; }
         releaseWaiters();
