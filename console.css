@@ -113,11 +113,13 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .cbtns{display:flex;gap:5px;white-space:nowrap}
 .cbtn{cursor:pointer;font-size:13px;opacity:.5;user-select:none}
 .cbtn:hover{opacity:1}
-/* per-session activity glyph by the callsign: spinner = working, 💤 = idle/quiet */
-.actspin{display:inline-block;width:8px;height:8px;margin:0 3px;vertical-align:middle;border:2px solid #5dd97c;border-top-color:transparent;border-radius:50%;animation:actspin .8s linear infinite}
+/* per-session activity glyph by the callsign: spinner = working, 💤 = idle/quiet.
+   Lives in a fixed-width slot so the three states (spinner / idle / empty) don't reflow the row. */
+.actslot{display:inline-block;width:18px;text-align:center;vertical-align:middle}
+.actspin{display:inline-block;width:8px;height:8px;margin:0;vertical-align:middle;border:2px solid #5dd97c;border-top-color:transparent;border-radius:50%;animation:actspin .8s linear infinite}
 .actspin.stuck{border-color:#e0a34d;border-top-color:transparent;animation-duration:1.6s}
 @keyframes actspin{to{transform:rotate(360deg)}}
-.actidle{font-size:10px;margin:0 2px;vertical-align:middle;opacity:.45}
+.actidle{font-size:10px;margin:0;vertical-align:middle;opacity:.45}
 .cpurpose{color:#7a8a9c;font-size:11px;margin:2px 0;letter-spacing:0;font-weight:normal}
 .ccount{font-size:11px;margin:3px 0;display:flex;gap:12px}
 .cnum{font-weight:bold}

@@ -336,8 +336,12 @@ const STUCK_WORK_MS = 45 * 60 * 1000;
 const IDLE_DOING = /idle|standing by|stand[ -]?by|waiting|awaiting|blocked|paused|on hold|wound down|retir|sleeping|zzz/i;
 const _workSince = new Map();   // callsign -> ms timestamp its current working streak began
 function activityIndicator(b) {
+    // Fixed-width slot: the glyph swaps spinner <-> zzz <-> (none) on every state flip, and
+    // those three differ in width — which shoved the callsign / % / worker sideways and made
+    // the row "bounce" (Chris). Wrapping all three in one constant-width slot stops the reflow.
+    const slot = inner => ' <span class="actslot">' + inner + '</span>';
     const cs = b.callsign;
-    if (!b.uid || b.needsYou) { _workSince.delete(cs); return ''; }
+    if (!b.uid || b.needsYou) { _workSince.delete(cs); return slot(''); }
     const doing = b.doing || '';
     if (b.alive && doing && !IDLE_DOING.test(doing)) {
         const now = Date.now();
@@ -345,11 +349,11 @@ function activityIndicator(b) {
         const mins = Math.round((now - _workSince.get(cs)) / 60000);
         const stuck = (now - _workSince.get(cs)) > STUCK_WORK_MS;
         const title = stuck ? 'working ~' + mins + ' min - looks stuck' : 'working' + (mins >= 1 ? ' ~' + mins + ' min' : '');
-        return ' <span class="actspin' + (stuck ? ' stuck' : '') + '" title="' + escAttr(title) + '"></span>';
+        return slot('<span class="actspin' + (stuck ? ' stuck' : '') + '" title="' + escAttr(title) + '"></span>');
     }
     _workSince.delete(cs);
     const title = (b.uid && !b.alive) ? 'quiet - no heartbeat in 2+ min' : 'idle';
-    return ' <span class="actidle" title="' + title + '">&#128164;</span>';
+    return slot('<span class="actidle" title="' + title + '">&#128164;</span>');
 }
 function renderBoards(d) {
     focusCS = d.focus;
