@@ -91,6 +91,11 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .nsmode{display:flex;border:1px solid #1f2c3a;border-radius:6px;overflow:hidden;flex:none}
 .nsmodebtn{padding:6px 10px;font:12px Consolas,monospace;color:#7a8a9c;cursor:pointer;background:#0d1420}
 .nsmodebtn.on{color:#5db4d9;background:#16202c}
+.schedhead{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.schedfilter{display:flex;border:1px solid #1f2c3a;border-radius:5px;overflow:hidden;flex:none}
+.sfbtn{padding:1px 7px;font:bold 10px Consolas,monospace;letter-spacing:.5px;color:#7a8a9c;cursor:pointer;background:#0d1420}
+.sfbtn.on{color:#5db4d9;background:#16202c}
+.sfbtn:hover{color:#9bb0c4}
 #nsmeeting{max-width:240px;background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:13px Consolas,monospace}
 #nsrepo{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:13px Consolas,monospace}
 #nspurpose{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:8px 12px;font:14px Consolas,monospace}

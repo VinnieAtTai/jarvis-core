@@ -251,6 +251,12 @@ document.getElementById('bcal').onclick = () => {
     const box = document.getElementById('calbox');
     box.style.display = box.style.display === 'none' ? 'block' : 'none';
 };
+// SCHEDULE panel filter pills (All / Meetings / Tasks) — set state, repaint from the cache.
+document.getElementById('schedpanel').addEventListener('click', (e) => {
+    const p = e.target.closest('.sfbtn'); if (!p) return;
+    schedFilter = p.getAttribute('data-sf') || 'all';
+    if (lastBoard) renderBoards(lastBoard);
+});
 document.getElementById('bcalsave').onclick = async () => {
     const ta = document.getElementById('caltext');
     try {
@@ -290,6 +296,7 @@ loadNotify();
 
 const boardExpand = new Set();
 let lastBoard = null, lastSched = null;
+let schedFilter = 'all';   // SCHEDULE panel pills: 'all' | 'meetings' | 'tasks' (reminders)
 // Local-time 24-hour clock (HH:MM) for chat, raw-log, and schedule timestamps. The stored ts is an
 // ISO/UTC instant; new Date() + getHours/getMinutes render it in the viewer's local zone, instead of
 // slicing the raw "...Z" string which showed UTC. 24-hour keeps every time a fixed 5 chars so the
@@ -399,12 +406,21 @@ function renderBoards(d) {
     }
     let sched = '';
     const _rem = (lastSched && lastSched.reminders) || [];
-    if (lastSched && (((lastSched.events || []).length) || _rem.length)) {
+    const _evs = (lastSched && lastSched.events) || [];
+    if (lastSched && (_evs.length || _rem.length)) {
         const now = Date.now();
+        // Schedule | Tasks filter. The pills only matter when BOTH meetings and timed tasks
+        // exist; otherwise show everything and hide the pills. A stale filter (e.g. "tasks"
+        // after the reminders clear) falls back to 'all' so the panel never goes blank.
+        const hasBoth = _evs.length && _rem.length;
+        const f = hasBoth ? schedFilter : 'all';
+        const showM = f !== 'tasks', showR = f !== 'meetings';
         // Merge meetings + reminders into one time-sorted list; reminders render with a clock glyph.
-        const items = [...((lastSched.events) || []).map(e => ({ ...e, _k: 'm' })), ..._rem.map(r => ({ ...r, _k: 'r' }))]
+        const items = [...(showM ? _evs.map(e => ({ ...e, _k: 'm' })) : []), ...(showR ? _rem.map(r => ({ ...r, _k: 'r' })) : [])]
             .sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
-        sched = '<div class="bhead" style="margin-top:0">SCHEDULE</div>' + items.map(e => {
+        const pill = (v, lbl) => '<span class="sfbtn' + (f === v ? ' on' : '') + '" data-sf="' + v + '">' + lbl + '</span>';
+        const pills = hasBoth ? '<span class="schedfilter">' + pill('all', 'All') + pill('meetings', 'Meetings') + pill('tasks', 'Tasks') + '</span>' : '';
+        sched = '<div class="bhead schedhead" style="margin-top:0"><span>SCHEDULE</span>' + pills + '</div>' + items.map(e => {
             if (e._k === 'r') {
                 const due = Date.parse(e.start) <= now, fired = !!e.firedAt;
                 const col = (due || fired) ? '#7d6fb0' : '#b9a7e6';
