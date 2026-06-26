@@ -1795,7 +1795,7 @@ async function handleRequest(req, res) {
         const fpath = join(dir, fname);
         writeFileSync(fpath, Buffer.from(data, 'base64'));
         const w = loadWork();
-        const uid = (cs && liveUidOf(cs)) || (w.focus !== 'jarvis' ? liveUidOf(w.focus) : null);
+        const uid = (cs && (liveUidOf(cs) || projectWorkerUid(cs))) || liveUidOf(w.focus) || projectWorkerUid(w.focus);
         if (uid) busAppend({ from: 'human', to: uid, kind: 'screenshot', text: fpath });
         const toCs = uid ? roster.sessions[uid].callsign : null;
         record({ kind: 'speech', text: '📎 ' + name + (toCs ? '' : ' (saved)'), to: toCs || null, img: '/att?n=' + encodeURIComponent(fname) });
