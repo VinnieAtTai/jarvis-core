@@ -92,6 +92,31 @@ export function textOf(t) {
     return (t && typeof t === 'object') ? (t.text == null ? '' : t.text) : (t == null ? '' : t);
 }
 
+// Trim a task to a speakable headline: drop a leading category tag (e.g. "BUG:") and keep the
+// first few words. Used for spoken read-back and short status lines.
+export function shortTitle(s) {
+    const t = String(s).replace(/^[A-Z]{2,10}:\s*/, '').trim();
+    return t.split(/\s+/).slice(0, 7).join(' ').slice(0, 50);
+}
+
+// Spoken summary of one board's open work: counts plus a headline task, NOT every task read out
+// verbatim — Chris asked for read-back to be summarized. Returns '' when nothing is open so the
+// caller can say "the list is empty". Scope mirrors the old speakBoard: working + queued only.
+export function summarizeBoard(board) {
+    if (!board) return '';
+    const open = lane => (board[lane] || []).map(textOf).filter(s => s && s.trim());
+    const working = open('working');
+    const queued = open('queued');
+    const parts = [];
+    if (working.length === 1) parts.push('working on ' + shortTitle(working[0]));
+    else if (working.length > 1) parts.push('working on ' + working.length + ', starting with ' + shortTitle(working[0]));
+    if (queued.length === 1) parts.push('1 queued, ' + shortTitle(queued[0]));
+    else if (queued.length > 1) parts.push(queued.length + ' queued, next ' + shortTitle(queued[0]));
+    if (!parts.length) return '';
+    const s = parts.join('; ');
+    return s.charAt(0).toUpperCase() + s.slice(1) + '.';
+}
+
 // Bring any on-disk worklist up to the current shape. Idempotent: existing task objects
 // keep their ids (so ids are stable across reloads); only missing fields are backfilled.
 // Returns { w, changed } so the loader can persist a one-time upgrade. makeTask(text)->task and

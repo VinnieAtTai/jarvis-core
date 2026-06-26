@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 import { captureScreen } from './screen.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, migrateWork, cwdKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -470,10 +470,6 @@ function orderedTasks(board) {
     }
     return out;
 }
-function shortTitle(s) {
-    const t = String(s).replace(/^[A-Z]{2,10}:\s*/, '').trim();
-    return t.split(/\s+/).slice(0, 7).join(' ').slice(0, 50);
-}
 const NUMWORDS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
 const IDX_FILLER = new Set(['item', 'number', 'no', 'task', 'the', 'on', 'to']);
 function liveUidOf(cs) {
@@ -900,11 +896,6 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting) {
     record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + repo.cwd + ' (' + repo.key + ')' });
     return cs;
 }
-function speakBoard(cs, board) {
-    const part = (label, items) => items && items.length ? label + ': ' + items.map(textOf).join('. ') + '. ' : '';
-    return part('Working on', board.working) + part('Queued', board.queued);
-}
-
 function handleUtterance(rawText, typed) {
     let text = rawText;
     let lower = canon(text).toLowerCase();
@@ -1237,7 +1228,7 @@ function handleUtterance(rawText, typed) {
     if (after(/read (?:everyone'?s'?|all)(?: the)? (?:list|lists|tasks)\b/)) {
         const w = loadWork();
         const parts = Object.entries(w.sessions)
-            .map(([cs, b]) => { const s = speakBoard(cs, b); return s ? cs + '. ' + s : ''; })
+            .map(([cs, b]) => { const s = summarizeBoard(b); return s ? cs + '. ' + s : ''; })
             .filter(Boolean);
         enqueueSay(parts.length ? parts.join(' ') : 'Every list is empty.', 'jarvis');
         return;
@@ -1304,7 +1295,7 @@ function handleUtterance(rawText, typed) {
     }
     if (after(/(?:read|what is|what's) (?:the |on |my )?(?:list|worklist|tasks)\b/)) {
         const w = loadWork();
-        const spoken = speakBoard(w.focus, ensureBoard(w, w.focus));
+        const spoken = summarizeBoard(ensureBoard(w, w.focus));
         const prefix = w.focus === 'jarvis' ? '' : 'On ' + w.focus + '. ';
         enqueueSay(spoken ? prefix + spoken : prefix + 'The list is empty.', 'jarvis');
         return;

@@ -2,7 +2,7 @@
 // No server boot, no I/O — these import the real functions the hub uses.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { clk, remTitle, parseReminder, parseScheduleText } from '../jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, shortTitle, summarizeBoard } from '../jarvis-text.mjs';
 
 const minutesFromNow = iso => (Date.parse(iso) - Date.now()) / 60000;
 
@@ -90,4 +90,59 @@ test('parseScheduleText — titles + times, sorted, RSVP noise stripped', () => 
 
 test('parseScheduleText — empty input yields no events', () => {
     assert.equal(parseScheduleText('').events.length, 0);
+});
+
+test('shortTitle — strips a leading category tag', () => {
+    assert.equal(shortTitle('BUG: copy button denied'), 'copy button denied');
+    assert.equal(shortTitle('FEATURE: add a local STT toggle'), 'add a local STT toggle');
+});
+
+test('shortTitle — keeps the first seven words', () => {
+    assert.equal(shortTitle('one two three four five six seven eight nine'), 'one two three four five six seven');
+});
+
+test('shortTitle — caps the headline at 50 chars', () => {
+    assert.ok(shortTitle('supercalifragilistic expialidocious antidisestablishmentarianism').length <= 50);
+});
+
+test('summarizeBoard — empty / work-free board reads as nothing', () => {
+    assert.equal(summarizeBoard(null), '');
+    assert.equal(summarizeBoard({ working: [], queued: [] }), '');
+    // only done/review counts as no open work
+    assert.equal(summarizeBoard({ done: [{ text: 'shipped' }], review: [{ text: 'r' }] }), '');
+});
+
+test('summarizeBoard — a single working task names it, summarized (no tag)', () => {
+    assert.equal(
+        summarizeBoard({ working: [{ text: 'BUG: fix the copy button on chat cards right now' }], queued: [] }),
+        'Working on fix the copy button on chat cards.'
+    );
+});
+
+test('summarizeBoard — multiple working tasks give a count + headline, not all of them', () => {
+    assert.equal(
+        summarizeBoard({ working: [{ text: 'alpha task' }, { text: 'beta task' }, { text: 'gamma' }], queued: [] }),
+        'Working on 3, starting with alpha task.'
+    );
+});
+
+test('summarizeBoard — queued summarized as count + next', () => {
+    assert.equal(summarizeBoard({ working: [], queued: [{ text: 'review the PR' }] }), '1 queued, review the PR.');
+    assert.equal(
+        summarizeBoard({ working: [], queued: [{ text: 'alpha' }, { text: 'beta' }] }),
+        '2 queued, next alpha.'
+    );
+});
+
+test('summarizeBoard — working + queued combine in one line', () => {
+    assert.equal(
+        summarizeBoard({ working: [{ text: 'the big task' }], queued: [{ text: 'b' }, { text: 'c' }] }),
+        'Working on the big task; 2 queued, next b.'
+    );
+});
+
+test('summarizeBoard — tolerates legacy string tasks and blank entries', () => {
+    assert.equal(summarizeBoard({ working: ['legacy string task'], queued: [] }), 'Working on legacy string task.');
+    // blank-text tasks do not count toward the summary
+    assert.equal(summarizeBoard({ working: [{ text: '' }, { text: '   ' }], queued: [{ text: 'real one' }] }), '1 queued, real one.');
 });
