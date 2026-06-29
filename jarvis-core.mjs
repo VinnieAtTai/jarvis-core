@@ -356,7 +356,11 @@ function findTaskAll(w, needle, lists, prefer) {
     return null;
 }
 function loadRepos() {
-    try { return JSON.parse(readFileSync(REPOS, 'utf8')) || {}; } catch { return {}; }
+    if (existsSync(REPOS)) {
+        try { return JSON.parse(readFileSync(REPOS, 'utf8')) || {}; }
+        catch { backupCorrupt(REPOS); }   // preserve the only copy, don't silently reset
+    }
+    return {};
 }
 // cwdKey (stable key for a job's working directory: separator/case/trailing-slash insensitive)
 // is imported from jarvis-text.mjs. Handoff records are stored under this so a successor on the
@@ -369,7 +373,11 @@ function resolveRepo(cwd) {
     return repo || { key: 'adhoc', cwd };
 }
 function loadSchedule() {
-    try { return JSON.parse(readFileSync(SCHEDULE, 'utf8')) || { events: [], announced: {} }; } catch { return { events: [], announced: {} }; }
+    if (existsSync(SCHEDULE)) {
+        try { return JSON.parse(readFileSync(SCHEDULE, 'utf8')) || { events: [], announced: {} }; }
+        catch { backupCorrupt(SCHEDULE); }   // a corrupt paste would otherwise lose the day's meetings + reminders
+    }
+    return { events: [], announced: {} };
 }
 function saveSchedule(s) {
     atomicWrite(SCHEDULE, JSON.stringify(s, null, 1));
@@ -535,7 +543,10 @@ function enqueueSay(text, from) {
 // DATA/notify.json. No URL configured -> silently does nothing. A short cooldown
 // collapses rapid-fire bursts (e.g. back-to-back permission prompts).
 let NOTIFY = { url: process.env.JARVIS_NTFY_URL || '' };
-try { NOTIFY = JSON.parse(readFileSync(join(DATA, 'notify.json'), 'utf8')); } catch { }
+if (existsSync(join(DATA, 'notify.json'))) {
+    try { NOTIFY = JSON.parse(readFileSync(join(DATA, 'notify.json'), 'utf8')); }
+    catch { backupCorrupt(join(DATA, 'notify.json')); }   // keep the env-default, preserve the corrupt file
+}
 function saveNotify() { try { writeFileSync(join(DATA, 'notify.json'), JSON.stringify(NOTIFY)); } catch { } }
 let lastPushAt = 0;
 function pushPhone(title, message) {
