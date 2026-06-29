@@ -24,6 +24,7 @@ const BUS = join(DATA, 'bus.jsonl');
 const BUSBASE = join(DATA, 'bus.base'); // persisted count of bus events dropped off the front
 const REPOS = join(DATA, 'repos.json');
 const SCHEDULE = join(DATA, 'schedule.json');
+const MISSIONS = join(DATA, 'missions.json');        // persistent always-visible mission tracker
 const AI_THREADS = join(DATA, 'ai-threads.json');   // conversational-tab thread store
 const AI_SPEND = join(DATA, 'ai-spend.json');        // conversational-tab monthly spend tracker
 // Hard monthly spend cap for the /ai tab (USD). Configurable; default $20. A non-positive/garbage
@@ -381,6 +382,68 @@ function loadSchedule() {
 }
 function saveSchedule(s) {
     atomicWrite(SCHEDULE, JSON.stringify(s, null, 1));
+}
+// —— Missions: a small, durable set of long-running objectives Chris wants ALWAYS visible in a
+// pinned console rail. Unlike board tasks (per-session, transient), a mission survives restarts
+// AND worker retire (it lives in hub state, not a session), tracks a phase checklist + progress +
+// doc links, and is CLOSED ONLY via the voice gate ("mission accomplished" -> "are you sure" ->
+// "yes"), which ARCHIVES it (status:'archived') — never a hard delete. The first mission is
+// seeded once below so the rail is alive the instant the feature deploys.
+let missionSeq = 0;
+function newMissionId() {
+    return 'm_' + Date.now().toString(36) + (missionSeq++).toString(36) + Math.random().toString(36).slice(2, 4);
+}
+function makeMission(title, phases, docs) {
+    return {
+        id: newMissionId(),
+        title: String(title == null ? '' : title).trim(),
+        phases: (Array.isArray(phases) ? phases : []).map(p => (p && typeof p === 'object')
+            ? { text: String(p.text == null ? '' : p.text), done: !!p.done }
+            : { text: String(p), done: false }),
+        docs: (Array.isArray(docs) ? docs : []).map(d => (d && typeof d === 'object')
+            ? { label: String(d.label == null ? (d.url || '') : d.label), url: String(d.url == null ? '' : d.url) }
+            : { label: String(d), url: String(d) }),
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        archivedAt: null,
+    };
+}
+// One-time seed: Chris's first mission (his ask 2026-06-29). Only used when missions.json is absent.
+function seedMissions() {
+    return {
+        version: 1, missions: [makeMission('PrimeNG 17 → 18 upgrade', [
+            'Audit PrimeNG 17 usage + 18 breaking changes',
+            'Bump dependency + theming / styled-mode migration',
+            'Fix component API changes (p-fileUpload, dropdowns, dialogs)',
+            'Visual QA pass across modals + forms',
+            'Merge to beta2 + verify',
+        ], [])],
+    };
+}
+function loadMissions() {
+    if (existsSync(MISSIONS)) {
+        try {
+            const m = JSON.parse(readFileSync(MISSIONS, 'utf8'));
+            if (m && Array.isArray(m.missions)) return m;
+        } catch { backupCorrupt(MISSIONS); }   // preserve + alert, don't silently reset
+    }
+    const seeded = seedMissions();
+    try { saveMissions(seeded); } catch { }
+    return seeded;
+}
+function saveMissions(m) {
+    atomicWrite(MISSIONS, JSON.stringify(m, null, 1));
+}
+function missionProgress(mn) {
+    const ph = mn.phases || [];
+    if (!ph.length) return 0;
+    return Math.round(ph.filter(p => p.done).length / ph.length * 100);
+}
+// Active missions, decorated with derived progress, for the console rail.
+function activeMissionsView() {
+    return (loadMissions().missions || [])
+        .filter(x => x.status === 'active')
+        .map(mn => ({ ...mn, progress: missionProgress(mn) }));
 }
 // —— Reminders: ad-hoc timed to-dos that live in the calendar next to meetings. Unlike the
 // meeting list (volatile, re-pasted daily, date-gated), a reminder carries an absolute time,
@@ -907,6 +970,9 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting) {
     record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + repo.cwd + ' (' + repo.key + ')' });
     return cs;
 }
+// Two-step close gate for a mission: "mission accomplished" arms this, the follow-up "yes"
+// archives it. Held in memory with a 60s window so a stray "yes" much later can't trip it.
+let pendingMissionClose = null;
 function handleUtterance(rawText, typed) {
     let text = rawText;
     let lower = canon(text).toLowerCase();
@@ -958,6 +1024,55 @@ function handleUtterance(rawText, typed) {
         text = text.replace(/^jarvis[\s,.!]*/i, '').trim();
         if (!text) return;
         lower = canon(text).toLowerCase();
+    }
+
+    // —— Mission tracker voice control. Closing a mission is a deliberate two-step gate so a
+    // stray "mission accomplished" can't wipe a long-running objective; creating one is a single
+    // phrase. ——
+    if (pendingMissionClose && Date.now() < pendingMissionClose.until) {
+        if (/\b(ye(s|ah|p)|confirm(ed)?|do it|affirmative|i'?m sure|absolutely|aye)\b/.test(lower)) {
+            const mm = loadMissions();
+            const mn = (mm.missions || []).find(x => x.id === pendingMissionClose.id && x.status === 'active');
+            const title = pendingMissionClose.title; pendingMissionClose = null;
+            if (mn) {
+                mn.status = 'archived'; mn.archivedAt = new Date().toISOString(); saveMissions(mm);
+                record({ kind: 'sys', text: 'mission accomplished + archived: ' + title });
+                enqueueSay('Mission accomplished: ' + title + '. Archived. Well done, Big Chris.', 'jarvis');
+            } else enqueueSay('That mission is already closed.', 'jarvis');
+            return;
+        }
+        if (/\b(no|nope|cancel|stop|never ?mind|not yet|hold on|wait)\b/.test(lower)) {
+            const title = pendingMissionClose.title; pendingMissionClose = null;
+            record({ kind: 'sys', text: 'mission close cancelled: ' + title });
+            enqueueSay('Okay, leaving it open.', 'jarvis');
+            return;
+        }
+        pendingMissionClose = null;   // anything else: drop the gate, don't trap unrelated speech
+    }
+    if (/\bmission accomplished\b|\b(close|complete|finish|archive) (the |this )?mission\b/.test(lower)) {
+        const act = (loadMissions().missions || []).filter(x => x.status === 'active');
+        if (!act.length) { enqueueSay('There are no active missions.', 'jarvis'); return; }
+        const target = act.length === 1 ? act[0]
+            : act.find(x => x.title && lower.includes(x.title.toLowerCase().split(/[\s→>\-]+/)[0]));
+        if (!target) { enqueueSay('Which mission? You have ' + act.length + ' active. Name it, then say mission accomplished.', 'jarvis'); return; }
+        pendingMissionClose = { id: target.id, title: target.title, until: Date.now() + 60000 };
+        record({ kind: 'sys', text: 'mission close requested: ' + target.title });
+        enqueueSay('Are you sure you want to mark ' + target.title + ' accomplished? Say yes to confirm.', 'jarvis');
+        return;
+    }
+    {
+        const nm = /^(?:jarvis[\s,.!]+)?(?:new|start|begin|create|add) (?:a )?mission[:\s]+(.+)$/i.exec(text.trim());
+        if (nm) {
+            const title = nm[1].trim();
+            if (title) {
+                const mm = loadMissions();
+                const created = makeMission(title, [], []);
+                mm.missions.push(created); saveMissions(mm);
+                record({ kind: 'sys', text: 'mission created: ' + created.title });
+                enqueueSay('New mission: ' + created.title + '. Pinned to the rail.', 'jarvis');
+            } else enqueueSay('What should the mission be called?', 'jarvis');
+            return;
+        }
     }
 
     // —— Easter egg (for Big Chris): a spot of Guy Ritchie, served in the Queen's English.
@@ -1392,8 +1507,9 @@ async function handleRequest(req, res) {
                 working: b.working, queued: b.queued, done: b.done, review: b.review || [],
             };
         });
-        return json(res, 200, { focus: w.focus, muted, paused: discard, boards, awayUntil: roster.awayUntil || 0 });
+        return json(res, 200, { focus: w.focus, muted, paused: discard, boards, awayUntil: roster.awayUntil || 0, missions: activeMissionsView() });
     }
+    if (key === 'GET /missions') return json(res, 200, loadMissions());
     if (key === 'GET /roster') {
         const live = liveCallsigns().map(cs => {
             const uid = liveUidOf(cs);
@@ -1865,6 +1981,52 @@ async function handleRequest(req, res) {
         saveWork(w);
         record({ kind: 'task', op: b.op, board: cs, task: textOf(task) });
         return json(res, 200, { ok: true, op: b.op, task });
+    }
+    if (key === 'POST /mission') {
+        // Mutate the durable mission set. Note: there is NO console close button — a mission is
+        // closed only via the voice gate (handleUtterance). The 'archive' op here exists for
+        // programmatic/recovery use, not the UI. ops: add | phase | unphase | title | doc | undoc
+        // | archive | reactivate.
+        const b = await readBody(req);
+        const op = String(b.op || '').toLowerCase();
+        const mm = loadMissions();
+        if (op === 'add') {
+            const mn = makeMission(b.title, b.phases, b.docs);
+            if (!mn.title) return json(res, 400, { error: 'title required' });
+            mm.missions.push(mn); saveMissions(mm);
+            record({ kind: 'sys', text: 'mission created: ' + mn.title });
+            return json(res, 200, { ok: true, mission: mn });
+        }
+        const mn = (mm.missions || []).find(x => x.id === b.id);
+        if (!mn) return json(res, 404, { error: 'no such mission' });
+        if (op === 'phase') {
+            if (b.text != null && b.index == null) { mn.phases.push({ text: String(b.text), done: !!b.done }); }
+            else {
+                const i = Number(b.index);
+                if (!(i >= 0 && i < mn.phases.length)) return json(res, 400, { error: 'bad phase index' });
+                mn.phases[i].done = (b.done != null) ? !!b.done : !mn.phases[i].done;
+            }
+        } else if (op === 'unphase') {
+            const i = Number(b.index);
+            if (!(i >= 0 && i < mn.phases.length)) return json(res, 400, { error: 'bad phase index' });
+            mn.phases.splice(i, 1);
+        } else if (op === 'title') {
+            if (b.title) mn.title = String(b.title).trim();
+        } else if (op === 'doc') {
+            mn.docs.push({ label: String(b.label || b.url || ''), url: String(b.url || '') });
+        } else if (op === 'undoc') {
+            const i = Number(b.index);
+            if (i >= 0 && i < mn.docs.length) mn.docs.splice(i, 1);
+        } else if (op === 'archive') {
+            mn.status = 'archived'; mn.archivedAt = new Date().toISOString();
+            record({ kind: 'sys', text: 'mission archived: ' + mn.title });
+        } else if (op === 'reactivate') {
+            mn.status = 'active'; mn.archivedAt = null;
+        } else {
+            return json(res, 400, { error: 'op must be add|phase|unphase|title|doc|undoc|archive|reactivate' });
+        }
+        saveMissions(mm);
+        return json(res, 200, { ok: true, mission: mn });
     }
     if (key === 'POST /retire') {
         const b = await readBody(req);

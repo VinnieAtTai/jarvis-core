@@ -82,6 +82,24 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .nmclear{color:#7fb98a;font-size:13px;padding:2px 0}
 #nextpanel.imminent{border-color:#ff6b6b;animation:nmpulse 1.4s ease-in-out infinite}
 @keyframes nmpulse{0%,100%{box-shadow:0 0 0 0 rgba(255,107,107,0)}50%{box-shadow:0 0 14px 1px rgba(255,107,107,.5)}}
+/* Mission tracker: a pinned, always-visible rail of long-running objectives. */
+.panel.mission{border-color:#3a4a2a;background:#121a16;flex:none}
+.mhead{display:flex;align-items:center;gap:7px;font-weight:bold;font-size:11px;letter-spacing:1px;color:#7fb98a;margin-bottom:8px;text-transform:uppercase}
+.mhead .mhicon{font-size:13px}
+.mtitle{font-weight:bold;font-size:14px;color:#d7e3f0;margin:0 0 1px}
+.mpct{font-size:11px;color:#7a8a9c;float:right;font-weight:normal}
+.mission .nmbarfill{background:#5dd97c}
+.mphases{margin:7px 0 2px}
+.mphase{display:flex;align-items:flex-start;gap:7px;padding:3px 0;font-size:13px;color:#aeb9c4;cursor:pointer;line-height:1.4}
+.mphase:hover{color:#d7e3f0}
+.mphase .mbox{flex:none;color:#566270;font-size:13px;width:14px;text-align:center}
+.mphase.done{color:#6f9b7e;text-decoration:line-through}
+.mphase.done .mbox{color:#5dd97c;text-decoration:none}
+.mdocs{margin-top:6px;display:flex;flex-wrap:wrap;gap:5px}
+.mdoc{font-size:11px;color:#5db4d9;border:1px solid #1f3340;border-radius:5px;padding:1px 7px;cursor:pointer}
+.mdoc:hover{border-color:#5db4d9}
+.mmsg{font-size:11px;color:#566270;margin-top:6px;font-style:italic}
+.mission .mitem+.mitem{margin-top:11px;padding-top:11px;border-top:1px solid #1f2c3a}
 #stabs{display:flex;gap:5px;flex-wrap:wrap;align-items:center;padding:0 0 8px;border-bottom:1px solid #1f2c3a;margin-bottom:2px}
 .stab{background:#16202c;border:1px solid #1f2c3a;color:#9bb0c4;border-radius:6px;padding:4px 12px;cursor:pointer;font:bold 12px Consolas,monospace;letter-spacing:1px}
 .stab.active{color:#5db4d9;border-color:#5db4d9;background:#0d1420}

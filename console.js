@@ -7,6 +7,7 @@ const cancelBtn = document.getElementById('icancel');
 const chatEl = document.getElementById('chat');
 const rawEl = document.getElementById('rawlog');
 const workEl = document.getElementById('work');
+const missionEl = document.getElementById('mission');
 const jumpEl = document.getElementById('jump');
 const bexp = document.getElementById('bexp');
 const braw = document.getElementById('braw');
@@ -362,10 +363,49 @@ function activityIndicator(b) {
     const title = (b.uid && !b.alive) ? 'quiet - no heartbeat in 2+ min' : 'idle';
     return slot('<span class="actidle" title="' + title + '">&#128164;</span>');
 }
+// Mission rail: the pinned, always-visible objectives panel (#mission, separate from #work).
+// Phase rows toggle done on click; doc chips open via the document-level data-open listener.
+// There is deliberately NO close control — a mission is closed only by the voice gate.
+function renderMissions(list) {
+    if (!missionEl) return;
+    if (!list || !list.length) { missionEl.style.display = 'none'; missionEl.innerHTML = ''; return; }
+    missionEl.style.display = 'block';
+    const items = list.map(mn => {
+        const phs = mn.phases || [], tot = phs.length, done = phs.filter(p => p.done).length;
+        const pct = typeof mn.progress === 'number' ? mn.progress : (tot ? Math.round(done / tot * 100) : 0);
+        const phaseHtml = phs.map((p, i) =>
+            '<div class="mphase' + (p.done ? ' done' : '') + '" data-mid="' + escAttr(mn.id) + '" data-pi="' + i + '" title="click to toggle">'
+            + '<span class="mbox">' + (p.done ? '☑' : '☐') + '</span><span>' + esc(p.text) + '</span></div>').join('');
+        const docHtml = (mn.docs || []).length
+            ? '<div class="mdocs">' + mn.docs.map(d => {
+                const u = (d.url || '').trim(), lbl = esc(d.label || u || 'link');
+                return u
+                    ? '<span class="mdoc" data-open="' + escAttr(u) + '" title="' + escAttr(u) + '">🔗 ' + lbl + '</span>'
+                    : '<span class="mdoc" style="cursor:default">🔗 ' + lbl + '</span>';
+            }).join('') + '</div>'
+            : '';
+        return '<div class="mitem">'
+            + '<div class="mtitle">' + esc(mn.title) + '<span class="mpct">' + pct + '%' + (tot ? ' · ' + done + '/' + tot : '') + '</span></div>'
+            + '<div class="nmbar"><div class="nmbarfill" style="width:' + pct + '%"></div></div>'
+            + (phaseHtml ? '<div class="mphases">' + phaseHtml + '</div>' : '')
+            + docHtml
+            + '</div>';
+    }).join('');
+    missionEl.innerHTML = '<div class="mhead"><span class="mhicon">🎯</span> MISSION' + (list.length > 1 ? 'S' : '') + '</div>'
+        + items
+        + '<div class="mmsg">Say &ldquo;mission accomplished&rdquo; to close one.</div>';
+}
+if (missionEl) missionEl.onclick = (e) => {
+    const t = e.target.closest ? e.target.closest('.mphase[data-mid]') : null;
+    if (!t) return;
+    fetch('/mission', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op: 'phase', id: t.getAttribute('data-mid'), index: Number(t.getAttribute('data-pi')) }) })
+        .then(() => fetch('/board').then(r => r.json()).then(renderBoards)).catch(() => { });
+};
 function renderBoards(d) {
     focusCS = d.focus;
     lastBoard = d;
     populateAddTaskCols(d);
+    renderMissions(d.missions || []);
     if (typeof d.muted === 'boolean' && d.muted !== isMuted) window.__setMute(d.muted);
     if (typeof d.paused === 'boolean' && d.paused !== isPaused) window.__setPause(d.paused);
     renderHeat();
