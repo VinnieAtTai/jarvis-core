@@ -38,6 +38,7 @@ the hub is up.
 | `sessions.json` | roster: uids, callsigns, cwd, purpose, tier, ctx/doing, handoffs | `saveRoster()` (debounced) |
 | `worklist.json` | the board, v3: `{focus, sessions:{<callsign>:{working,queued,review,done}}}` | `saveWork()` |
 | `schedule.json` | `{date, events[] (meetings), announced{}, reminders[]}` | `saveSchedule()` |
+| `missions.json` | mission tracker: `{version, missions[]:{id,title,phases[],docs[],status,createdAt,archivedAt}}` (durable across restarts + worker retire) | `saveMissions()` |
 | `bus.jsonl` | per-recipient event bus; `/poll` reads from here (`bus.base` = dropped-prefix count) | `busAppend()` |
 | `transcript.jsonl` | append-only human-facing event log; the hub-driver monitor tails it | `record()` |
 | `say.txt` | latest spoken line for the TTS layer to read out | `enqueueSay()` / say queue |
@@ -61,6 +62,10 @@ Grouped by purpose; all JSON unless noted.
   `POST /attach`.
 - **Calendar:** `GET/POST /schedule` (meetings), `POST /remind` (reminders), surfaced via
   the 15s scheduler tick + the NEXT banner.
+- **Missions:** `GET /missions`, `POST /mission` (add/phase/unphase/title/doc/undoc/archive/
+  reactivate); active missions are also decorated with progress on `GET /board` for the pinned
+  console rail. A mission is *closed only via the voice gate* ("mission accomplished" →
+  "are you sure?" → "yes" archives it) — never hard-deleted.
 - **Permissions:** `POST /permission` (worker asks), `POST /permission-answer[-all]`
   (human decides) — the perm-hook classifier tags risk.
 - **Control / misc:** `POST /mute`, `POST /pause`, `POST /restart` (Rebuild),
@@ -101,7 +106,7 @@ the card persists and the successor re-attaches.
 ## Routing
 
 `handleUtterance()` parses an inbound utterance: explicit address (`"<callsign>, …"` /
-`"on <callsign> …"`), then commands (focus, schedule, reminders, spawn, retire, board ops,
+`"on <callsign> …"`), then commands (focus, schedule, reminders, missions, spawn, retire, board ops,
 mute/pause, easter eggs), else it falls to the focused session. `routeTo(cs, msg)` resolves
 `liveUidOf(cs) || projectWorkerUid(cs)` and drops a `speech` event on that uid's bus (debounced
 so rapid sentences batch). Speech with no live target (incl. `focus=jarvis` when no project
