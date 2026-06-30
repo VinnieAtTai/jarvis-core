@@ -35,7 +35,7 @@ function pidAlive(pid) {
 
 (async () => {
     if (await probe()) return;                                   // hub healthy — nothing to do
-    if (existsSync(STOP)) { log('down + STOP sentinel — deliberate wind-down, leaving it'); return; }
+    if (existsSync(STOP)) return;
     await sleep(15000);                                          // ride out a normal supervisor relaunch (~2-3s)
     if (await probe()) return;                                   // recovered on its own
     if (existsSync(STOP)) { log('STOP appeared during recheck — leaving it'); return; }
