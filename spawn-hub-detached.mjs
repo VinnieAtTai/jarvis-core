@@ -81,7 +81,7 @@ async function loop() {
             c.on('exit', (x) => res(x));
             c.on('error', () => res(-1));
         });
-        if (existsSync(STOP)) { try { unlinkSync(STOP); } catch { } process.stdout.write('[supervisor] STOP sentinel -> stopping for the night\n'); break; }
+        if (existsSync(STOP)) { process.stdout.write('[supervisor] STOP sentinel present -> stopping; leaving sentinel in place so the OS guardian also honors the wind-down (hub clears it on next intentional start)\n'); break; }
         process.stdout.write('[supervisor] hub exited (' + code + ') -> relaunch in 2s\n');
         await new Promise((r) => setTimeout(r, 2000));
     }
