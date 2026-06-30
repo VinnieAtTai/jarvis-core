@@ -567,6 +567,20 @@ function aliveNow(uid) {
     const s = roster.sessions[uid];
     return !!(s && s.lastSeen && Date.now() - Date.parse(s.lastSeen) < 120000);
 }
+// A watcher session (e.g. the jarvis worker running the #jarvis QA loop) re-pings POST /watch
+// on each ~120s tick. The console's green "watching" light is lit ONLY while those pings are
+// fresh AND the session is live — so it greys the instant the watcher stops ticking or goes
+// quiet, rather than lying green off a stale flag (lastSeen alone can't tell watching from a
+// session that's merely alive but doing other work). TTL is ~2.5x the tick so a single missed
+// ping doesn't flicker it. Returns the watched channel label, or null when not watching.
+const WATCH_TTL = 5 * 60 * 1000;
+function watchingNow(uid) {
+    const s = roster.sessions[uid];
+    if (!s || !s.watching || !s.watching.ts) return null;
+    if (!aliveNow(uid)) return null;
+    if (Date.now() - Date.parse(s.watching.ts) > WATCH_TTL) return null;
+    return s.watching.channel || '#jarvis';
+}
 function csFrom(word) {
     if (!word) return null;
     const n = word.toLowerCase().replace(/[^a-z]/g, '');
@@ -1500,6 +1514,7 @@ async function handleRequest(req, res) {
                 alive: cs === 'jarvis' ? true : (uid ? aliveNow(uid) : false),
                 context: uid && roster.sessions[uid].ctx !== undefined ? roster.sessions[uid].ctx : null,
                 doing: uid ? roster.sessions[uid].doing || '' : '',
+                watching: uid ? watchingNow(uid) : null,
                 needsYou: uid ? !!roster.sessions[uid].needsYou : false,
                 voiceMuted: uid ? !!roster.sessions[uid].voiceMuted : false,
                 pendingPerm: pends[0] ? { id: pends[0].id, tool: pends[0].tool, detail: pends[0].detail, klass: pends[0].klass || 'neutral', label: permLabel(pends[0].tool, pends[0].detail) } : null,
@@ -1742,6 +1757,18 @@ async function handleRequest(req, res) {
             enqueueSay(s.callsign + ' is at ' + n + ' percent context. Have it wrap up and hand off soon.', 'jarvis');
         }
         if (n < 80) s.ctxWarned = false;
+        saveRoster();
+        return json(res, 200, { ok: true });
+    }
+    if (key === 'POST /watch') {
+        // A watcher session reports that it is actively watching a channel (the #jarvis QA loop).
+        // It re-pings on each ~120s tick to keep the light fresh (see watchingNow / WATCH_TTL);
+        // POST {on:false} clears it the instant it stops. Liveness + freshness gating is at render.
+        const b = await readBody(req);
+        const s = roster.sessions[b.uid];
+        if (!s || s.ended) return json(res, 404, { error: 'unknown uid' });
+        if (b.on === false) s.watching = null;
+        else s.watching = { channel: String(b.channel || '#jarvis').slice(0, 40), ts: new Date().toISOString() };
         saveRoster();
         return json(res, 200, { ok: true });
     }

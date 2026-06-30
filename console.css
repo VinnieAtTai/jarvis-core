@@ -143,6 +143,11 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .actspin.stuck{border-color:#e0a34d;border-top-color:transparent;animation-duration:1.6s}
 @keyframes actspin{to{transform:rotate(360deg)}}
 .actidle{font-size:10px;margin:0;vertical-align:middle;opacity:.45}
+/* green "watching" light: lit while a session is actively watching a channel (#jarvis QA loop).
+   Server-gated by liveness + ping freshness, so it greys the instant the watcher stops ticking. */
+.watchdot{display:inline-block;width:8px;height:8px;margin:0 3px 0 5px;vertical-align:middle;border-radius:50%;background:#5dd97c;animation:watchpulse 1.6s ease-in-out infinite}
+@keyframes watchpulse{0%,100%{box-shadow:0 0 0 0 rgba(93,217,124,0)}50%{box-shadow:0 0 7px 2px rgba(93,217,124,.7)}}
+.watchlbl{color:#5dd97c;font-size:10px;font-weight:600;vertical-align:middle;letter-spacing:.3px}
 .cpurpose{color:#7a8a9c;font-size:11px;margin:2px 0;letter-spacing:0;font-weight:normal}
 .ccount{font-size:11px;margin:3px 0;display:flex;gap:12px}
 .cnum{font-weight:bold}

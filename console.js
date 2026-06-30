@@ -363,6 +363,15 @@ function activityIndicator(b) {
     const title = (b.uid && !b.alive) ? 'quiet - no heartbeat in 2+ min' : 'idle';
     return slot('<span class="actidle" title="' + title + '">&#128164;</span>');
 }
+// Green "watching" light: lit when the server reports this card's session is actively watching
+// a channel (the #jarvis QA loop). The server gates it by liveness + ping freshness
+// (watchingNow / WATCH_TTL), so if `b.watching` is present here the watch is genuinely live —
+// it greys the moment the watcher stops ticking. Returns a pulsing green dot + the channel label.
+function watchIndicator(b) {
+    if (!b.watching) return '';
+    return ' <span class="watchdot" title="actively watching ' + escAttr(b.watching) + '"></span>'
+        + '<span class="watchlbl">' + esc(b.watching) + '</span>';
+}
 // Mission rail: the pinned, always-visible objectives panel (#mission, separate from #work).
 // Phase rows toggle done on click; doc chips open via the document-level data-open listener.
 // There is deliberately NO close control — a mission is closed only by the voice gate.
@@ -514,7 +523,8 @@ function renderBoards(d) {
         const worker = b.worker ? ' <span class="cworker">' + esc(b.worker.toUpperCase()) + '</span>' : '';
         const cwdChip = b.cwd ? '<span class="cpybtn pathtok" data-copy="' + b64(b.cwd) + '" title="copy path: ' + escAttr(b.cwd) + '">📋</span>' : '';
         const act = activityIndicator(b);
-        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + act + worker + ctx + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
+        const watch = watchIndicator(b);
+        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + act + worker + ctx + watch + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
         const purpose = b.purpose ? '<div class="cpurpose">' + esc(b.purpose) + '</div>' : '';
         const doing = (b.needsYou || b.doing) ? '<div class="bdoing">' + (b.needsYou ? '<span class="needs">NEEDS YOU</span> ' : '') + esc(b.doing || '') + '</div>' : '';
         const counts = (working.length || queued.length || review.length || done.length) ? '<div class="ccount">'
