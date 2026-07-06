@@ -110,13 +110,24 @@ function linkify(raw) {
     while ((m = re.exec(raw))) {
         out += esc(raw.slice(last, m.index));
         let tok = m[0], trail = '';
-        const tm = tok.match(/[).,;:!?\]]+$/);
+        const tm = tok.match(/[).,;:!?\]=]+$/);
         if (tm) { trail = tok.slice(tok.length - tm[0].length); tok = tok.slice(0, tok.length - tm[0].length); }
         out += '<span class="cpy pathtok" data-copy="' + b64(tok) + '" title="click to copy; hover to open">' + esc(tok) + '</span>' + esc(trail);
         last = m.index + m[0].length;
     }
     out += esc(raw.slice(last));
     return out;
+}
+// True when the user has a live (non-collapsed) selection sitting inside `el`. The poll loops
+// consult this before rebuilding innerHTML so a periodic re-render can't wipe an in-progress
+// text selection (Chris: "every time I copy a bit of text, it refreshes and I lose my copy").
+function selectionInside(el) {
+    if (!el) return false;
+    try {
+        const s = window.getSelection();
+        if (!s || s.isCollapsed || !s.rangeCount) return false;
+        return el.contains(s.getRangeAt(0).commonAncestorContainer);
+    } catch { return false; }
 }
 // In-page confirm modal. window.confirm() is auto-dismissed (returns false) inside the
 // Playwright app window, so every confirm()-gated button — Rebuild, Restart & deploy,
@@ -209,7 +220,8 @@ async function pollChat() {
     try {
         const r = await (await fetch('/transcript?limit=' + (expanded ? 0 : 60))).json();
         const p = JSON.stringify(r);
-        if (p !== lastChatPayload) { lastChatPayload = p; chatEvts = r; renderChat(); }
+        // Hold the rebuild while a selection is live in the chat — replacing innerHTML would drop it.
+        if (p !== lastChatPayload && !selectionInside(chatEl) && !selectionInside(rawEl)) { lastChatPayload = p; chatEvts = r; renderChat(); }
     } catch { }
     setTimeout(pollChat, 1500);
 }
@@ -930,7 +942,8 @@ window.addEventListener('drop', (e) => {
 });
 async function pollWork() {
     try { lastSched = await (await fetch('/schedule')).json(); } catch { }
-    try { renderBoards(await (await fetch('/board')).json()); } catch { }
+    // Skip the board rebuild while text is selected inside it, so a copy isn't yanked away.
+    try { const d = await (await fetch('/board')).json(); if (!selectionInside(workEl)) renderBoards(d); } catch { }
     setTimeout(pollWork, 1500);
 }
 function renderArchive(d) {
@@ -969,7 +982,8 @@ function renderArchive(d) {
     if (wasFocused) { const fi = document.getElementById('archfilter'); if (fi) { fi.focus(); try { fi.setSelectionRange(caret, caret); } catch { } } }
 }
 async function pollArchive() {
-    try { renderArchive(await (await fetch('/archive')).json()); } catch { }
+    // Skip the rebuild while text is selected inside the archive panel, so a copy isn't yanked away.
+    try { const d = await (await fetch('/archive')).json(); if (!selectionInside(document.getElementById('archpanel'))) renderArchive(d); } catch { }
     setTimeout(pollArchive, 8000);
 }
 // Archive filter: re-render on each keystroke; stopPropagation so typing "t"/"r" here doesn't
@@ -1012,7 +1026,8 @@ function renderHold(d) {
     hp.style.display = 'block';
 }
 async function pollHold() {
-    try { renderHold(await (await fetch('/hold')).json()); } catch { }
+    // Skip the rebuild while text is selected inside the hold panel, so a copy isn't yanked away.
+    try { const d = await (await fetch('/hold')).json(); if (!selectionInside(document.getElementById('holdpanel'))) renderHold(d); } catch { }
     setTimeout(pollHold, 8000);
 }
 document.getElementById('holdpanel').onclick = (e) => {
