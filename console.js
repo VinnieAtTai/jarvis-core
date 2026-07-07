@@ -468,6 +468,15 @@ function renderBoards(d) {
     let sched = '';
     const _rem = (lastSched && lastSched.reminders) || [];
     const _evs = (lastSched && lastSched.events) || [];
+    // Stale-schedule hint: the hub marks the schedule stale when its saved date isn't today
+    // (empty after a restart, or never pulled this morning) and blanks the events, so the panel
+    // would otherwise just hide and a missing morning pull goes unnoticed. Degrades to nothing
+    // on an older hub that doesn't send `stale` yet.
+    const _staleHint = (lastSched && lastSched.stale)
+        ? '<div class="schedstale">📅 No schedule loaded for today'
+            + (lastSched.date ? ' (last pulled ' + esc(lastSched.date) + ')' : '')
+            + ' — a Calendar session needs to pull it.</div>'
+        : '';
     if (lastSched && (_evs.length || _rem.length)) {
         const now = Date.now();
         // Schedule | Tasks filter. The pills only matter when BOTH meetings and timed tasks
@@ -496,7 +505,7 @@ function renderBoards(d) {
     const np = document.getElementById('nextpanel'), sp = document.getElementById('schedpanel');
     np.innerHTML = top; np.style.display = top ? 'block' : 'none';
     np.classList.toggle('imminent', imminent);
-    sp.innerHTML = sched; sp.style.display = sched ? 'block' : 'none';
+    const schedOut = _staleHint + sched; sp.innerHTML = schedOut; sp.style.display = schedOut ? 'block' : 'none';
     const prio = b => b.pendingPerm ? 2 : b.needsYou ? 1 : 0;   // float perm/needs-you cards to the top
     workEl.innerHTML = d.boards.slice().sort((a, b) => prio(b) - prio(a)).map(b => {
         const queued = b.queued || [], done = b.done || [], working = b.working || [], review = b.review || [];

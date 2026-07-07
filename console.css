@@ -80,6 +80,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .nmbar{height:3px;background:#1f2c3a;border-radius:2px;margin:1px 0 7px;overflow:hidden}
 .nmbarfill{height:100%;background:#e8c35a;border-radius:2px;transition:width .8s linear}
 .nmclear{color:#7fb98a;font-size:13px;padding:2px 0}
+.schedstale{color:#d9b45a;font-size:13px;padding:3px 0;line-height:1.35}
 #nextpanel.imminent{border-color:#ff6b6b;animation:nmpulse 1.4s ease-in-out infinite}
 @keyframes nmpulse{0%,100%{box-shadow:0 0 0 0 rgba(255,107,107,0)}50%{box-shadow:0 0 14px 1px rgba(255,107,107,.5)}}
 /* Mission tracker: a pinned, always-visible rail of long-running objectives. */

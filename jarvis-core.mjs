@@ -2250,7 +2250,9 @@ async function handleRequest(req, res) {
         const next = [...events, ...reminders].filter(e => Date.parse(e.start) > now)
             .sort((a, b) => Date.parse(a.start) - Date.parse(b.start))[0] || null;
         const current = events.find(e => e.end && Date.parse(e.start) <= now && now < Date.parse(e.end)) || null;
-        return json(res, 200, { events, reminders, next, current });
+        // `stale` (schedule not from today) + `date` let the console flag a missing morning pull
+        // instead of silently hiding the panel — when stale, events above is already blanked.
+        return json(res, 200, { events, reminders, next, current, stale, date: s.date || null });
     }
     if (key === 'POST /schedule') {
         const b = await readBody(req);
