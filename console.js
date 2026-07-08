@@ -266,6 +266,8 @@ document.getElementById('bcal').onclick = () => {
 };
 // SCHEDULE panel filter pills (All / Meetings / Tasks) — set state, repaint from the cache.
 document.getElementById('schedpanel').addEventListener('click', (e) => {
+    if (e.target.closest('[data-calrefresh]')) { refreshCalendar(); return; }
+    if (e.target.closest('[data-spinup]')) { spinUpMorning(); return; }
     const p = e.target.closest('.sfbtn'); if (!p) return;
     schedFilter = p.getAttribute('data-sf') || 'all';
     if (lastBoard) renderBoards(lastBoard);
@@ -422,6 +424,38 @@ if (missionEl) missionEl.onclick = (e) => {
     fetch('/mission', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op: 'phase', id: t.getAttribute('data-mid'), index: Number(t.getAttribute('data-pi')) }) })
         .then(() => fetch('/board').then(r => r.json()).then(renderBoards)).catch(() => { });
 };
+// —— Calendar Refresh + morning Spin-Up (punchlist #3/#5). The hub holds no Google credentials,
+// so today's schedule can only be pulled by a live jarvis worker with the Calendar MCP tool. Both
+// buttons therefore route a plain-language instruction to that worker: a /hear POST whose text
+// starts with "jarvis," is delivered straight to the jarvis worker's poll loop (routeTo), with
+// typed:true so it lands even while the mic is muted. If no worker is bound yet, ☀ spins one up.
+// Console-only — no server change, live on reload.
+function jarvisWorkerUid() {
+    const j = lastBoard && (lastBoard.boards || []).find(b => b.callsign === 'jarvis');
+    return j && j.uid ? j.uid : null;
+}
+function nudgeJarvis(instruction) {
+    return fetch('/hear', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: 'jarvis, ' + instruction, typed: true }) });
+}
+const CAL_REFRESH_KICK = "pull today's schedule from Google Calendar and POST it to /schedule (calendar refresh).";
+const MORNING_KICK = "good morning. Run the morning routine: pull today's schedule from Google Calendar and POST /schedule if it's stale, then carry on with the punchlist.";
+function refreshCalendar() {
+    if (!jarvisWorkerUid()) { uiToast('No live JARVIS worker to pull the calendar — press ☀ to spin one up.', 'error'); return; }
+    nudgeJarvis(CAL_REFRESH_KICK)
+        .then(() => uiToast('Asked JARVIS to refresh today\'s calendar.', 'ok'))
+        .catch(() => uiToast('Could not reach the hub to send the refresh.', 'error'));
+}
+function spinUpMorning() {
+    if (jarvisWorkerUid()) {
+        nudgeJarvis(MORNING_KICK)
+            .then(() => uiToast('JARVIS is up — running the morning routine.', 'ok'))
+            .catch(() => uiToast('Could not reach the hub to nudge JARVIS.', 'error'));
+        return;
+    }
+    fetch('/spawn', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cwd: 'd:/claude/jarvis-core', purpose: 'JARVIS punchlist', project: 'jarvis' }) })
+        .then(() => uiToast('Spinning up JARVIS — press ☀ again in a few seconds to run the morning routine.', 'ok'))
+        .catch(() => uiToast('Spin-up request failed.', 'error'));
+}
 function renderBoards(d) {
     focusCS = d.focus;
     lastBoard = d;
@@ -475,7 +509,10 @@ function renderBoards(d) {
     const _staleHint = (lastSched && lastSched.stale)
         ? '<div class="schedstale">📅 No schedule loaded for today'
             + (lastSched.date ? ' (last pulled ' + esc(lastSched.date) + ')' : '')
-            + ' — a Calendar session needs to pull it.</div>'
+            + ' — a Calendar session needs to pull it.<div class="schedstaleacts">'
+            + '<span class="schedact" data-spinup="1" title="spin up JARVIS and run the morning routine (pulls the calendar)">☀ Spin Up</span>'
+            + '<span class="schedact" data-calrefresh="1" title="ask a live JARVIS worker to pull today\'s calendar">⟳ Refresh</span>'
+            + '</div></div>'
         : '';
     if (lastSched && (_evs.length || _rem.length)) {
         const now = Date.now();
@@ -490,7 +527,7 @@ function renderBoards(d) {
             .sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
         const pill = (v, lbl) => '<span class="sfbtn' + (f === v ? ' on' : '') + '" data-sf="' + v + '">' + lbl + '</span>';
         const pills = hasBoth ? '<span class="schedfilter">' + pill('all', 'All') + pill('meetings', 'Meetings') + pill('tasks', 'Tasks') + '</span>' : '';
-        sched = '<div class="bhead schedhead" style="margin-top:0"><span>SCHEDULE</span>' + pills + '</div>' + items.map(e => {
+        sched = '<div class="bhead schedhead" style="margin-top:0"><span>SCHEDULE</span><span class="schedhacts">' + pills + '<span class="schedact" data-calrefresh="1" title="ask JARVIS to re-pull today\'s calendar">⟳</span></span></div>' + items.map(e => {
             if (e._k === 'r') {
                 const due = Date.parse(e.start) <= now, fired = !!e.firedAt;
                 const col = (due || fired) ? '#7d6fb0' : '#b9a7e6';

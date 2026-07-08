@@ -115,6 +115,10 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .sfbtn{padding:1px 7px;font:bold 10px Consolas,monospace;letter-spacing:.5px;color:#7a8a9c;cursor:pointer;background:#0d1420}
 .sfbtn.on{color:#5db4d9;background:#16202c}
 .sfbtn:hover{color:#9bb0c4}
+.schedhacts{display:flex;align-items:center;gap:6px;flex:none}
+.schedact{padding:1px 7px;font:bold 11px Consolas,monospace;color:#7a8a9c;cursor:pointer;border:1px solid #1f2c3a;border-radius:5px;background:#0d1420;white-space:nowrap}
+.schedact:hover{color:#5db4d9;border-color:#2a3c4e}
+.schedstaleacts{display:flex;gap:8px;margin-top:5px}
 #nsmeeting{max-width:240px;background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:13px Consolas,monospace}
 #nsrepo{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:13px Consolas,monospace}
 #nspurpose{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:8px 12px;font:14px Consolas,monospace}
