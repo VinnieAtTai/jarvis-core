@@ -1103,12 +1103,23 @@ function renderTabs() {
     const _tprio = b => b.pendingPerm ? 2 : b.needsYou ? 1 : 0;
     const sessions = lastBoard ? lastBoard.boards.filter(b => b.callsign !== 'jarvis' && b.alive !== false).slice().sort((a, b) => _tprio(b) - _tprio(a)) : [];
     const base = ['all', 'general', 'jarvis', 'ask'];
-    const ids = base.concat(sessions.map(b => b.callsign));
+    // Recently-retired sessions still present in the transcript keep a greyed, clickable tab so
+    // their chat history stays reachable instead of vanishing the instant they retire (#7). Sourced
+    // from chatEvts, so it is self-limited to the transcript window; anything currently live —
+    // including the bound jarvis worker, which is surfaced under JARVIS — is excluded.
+    const _liveSet = new Set(sessions.map(b => b.callsign));
+    const _jbCur = lastBoard && lastBoard.boards.find(b => b.callsign === 'jarvis');
+    const _skip = new Set(base); _skip.add('you'); _skip.add('jarvis'); if (_jbCur && _jbCur.worker) _skip.add(_jbCur.worker);
+    const _deadLast = {};
+    for (const e of chatEvts) { const w = e.who; if (!w || _skip.has(w) || _liveSet.has(w)) continue; _deadLast[w] = e.ts || _deadLast[w]; }
+    const deadTabs = Object.keys(_deadLast).sort((a, b) => Date.parse(_deadLast[b] || 0) - Date.parse(_deadLast[a] || 0)).slice(0, 4);
+    const ids = base.concat(sessions.map(b => b.callsign)).concat(deadTabs);
     if (!ids.includes(activeTab)) activeTab = 'all';
     let html = base.map(id => '<span class="stab' + (id === activeTab ? ' active' : '') + '" data-tab="' + id + '">' + id.toUpperCase() + '</span>').join('');
     // Full purpose rides as a title tooltip on every session tab so multiple same-named jobs
     // (e.g. three TMS-20079 sessions) are distinguishable on hover.
     html += sessions.map(b => '<span class="stab' + (b.callsign === activeTab ? ' active' : '') + (b.needsYou ? ' needs' : '') + '" data-tab="' + esc(b.callsign) + '"' + (b.purpose ? ' title="' + escAttr(b.callsign.toUpperCase() + ' · ' + b.purpose) + '"' : '') + '>' + esc(b.callsign.toUpperCase()) + (b.needsYou ? '<span class="sbadge">!</span>' : '') + '</span>').join('');
+    html += deadTabs.map(cs => '<span class="stab dead' + (cs === activeTab ? ' active' : '') + '" data-tab="' + esc(cs) + '" title="' + escAttr(cs.toUpperCase() + ' · retired — chat history') + '">' + esc(cs.toUpperCase()) + '</span>').join('');
     html += '<span class="stab plus" data-newsession="1" title="new session: spin up a fresh worker">+</span>';
     // Active session's purpose as a sub-line under the strip (real session tabs + the JARVIS
     // tab, which borrows its bound worker's purpose). all/general/ask have no single purpose.
