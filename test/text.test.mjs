@@ -55,6 +55,16 @@ test('parseReminder — absolute time, future today', () => {
     assert.equal(d.getMinutes(), 59);
 });
 
+test('parseReminder — absolute 12 am/pm boundary (the H % 12 arithmetic)', () => {
+    // "12 pm" is noon (hour 12), "12 am" is midnight (hour 0) — the +12/%12 math is easy to
+    // flip at exactly 12. getHours() is stable whether the time lands today or rolls to tomorrow.
+    assert.equal(new Date(parseReminder('remind me at 12 pm to eat lunch').start).getHours(), 12);
+    assert.equal(new Date(parseReminder('remind me at 12 am to sleep').start).getHours(), 0);
+    const r = parseReminder('remind me at 3:30 pm to join the call');
+    assert.equal(new Date(r.start).getHours(), 15);
+    assert.equal(new Date(r.start).getMinutes(), 30);
+});
+
 test('parseReminder — no time returns null', () => {
     assert.equal(parseReminder('what reminders do I have'), null);
     assert.equal(parseReminder('remind me about the thing'), null);
@@ -90,6 +100,23 @@ test('parseScheduleText — titles + times, sorted, RSVP noise stripped', () => 
 
 test('parseScheduleText — empty input yields no events', () => {
     assert.equal(parseScheduleText('').events.length, 0);
+});
+
+test('parseScheduleText — a start time with no AM/PM inherits the end\'s meridiem', () => {
+    // Documented quirk: the start meridiem is optional, so "10:00 - 11:00 AM" reads the start
+    // as 10 AM by borrowing the end's "AM". (Pins current behavior; a future change here is a
+    // deliberate choice, not a silent regression.)
+    const s = parseScheduleText('Standup\n10:00 - 11:00 AM');
+    assert.equal(s.events.length, 1);
+    assert.equal(new Date(s.events[0].start).getHours(), 10);
+    assert.equal(new Date(s.events[0].end).getHours(), 11);
+});
+
+test('parseScheduleText — "Past events" marker drops the dangling title before it', () => {
+    // A title with no time line must not bind to the next time after a "Past events" divider.
+    const s = parseScheduleText(['Yesterday leftover', 'Past events', 'Real meeting', '2:00 PM - 3:00 PM'].join('\n'));
+    assert.equal(s.events.length, 1);
+    assert.equal(s.events[0].title, 'Real meeting');
 });
 
 test('shortTitle — strips a leading category tag', () => {
