@@ -71,6 +71,37 @@ document.addEventListener('click', (e) => {
     e.stopPropagation(); e.preventDefault();
     doCopy(unb64(t.getAttribute('data-copy')), t);
 }, true);
+// Copy rendered rich HTML so pasting into email/docs keeps the formatting: re-render the raw
+// markdown through richText(), write text/html (with a plain-markdown text/plain fallback), and
+// fall back to selecting a hidden rendered node + execCommand('copy') where ClipboardItem is absent.
+function doCopyHtml(rawMd, el) {
+    const flash = (cls) => { if (!el) return; el.classList.add(cls); setTimeout(() => el.classList.remove('copied', 'copyfail'), 800); };
+    const html = richText(rawMd);
+    const legacy = () => {
+        const holder = document.createElement('div');
+        holder.style.cssText = 'position:fixed;left:-9999px;top:0';
+        holder.innerHTML = html;
+        document.body.appendChild(holder);
+        const range = document.createRange(); range.selectNodeContents(holder);
+        const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+        let ok = false; try { ok = document.execCommand('copy'); } catch { ok = false; }
+        sel.removeAllRanges(); holder.remove(); flash(ok ? 'copied' : 'copyfail');
+    };
+    try {
+        if (navigator.clipboard && navigator.clipboard.write && window.ClipboardItem) {
+            const item = new ClipboardItem({ 'text/html': new Blob([html], { type: 'text/html' }), 'text/plain': new Blob([rawMd], { type: 'text/plain' }) });
+            navigator.clipboard.write([item]).then(() => flash('copied')).catch(legacy);
+            return;
+        }
+    } catch { }
+    legacy();
+}
+document.addEventListener('click', (e) => {
+    const t = e.target.closest ? e.target.closest('[data-copyhtml]') : null;
+    if (!t) return;
+    e.stopPropagation(); e.preventDefault();
+    doCopyHtml(unb64(t.getAttribute('data-copyhtml')), t);
+}, true);
 // Hover any copyable path/URL token -> floating menu to open it in Explorer or Chrome.
 const pathfly = document.createElement('div');
 pathfly.id = 'pathfly'; pathfly.style.display = 'none';
@@ -117,6 +148,74 @@ function linkify(raw) {
     }
     out += esc(raw.slice(last));
     return out;
+}
+// —— Rich text for chat bubbles. Chris: long messages read as one undifferentiated block. Render a
+// small, SAFE subset of markdown so they self-structure. Everything is escaped first (esc/linkify
+// only ever emit a fixed whitelist of tags), so a message can never inject HTML.
+// inlineMd handles one line. Split on `inline code` (a capturing split yields alternating
+// text/code segments): odd segments are code — escaped, wrapped, left untouched; even segments are
+// normal text — linkified (escapes + URL/path tokens) then **bold**. No placeholders, so a stray
+// digit in a message can never collide with a code marker.
+function inlineMd(line) {
+    const parts = String(line == null ? '' : line).split(/`([^`]+)`/);
+    let out = '';
+    for (let k = 0; k < parts.length; k++) {
+        if (k % 2 === 1) { out += '<code class="ic cpy" data-copy="' + b64(parts[k]) + '" title="click to copy">' + esc(parts[k]) + '</code>'; continue; }
+        out += linkify(parts[k])
+            .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>')
+            .replace(/\*([^*\n]+)\*/g, '<i>$1</i>')
+            .replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,;:!?]|$)/g, '$1<i>$2</i>');
+    }
+    return out;
+}
+// richText walks lines into blocks: ```fenced code```, # / ## / ### headings, - / * bullet lists,
+// 1. / 1) numbered lists, blank-line spacers, and plain paragraphs (consecutive lines joined by
+// <br>). Block runs are consumed greedily so a list/code block stays one element.
+function richText(raw) {
+    const lines = String(raw == null ? '' : raw).split('\n');
+    const isFence = (l) => /^\s*```/.test(l);
+    const isHead = (l) => /^#{1,3}\s+\S/.test(l);
+    const isUl = (l) => /^\s*[-*]\s+\S/.test(l);
+    const isOl = (l) => /^\s*\d+[.)]\s+\S/.test(l);
+    const isTableSep = (l) => /-/.test(l) && /^\s*\|?[-:\s|]+\|?\s*$/.test(l);
+    const isTableTop = (n) => lines[n].includes('|') && n + 1 < lines.length && isTableSep(lines[n + 1]);
+    const splitRow = (l) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim());
+    const isBlock = (l) => isFence(l) || isHead(l) || isUl(l) || isOl(l);
+    let html = '', i = 0;
+    while (i < lines.length) {
+        const line = lines[i];
+        if (isFence(line)) {
+            const buf = []; i++;
+            while (i < lines.length && !isFence(lines[i])) { buf.push(esc(lines[i])); i++; }
+            i++;   // consume the closing fence if present
+            html += '<pre class="cb">' + buf.join('\n') + '</pre>';
+        } else if (isTableTop(i)) {
+            const header = splitRow(line);
+            i += 2;   // consume the header + separator rows
+            const rows = [];
+            while (i < lines.length && lines[i].includes('|') && lines[i].trim() !== '') { rows.push(splitRow(lines[i])); i++; }
+            let t = '<table class="mdt"><thead><tr>' + header.map(c => '<th>' + inlineMd(c) + '</th>').join('') + '</tr></thead>';
+            if (rows.length) t += '<tbody>' + rows.map(r => '<tr>' + r.map(c => '<td>' + inlineMd(c) + '</td>').join('') + '</tr>').join('') + '</tbody>';
+            html += t + '</table>';
+        } else if (isHead(line)) {
+            html += '<div class="mdh">' + inlineMd(line.replace(/^#{1,3}\s+/, '')) + '</div>'; i++;
+        } else if (isUl(line)) {
+            const items = [];
+            while (i < lines.length && isUl(lines[i])) { items.push('<li>' + inlineMd(lines[i].replace(/^\s*[-*]\s+/, '')) + '</li>'); i++; }
+            html += '<ul class="mdl">' + items.join('') + '</ul>';
+        } else if (isOl(line)) {
+            const items = [];
+            while (i < lines.length && isOl(lines[i])) { items.push('<li>' + inlineMd(lines[i].replace(/^\s*\d+[.)]\s+/, '')) + '</li>'); i++; }
+            html += '<ol class="mdl">' + items.join('') + '</ol>';
+        } else if (line.trim() === '') {
+            html += '<div class="mdsp"></div>'; i++;
+        } else {
+            const buf = [];
+            while (i < lines.length && lines[i].trim() !== '' && !isBlock(lines[i]) && !isTableTop(i)) { buf.push(inlineMd(lines[i])); i++; }
+            html += buf.join('<br>');
+        }
+    }
+    return html;
 }
 // True when the user has a live (non-collapsed) selection sitting inside `el`. The poll loops
 // consult this before rebuilding innerHTML so a periodic re-render can't wipe an in-progress
@@ -206,10 +305,10 @@ function renderChat() {
         // Ordered happiest -> poop: squee, fire, love, up (positives, descending), then down, poop.
         const reactBar = '<span class="reacts">' + ['squee', 'fire', 'love', 'up', 'down', 'poop'].map(k => '<span class="rx' + (cur === k ? ' on' : '') + '" data-react="' + k + '" data-ts="' + escAttr(g.ts || '') + '">' + REMOJI[k] + '</span>').join('') + '</span>';
         return '<div class="row ' + (me ? 'me' : 'them') + '"><div class="bubble">' + chip
-            + linkify(g.texts.join('\n')).split('\n').join('<br>')
+            + richText(g.texts.join('\n'))
             + (g.img ? '<br><a href="' + g.img + '" target="_blank"><img src="' + g.img + '" class="thumb"></a>' : '')
             + '<span class="t">' + fmtHM(g.ts) + '</span>'
-            + '<span class="copybtn" data-c="' + btoa(unescape(encodeURIComponent(g.texts.join('\n')))) + '" title="copy">📋</span>' + reactBar + '</div></div>';
+            + '<span class="copybtn" data-c="' + btoa(unescape(encodeURIComponent(g.texts.join('\n')))) + '" title="copy markdown">📋</span>' + '<span class="htmlbtn" data-copyhtml="' + b64(g.texts.join('\n')) + '" title="copy formatted — paste into email or docs with styling">html</span>' + reactBar + '</div></div>';
     }).join('');
     rawEl.innerHTML = chatEvts.slice(-200).reverse().map(e =>
         '<div>[' + fmtHMS(e.ts) + '] <b>' + esc(e.kind === 'sys' ? 'SYS' : (e.who === 'you' ? 'YOU' : String(e.who).toUpperCase())) + '</b> ' + esc(e.text) + '</div>'
@@ -897,7 +996,7 @@ function applyTabMode() {
         document.getElementById('bar').style.display = 'none';
         document.getElementById('newsessbox').style.display = 'none';
         aibarEl.style.display = 'flex'; aichatEl.style.display = 'flex';
-        typeBox.placeholder = 'Ask JARVIS — direct model chat, separate from the voice bus';
+        typeBox.placeholder = 'Ask JARVIS — direct model chat, separate from the voice bus · Ctrl+Enter to send';
         loadAiThreads(true);
     } else {
         aibarEl.style.display = 'none'; aichatEl.style.display = 'none';
@@ -939,9 +1038,9 @@ function renderAiMessages() {
         const me = m.role === 'user';
         const tag = (!me && m.model) ? '<span class="chip">' + esc((MODEL_LABELS[m.model] || m.model).split(' ')[0].toUpperCase()) + ' &#183; </span>' : '';
         return '<div class="row ' + (me ? 'me' : 'them') + '"><div class="bubble">' + tag
-            + linkify(m.content || '').split('\n').join('<br>')
+            + richText(m.content || '')
             + (m.ts ? '<span class="t">' + fmtHM(m.ts) + '</span>' : '')
-            + '<span class="copybtn" data-c="' + b64(m.content || '') + '" title="copy">📋</span></div></div>';
+            + '<span class="copybtn" data-c="' + b64(m.content || '') + '" title="copy markdown">📋</span></div></div>';
     }).join('');
     if (aiState.busy) h += '<div class="row them"><div class="bubble aiwait">…thinking</div></div>';
     aichatEl.innerHTML = h;
@@ -1014,7 +1113,10 @@ document.getElementById('aidel').onclick = async () => {
     try { await fetch('/ai/deletethread', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) }); } catch { }
     loadAiThreads(false); renderAiMessages();
 };
-typeBox.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); sendTyped(); } e.stopPropagation(); });
+// Enter inserts a newline (Chris wants to compose multi-line messages + paste with breaks);
+// Ctrl/Cmd+Enter or the SEND button sends. stopPropagation on every key so typing never trips
+// the global t/r/Escape shortcuts behind the box.
+typeBox.addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendTyped(); } e.stopPropagation(); });
 document.getElementById('btype').onclick = sendTyped;
 function attachFile(f) {
     const r = new FileReader();
@@ -1192,7 +1294,7 @@ function renderTabs() {
     populateSendTo();
     if (activeTab !== 'ask') {   // ASK manages its own placeholder (see applyTabMode)
         const sess = activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
-        typeBox.placeholder = sess ? ('Message ' + activeTab + ' - no focus change') : 'Type to jarvis (routes like speech; works while paused/muted)';
+        typeBox.placeholder = (sess ? ('Message ' + activeTab + ' - no focus change') : 'Type to jarvis (routes like speech; works while paused/muted)') + ' · Ctrl+Enter to send';
     }
     applyTabMode();
 }

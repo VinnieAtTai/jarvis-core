@@ -20,8 +20,8 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 #chat{display:flex;flex-direction:column;gap:6px;overflow-y:auto;flex:1;min-height:0;background:#0d1420;border:none;border-radius:6px;padding:10px}
 #rawlog{display:none;overflow-y:auto;flex:1;min-height:0;background:#0d1420;border:none;border-radius:6px;padding:10px;font-size:12px;color:#9bb0c4}
 #chatpanel{display:flex;flex-direction:column;gap:8px;padding:10px;flex:1;min-height:0;overflow:hidden}
-#chatinput{display:flex;gap:8px;align-items:center}
-#chatinput #typebox{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:8px 12px;font-size:14px;font-family:inherit}
+#chatinput{display:flex;gap:8px;align-items:flex-end}
+#chatinput #typebox{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:8px 12px;font-size:14px;font-family:inherit;line-height:1.35;resize:vertical;max-height:40vh}
 #chatinput #sendto{flex:none;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:7px 8px;font:12px Consolas,monospace;max-width:120px}
 #calcard{display:flex;flex-direction:column;gap:8px}
 #calbar{display:flex;gap:8px}
@@ -31,12 +31,28 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 #rawlog b{color:#5db4d9}
 .row{display:flex}.row.me{justify-content:flex-end}
 .bubble{max-width:70%;padding:7px 11px;border-radius:12px;border-bottom-left-radius:4px;white-space:pre-wrap;word-break:break-word;font-size:13px;background:#1a2533}
+.bubble .mdh{font-weight:700;color:#e6d9b8;margin:3px 0}
+.bubble ul.mdl,.bubble ol.mdl{margin:3px 0;padding-left:20px}
+.bubble ul.mdl li,.bubble ol.mdl li{margin:1px 0}
+.bubble pre.cb{background:#0b1016;border:1px solid #24303f;border-radius:5px;padding:6px 8px;margin:4px 0;overflow-x:auto;white-space:pre;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.bubble code.ic{background:#0b1016;border:1px solid #24303f;border-radius:3px;padding:1px 4px;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.bubble code.ic.cpy{cursor:pointer}
+.bubble code.ic.cpy:hover::after{content:"\1F4CB";font-size:9px;margin-left:4px;opacity:.7}
+.bubble table.mdt{border-collapse:collapse;margin:4px 0;font-size:12px}
+.bubble table.mdt th,.bubble table.mdt td{border:1px solid #2c3a4c;padding:3px 8px;text-align:left}
+.bubble table.mdt th{background:#16202c;color:#e6d9b8;font-weight:600}
+.bubble .mdsp{height:5px}
 .me .bubble{background:#1d4567;border-bottom-left-radius:12px;border-bottom-right-radius:4px}
 .chip{font-size:10px;color:#5db4d9;letter-spacing:1px}
 .t{font-size:10px;color:#7a8a9c;margin-left:10px;white-space:nowrap}
 .copybtn{cursor:pointer;margin-left:8px;font-size:11px;opacity:0;transition:opacity .15s;user-select:none}
 .bubble:hover .copybtn{opacity:.6}
 .copybtn:hover{opacity:1}
+.htmlbtn{cursor:pointer;margin-left:6px;font-size:10px;line-height:1.4;opacity:0;transition:opacity .15s;user-select:none;border:1px solid #2c3a4c;border-radius:3px;padding:0 4px;color:#8fb3c9}
+.bubble:hover .htmlbtn{opacity:.6}
+.htmlbtn:hover{opacity:1;color:#cfe3f2}
+.htmlbtn.copied,.copybtn.copied{color:#5fd08a;opacity:1}
+.htmlbtn.copyfail{color:#e07a7a;opacity:1}
 .reacts{margin-left:8px;display:inline-flex;gap:3px;vertical-align:middle}
 .rx{cursor:pointer;opacity:.22;font-size:12px;transition:opacity .15s;filter:grayscale(1)}
 .bubble:hover .rx{opacity:.55}
