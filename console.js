@@ -463,6 +463,8 @@ function renderBoards(d) {
     renderMissions(d.missions || []);
     if (typeof d.muted === 'boolean' && d.muted !== isMuted) window.__setMute(d.muted);
     if (typeof d.paused === 'boolean' && d.paused !== isPaused) window.__setPause(d.paused);
+    if (typeof d.sttReady === 'boolean') sttReady = d.sttReady;
+    if (typeof d.sttBackend === 'string') { window.__setSttBackend(d.sttBackend); updateSttBtn(); }
     renderHeat();
     const evIcons = (e) => {
         let h = '';
@@ -760,6 +762,31 @@ window.__setPause = (on) => {
 };
 document.getElementById('bpause').onclick = () => {
     fetch('/pause', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ on: !isPaused }) }).catch(() => { });
+};
+// Speech-to-text backend, mirrored from the hub (like mute/pause): 'google' = the browser's
+// webkitSpeechRecognition (cloud, default), 'local' = offline whisper.cpp via /stt. The hub owns
+// the setting; the button just requests a flip and the poll payload syncs the truth back down.
+let sttBackend = 'google', sttReady = false;
+function updateSttBtn() {
+    const btn = document.getElementById('bstt');
+    if (!btn) return;
+    if (sttBackend === 'local') { btn.textContent = 'STT: Local' + (sttReady ? '' : ' ⏳'); btn.className = 'btn on'; }
+    else { btn.textContent = 'STT: Google'; btn.className = 'btn'; }
+}
+window.__setSttBackend = (b) => {
+    const next = b === 'local' ? 'local' : 'google';
+    const changed = next !== sttBackend;
+    sttBackend = next;
+    updateSttBtn();
+    if (!changed) return;
+    // Only one recognizer runs at a time: switching to local aborts the cloud recognizer and
+    // starts mic capture; switching back stops capture and re-arms the cloud recognizer.
+    if (sttBackend === 'local') { try { rec.abort(); } catch { } startLocalCapture(); }
+    else { stopLocalCapture(); startRec(); }
+};
+document.getElementById('bstt').onclick = () => {
+    const to = sttBackend === 'local' ? 'google' : 'local';
+    fetch('/stt-backend', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backend: to }) }).catch(() => { });
 };
 const jvmenu = document.getElementById('jvmenu');
 document.getElementById('bjv').onclick = (e) => { e.stopPropagation(); jvmenu.style.display = jvmenu.style.display === 'none' ? 'block' : 'none'; };
@@ -1332,9 +1359,9 @@ rec.onerror = (e) => {
         setStatus('error', 'ERROR: ' + e.error + ' (auto-restarting)');
     }
 };
-rec.onend = () => { if (!stopped) setTimeout(startRec, 200); };
+rec.onend = () => { if (!stopped && sttBackend === 'google') setTimeout(startRec, 200); };
 function startRec() {
-    if (stopped) return;
+    if (stopped || sttBackend !== 'google') return;   // local mode uses the mic directly, not this
     try { rec.start(); if (!speaking && !isPaused && !isMuted) setStatus('listening', 'LISTENING'); } catch { }
 }
 function pickVoice() {
@@ -1367,7 +1394,7 @@ window.__speak = (text) => new Promise((resolve) => {
     setStatus('speaking', 'SPEAKING (talk to interrupt)');
     speechSynthesis.speak(u);
 });
-window.__shutdown = () => { stopped = true; flushBuf(); try { rec.stop(); } catch { } setStatus('muted', 'STOPPED'); };
+window.__shutdown = () => { stopped = true; flushBuf(); try { rec.stop(); } catch { } stopLocalCapture(); setStatus('muted', 'STOPPED'); };
 let voicesReported = false;
 function reportVoices() {
     const vs = speechSynthesis.getVoices();
@@ -1380,3 +1407,96 @@ speechSynthesis.getVoices();
 speechSynthesis.onvoiceschanged = reportVoices;
 reportVoices();
 startRec();
+
+// ---- Local (offline) STT capture ----
+// In local mode we bypass webkitSpeechRecognition: grab the raw mic, run a simple energy VAD to
+// slice out each utterance, encode it as 16 kHz mono PCM16 WAV, and POST it to /stt for whisper.cpp
+// to transcribe. The returned text is fed through the SAME buffer/flush path as a final cloud
+// result, so mute, INSTANT commands, TTS-echo rejection, and the 2.5s merge all behave identically.
+let localCap = null;         // { stream, ac, node, src } while capturing, else null
+let sttErrToasted = false;   // only nag once per outage, reset on the next success
+function pushFinalLocal(t) {
+    if (!t) return;
+    if (speaking) { if (!isNovelSpeech(t)) return; speechSynthesis.cancel(); }  // drop our own TTS echo; allow barge-in
+    buf.push(t);
+    const joined = buf.join(' ');
+    if (INSTANT.some(re => re.test(joined))) { flushBuf(); return; }
+    setInterim(joined + ' …');
+    armFlush();
+}
+async function startLocalCapture() {
+    if (localCap || stopped) return;
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
+    catch (e) { if (typeof uiToast === 'function') uiToast('Local STT: mic access failed (' + e.name + ')', 'error'); return; }
+    if (sttBackend !== 'local' || stopped) { stream.getTracks().forEach(t => t.stop()); return; }
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const src = ac.createMediaStreamSource(stream);
+    const node = ac.createScriptProcessor(4096, 1, 1);   // deprecated but ubiquitous; we never fill
+    const inRate = ac.sampleRate;                        // the output buffer, so nothing is played back
+    const FRAME_MS = 4096 / inRate * 1000;
+    let chunks = [], voicedMs = 0, silenceMs = 0, active = false;
+    const reset = () => { chunks = []; voicedMs = 0; silenceMs = 0; active = false; };
+    node.onaudioprocess = (e) => {
+        if (sttBackend !== 'local' || isPaused) { reset(); return; }
+        const input = e.inputBuffer.getChannelData(0);
+        let sum = 0; for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+        const rms = Math.sqrt(sum / input.length);
+        if (rms > 0.012) { active = true; voicedMs += FRAME_MS; silenceMs = 0; chunks.push(new Float32Array(input)); }
+        else if (active) {
+            silenceMs += FRAME_MS; chunks.push(new Float32Array(input));   // keep a little trailing audio
+            if (silenceMs > 850 && voicedMs > 250) { const c = chunks; reset(); finalizeUtterance(c, inRate); }
+            else if (silenceMs > 1600) { reset(); }                        // was just a blip of noise
+        }
+        if (chunks.length * FRAME_MS > 15000) { const c = chunks; reset(); finalizeUtterance(c, inRate); }  // hard cap
+    };
+    src.connect(node); node.connect(ac.destination);
+    localCap = { stream, ac, node, src };
+}
+function stopLocalCapture() {
+    if (!localCap) return;
+    const { stream, ac, node, src } = localCap; localCap = null;
+    try { node.disconnect(); } catch { }
+    try { src.disconnect(); } catch { }
+    try { stream.getTracks().forEach(t => t.stop()); } catch { }
+    try { ac.close(); } catch { }
+}
+async function finalizeUtterance(frames, inRate) {
+    const wav = encodeWav16k(frames, inRate);
+    let text = '';
+    try {
+        const r = await fetch('/stt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ audio: bytesToB64(wav) }) });
+        if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            if (!sttErrToasted && typeof uiToast === 'function') { uiToast('Local STT unavailable: ' + (j.error || r.status), 'error'); sttErrToasted = true; }
+            return;
+        }
+        sttErrToasted = false;
+        text = (await r.json()).text || '';
+    } catch { return; }
+    if (text) pushFinalLocal(text);
+}
+// Merge Float32 frames captured at inRate, downsample to 16 kHz mono, encode a PCM16 WAV. -> Uint8Array
+function encodeWav16k(frames, inRate) {
+    let len = 0; for (const f of frames) len += f.length;
+    const merged = new Float32Array(len); let mo = 0; for (const f of frames) { merged.set(f, mo); mo += f.length; }
+    const outRate = 16000, ratio = inRate / outRate, outLen = Math.floor(merged.length / ratio);
+    const pcm = new Int16Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+        const s = Math.max(-1, Math.min(1, merged[Math.floor(i * ratio)] || 0));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    const abuf = new ArrayBuffer(44 + pcm.length * 2), dv = new DataView(abuf);
+    const ws = (off, str) => { for (let i = 0; i < str.length; i++) dv.setUint8(off + i, str.charCodeAt(i)); };
+    ws(0, 'RIFF'); dv.setUint32(4, 36 + pcm.length * 2, true); ws(8, 'WAVE');
+    ws(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, outRate, true); dv.setUint32(28, outRate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    ws(36, 'data'); dv.setUint32(40, pcm.length * 2, true);
+    let off = 44; for (let i = 0; i < pcm.length; i++, off += 2) dv.setInt16(off, pcm[i], true);
+    return new Uint8Array(abuf);
+}
+function bytesToB64(bytes) {
+    let bin = ''; const CH = 0x8000;
+    for (let i = 0; i < bytes.length; i += CH) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    return btoa(bin);
+}

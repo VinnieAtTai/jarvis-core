@@ -5,6 +5,7 @@ import { createServer } from 'node:http';
 import { spawn, execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { captureScreen } from './screen.mjs';
+import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
 import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded } from './jarvis-text.mjs';
@@ -132,6 +133,20 @@ function setMute(on, by) {
     autoMutedBy = muted ? (by || null) : null;
     record({ kind: 'sys', text: muted ? 'muted' + (by ? ' (auto: ' + by + ')' : '') : 'unmuted' });
     if (consolePageRef) consolePageRef.evaluate(m => window.__setMute(m), muted).catch(() => { });
+}
+// Selectable speech-to-text backend. 'google' = the browser's webkitSpeechRecognition (cloud,
+// the default). 'local' = mic audio is captured in the console, POSTed to /stt, and transcribed
+// by a local whisper.cpp server spawned on demand (see stt.mjs) — fully offline, audio never
+// leaves the machine. It is a privacy/offline toggle, not a replacement; Google stays default.
+let sttBackend = 'google';
+function setSttBackend(b) {
+    const next = b === 'local' ? 'local' : 'google';
+    if (next === sttBackend) return;
+    sttBackend = next;
+    record({ kind: 'sys', text: 'STT backend: ' + sttBackend });
+    if (consolePageRef) consolePageRef.evaluate(v => window.__setSttBackend(v), sttBackend).catch(() => { });
+    if (sttBackend === 'local') stt.ensureReady().catch(e => record({ kind: 'sys', text: 'STT local not ready: ' + e.message }));
+    else stt.stop();
 }
 const SESSION_BUDGET = Number(process.env.JARVIS_SESSION_BUDGET || 0);
 let tokenStats = { totals: { output: 0, input: 0, cacheWrite: 0, cacheRead: 0, turns: 0 }, burn: 0, heat: heatOf(0), resetAt: null, sessionPct: null, source: 'estimate', weekPct: null, blockBurn: 0, budget: null, at: null };
@@ -1522,7 +1537,7 @@ async function handleRequest(req, res) {
                 working: b.working, queued: b.queued, done: b.done, review: b.review || [],
             };
         });
-        return json(res, 200, { focus: w.focus, muted, paused: discard, boards, awayUntil: roster.awayUntil || 0, missions: activeMissionsView() });
+        return json(res, 200, { focus: w.focus, muted, paused: discard, sttBackend, sttReady: stt.isReady(), boards, awayUntil: roster.awayUntil || 0, missions: activeMissionsView() });
     }
     if (key === 'GET /missions') return json(res, 200, loadMissions());
     if (key === 'GET /roster') {
@@ -2136,6 +2151,29 @@ async function handleRequest(req, res) {
         discard = !!b.on;
         record({ kind: 'sys', text: discard ? 'listening paused (console)' : 'listening resumed (console)' });
         return json(res, 200, { ok: true, paused: discard });
+    }
+    if (key === 'POST /stt-backend') {
+        // Flip the speech-to-text backend (google <-> local). Spawning/stopping the local
+        // whisper server is handled by setSttBackend so the model is only warmed when in use.
+        const b = await readBody(req);
+        setSttBackend(String(b.backend || 'google'));
+        return json(res, 200, { ok: true, sttBackend, sttReady: stt.isReady() });
+    }
+    if (key === 'POST /stt') {
+        // Local-backend transcription bridge: the console captures one utterance of mic audio
+        // (16 kHz mono WAV, base64) and POSTs it here; we hand it to the local whisper server and
+        // return the text. Nothing is spoken/routed here — the console feeds the text back through
+        // its normal buffer/flush path so mute, INSTANT commands, and the 2.5s merge all still apply.
+        const b = await readBody(req);
+        if (sttBackend !== 'local') return json(res, 409, { error: 'STT backend is not local' });
+        if (!b.audio) return json(res, 400, { error: 'missing audio' });
+        try {
+            const text = await stt.transcribe(Buffer.from(String(b.audio), 'base64'));
+            return json(res, 200, { ok: true, text: text || '' });
+        } catch (e) {
+            record({ kind: 'sys', text: 'STT transcribe error: ' + e.message });
+            return json(res, 500, { error: e.message });
+        }
     }
     if (key === 'POST /voicemute') {
         // Silence one session's spoken lines (still logged in chat); per-session, not the global mute.

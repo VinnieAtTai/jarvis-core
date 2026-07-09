@@ -18,3 +18,4 @@ anthropic-key.txt
 *.key
 ai-threads.json
 ai-spend.json
+stt/
