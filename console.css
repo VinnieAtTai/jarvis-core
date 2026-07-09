@@ -58,6 +58,29 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .bubble:hover .rx{opacity:.55}
 .rx:hover{opacity:1;filter:none}
 .rx.on{opacity:1;filter:none}
+/* Pin / bookmark a chat message. Pin toggle mirrors .copybtn (hidden until bubble hover), stays
+   visible once pinned; pinned bubbles get a subtle amber left-rail + wash. The Pinned strip pins
+   to the top of the active chat, collapsible, entries scroll-highlight their original bubble. */
+.pinbtn{cursor:pointer;margin-left:6px;font-size:11px;opacity:0;transition:opacity .15s;user-select:none}
+.bubble:hover .pinbtn{opacity:.55}
+.pinbtn:hover{opacity:1}
+.pinbtn.on{opacity:1}
+.bubble.pinned{border-left:2px solid #c9b98a;background:#20242a}
+.me .bubble.pinned{background:#1d3f5c}
+.bubble.pinflash{animation:pinflash 1.4s ease-out}
+@keyframes pinflash{0%{box-shadow:0 0 0 2px #c9b98a}60%{box-shadow:0 0 0 2px #c9b98a}100%{box-shadow:0 0 0 0 rgba(201,185,138,0)}}
+.pinstrip{background:#0d1420;border:1px solid #3a3420;border-radius:6px;margin-bottom:8px;overflow:hidden}
+.pinhead{cursor:pointer;font:bold 10px Consolas,monospace;letter-spacing:.5px;color:#c9b98a;padding:4px 8px;display:flex;align-items:center;gap:5px;user-select:none}
+.pinhead:hover{color:#e6d49a}
+.pincaret{font-size:9px}
+.pincount{margin-left:auto;color:#7a8a9c;font-weight:normal}
+.pinbody{border-top:1px solid #1f2c3a;max-height:150px;overflow-y:auto}
+.pinitem{cursor:pointer;display:flex;align-items:baseline;gap:7px;padding:3px 9px;font-size:11px;color:#9bb0c4;border-bottom:1px solid #16202c}
+.pinitem:last-child{border-bottom:none}
+.pinitem:hover{background:#16202c;color:#cfe3f2}
+.pinwho{color:#c9b98a;font-weight:bold;letter-spacing:.5px;flex:0 0 auto}
+.pintxt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 auto}
+.pint{color:#566270;flex:0 0 auto;font-size:10px}
 .thumb{max-width:240px;max-height:180px;border-radius:6px;margin-top:4px;display:block;cursor:pointer;border:1px solid #1f2c3a}
 .divider{text-align:center;color:#d9a05d;font-size:11px;margin:2px 0}
 #right{flex:2;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:10px}

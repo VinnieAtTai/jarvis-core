@@ -286,6 +286,25 @@ function uiToast(message, kind) {
 }
 
 const REMOJI = { up: '👍', love: '❤️', squee: '🤩', fire: '🔥', down: '👎', poop: '💩' };
+// —— Pinned chat messages (client-only, punchlist: bookmark a chat message). Chris wants to flag
+// individual bubbles and find them again. Persisted in localStorage keyed by a stable per-message
+// id (sender + first-event timestamp of the group — same ts the reaction bar already keys on), so
+// pins survive reload AND the poll re-render (renderChat reads pinnedMsgs on every pass, never
+// tracks DOM state). msgKey mirrors the reaction key (g.ts) but also namespaces by sender so two
+// workers posting the same instant can't collide. The Pinned strip at the top of the active chat
+// is collapsible (state also persisted) and each entry scroll-highlights its original bubble.
+const PIN_LS_KEY = 'jarvisPinnedMsgs', PINSTRIP_LS_KEY = 'jarvisPinStripOpen';
+function loadPins() { try { const a = JSON.parse(localStorage.getItem(PIN_LS_KEY) || '[]'); return new Set(Array.isArray(a) ? a : []); } catch { return new Set(); } }
+let pinnedMsgs = loadPins();
+let pinStripOpen = (() => { try { return localStorage.getItem(PINSTRIP_LS_KEY) !== '0'; } catch { return true; } })();
+function savePins() { try { localStorage.setItem(PIN_LS_KEY, JSON.stringify([...pinnedMsgs])); } catch { } }
+function msgKey(who, ts) { return String(who == null ? '' : who) + '|' + String(ts == null ? '' : ts); }
+function isPinned(who, ts) { return pinnedMsgs.has(msgKey(who, ts)); }
+function togglePin(who, ts) {
+    const k = msgKey(who, ts);
+    if (pinnedMsgs.has(k)) pinnedMsgs.delete(k); else pinnedMsgs.add(k);
+    savePins();
+}
 // Worker-filter row pinned to the top of a mission chat: one toggle per worker on the mission
 // (labeled by name), plus an "ALL" reset. Clicking a name pins the chat to that worker; clicking
 // the pinned name again (or ALL) unpins. View-only — the workers still live under the mission.
@@ -300,6 +319,29 @@ function missionFilterBar() {
     let chips = '<span class="mfchip' + (!pin ? ' on' : '') + '" data-mfpin="" title="show every worker on this mission">ALL</span>';
     chips += names.map(n => '<span class="mfchip' + (pin === n ? ' on' : '') + '" data-mfpin="' + escAttr(n) + '" title="show only ' + escAttr(n.toUpperCase()) + '">' + esc(n.toUpperCase()) + '</span>').join('');
     return '<div class="mfilter">' + chips + '</div>';
+}
+// Collapsible "Pinned" strip at the top of the currently-viewed chat. Collects the groups in the
+// current tab (`show`) whose key is in pinnedMsgs, so it reflects exactly what's pinned in THIS
+// view; empty -> no strip. Each entry is a one-line snippet that scroll-highlights its original
+// bubble on click; the whole strip collapses via the header (state persisted). Reads pinnedMsgs on
+// every render so it survives the poll re-render and reload.
+function pinStripFor(show) {
+    const pins = (show || []).filter(g => g && !g.divider && pinnedMsgs.has(msgKey(g.who, g.ts)));
+    if (!pins.length) return '';
+    const snip = (g) => {
+        const raw = (g.texts || []).join(' ').replace(/\s+/g, ' ').trim();
+        const s = raw.length > 90 ? raw.slice(0, 88) + '…' : (raw || (g.img ? '[image]' : ''));
+        const who = g.who === 'you' ? 'YOU' : String(g.who || '').toUpperCase();
+        return '<div class="pinitem" data-pinjump="' + escAttr(msgKey(g.who, g.ts)) + '" title="jump to this message">'
+            + '<span class="pinwho">' + esc(who) + '</span>'
+            + '<span class="pintxt">' + esc(s) + '</span>'
+            + '<span class="pint">' + fmtHM(g.ts) + '</span></div>';
+    };
+    const body = pinStripOpen ? '<div class="pinbody">' + pins.map(snip).join('') + '</div>' : '';
+    return '<div class="pinstrip">'
+        + '<div class="pinhead" data-pintoggle="1" title="collapse / expand pinned">'
+        + '<span class="pincaret">' + (pinStripOpen ? '▾' : '▸') + '</span> 📌 PINNED <span class="pincount">' + pins.length + '</span></div>'
+        + body + '</div>';
 }
 function renderChat() {
     renderTabs();
@@ -319,18 +361,22 @@ function renderChat() {
     // In a mission chat, always label each bubble by its sending worker (never suppress the chip
     // against focusCS) — the whole point is telling several workers apart in one aggregated chat.
     const _mission = activeTab.startsWith('m:');
-    chatEl.innerHTML = missionFilterBar() + show.map(g => {
+    chatEl.innerHTML = missionFilterBar() + pinStripFor(show) + show.map(g => {
         if (g.divider) return '<div class="divider">&#9472;&#9472; ' + esc(g.divider) + ' &#9472;&#9472;</div>';
         const me = g.who === 'you';
         const chip = (!me && g.who !== 'jarvis' && (_mission || g.who !== focusCS)) ? '<span class="chip">' + esc(g.who.toUpperCase()) + ' &#183; </span>' : '';
         const cur = reactMap[g.ts];
         // Ordered happiest -> poop: squee, fire, love, up (positives, descending), then down, poop.
         const reactBar = '<span class="reacts">' + ['squee', 'fire', 'love', 'up', 'down', 'poop'].map(k => '<span class="rx' + (cur === k ? ' on' : '') + '" data-react="' + k + '" data-ts="' + escAttr(g.ts || '') + '">' + REMOJI[k] + '</span>').join('') + '</span>';
-        return '<div class="row ' + (me ? 'me' : 'them') + '"><div class="bubble">' + chip
+        // Pin toggle (mirrors .copybtn placement). Reads pinnedMsgs each render so pins survive the
+        // poll re-render and reload; a pinned bubble gets a subtle highlight class + filled pin.
+        const _key = msgKey(g.who, g.ts), _pinned = pinnedMsgs.has(_key);
+        const pinBtn = '<span class="pinbtn' + (_pinned ? ' on' : '') + '" data-pin="' + escAttr(_key) + '" title="' + (_pinned ? 'unpin this message' : 'pin / bookmark this message') + '">' + (_pinned ? '📌' : '📍') + '</span>';
+        return '<div class="row ' + (me ? 'me' : 'them') + '" data-mkey="' + escAttr(_key) + '"><div class="bubble' + (_pinned ? ' pinned' : '') + '">' + chip
             + richText(g.texts.join('\n'))
             + (g.img ? '<br><a href="' + g.img + '" target="_blank"><img src="' + g.img + '" class="thumb"></a>' : '')
             + '<span class="t">' + fmtHM(g.ts) + '</span>'
-            + '<span class="copybtn" data-c="' + btoa(unescape(encodeURIComponent(g.texts.join('\n')))) + '" title="copy markdown">📋</span>' + '<span class="htmlbtn" data-copyhtml="' + b64(g.texts.join('\n')) + '" title="copy formatted — paste into email or docs with styling">html</span>' + reactBar + '</div></div>';
+            + '<span class="copybtn" data-c="' + btoa(unescape(encodeURIComponent(g.texts.join('\n')))) + '" title="copy markdown">📋</span>' + '<span class="htmlbtn" data-copyhtml="' + b64(g.texts.join('\n')) + '" title="copy formatted — paste into email or docs with styling">html</span>' + pinBtn + reactBar + '</div></div>';
     }).join('');
     rawEl.innerHTML = chatEvts.slice(-200).reverse().map(e =>
         '<div>[' + fmtHMS(e.ts) + '] <b>' + esc(e.kind === 'sys' ? 'SYS' : (e.who === 'you' ? 'YOU' : String(e.who).toUpperCase())) + '</b> ' + esc(e.text) + '</div>'
@@ -346,7 +392,30 @@ async function pollChat() {
     } catch { }
     setTimeout(pollChat, 1500);
 }
+// Scroll a pinned bubble into view and pulse it, so a Pinned-strip entry can find its original.
+function flashMsg(key) {
+    const row = chatEl.querySelector ? chatEl.querySelector('[data-mkey="' + (window.CSS && CSS.escape ? CSS.escape(key) : key.replace(/"/g, '\\"')) + '"]') : null;
+    if (!row) { uiToast('That message has scrolled out of the loaded window — expand the chat (t) to see it.', 'error'); return; }
+    pinned = false;   // don't let the poll snap us back to the bottom
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const b = row.querySelector ? row.querySelector('.bubble') : null;
+    if (b) { b.classList.add('pinflash'); setTimeout(() => b.classList.remove('pinflash'), 1400); }
+}
 chatEl.addEventListener('click', (e) => {
+    // Pin toggle on a bubble — flip localStorage state, re-render so the strip + highlight update.
+    const pb = e.target.closest ? e.target.closest('[data-pin]') : null;
+    if (pb) {
+        const k = pb.getAttribute('data-pin') || '';
+        if (pinnedMsgs.has(k)) pinnedMsgs.delete(k); else pinnedMsgs.add(k);
+        savePins(); renderChat();
+        return;
+    }
+    // Collapse / expand the Pinned strip (state persisted).
+    const pt = e.target.closest ? e.target.closest('[data-pintoggle]') : null;
+    if (pt) { pinStripOpen = !pinStripOpen; try { localStorage.setItem(PINSTRIP_LS_KEY, pinStripOpen ? '1' : '0'); } catch { } renderChat(); return; }
+    // Pinned-strip entry — jump to and flash the original bubble.
+    const pj = e.target.closest ? e.target.closest('[data-pinjump]') : null;
+    if (pj) { flashMsg(pj.getAttribute('data-pinjump') || ''); return; }
     const mf = e.target.closest ? e.target.closest('[data-mfpin]') : null;
     if (mf && activeTab.startsWith('m:')) {
         const n = mf.getAttribute('data-mfpin') || '';
