@@ -488,10 +488,26 @@ function watchIndicator(b) {
 // Mission rail: the pinned, always-visible objectives panel (#mission, separate from #work).
 // Phase rows toggle done on click; doc chips open via the document-level data-open listener.
 // There is deliberately NO close control — a mission is closed only by the voice gate.
-function renderMissions(list) {
+function renderMissions(list, boards) {
     if (!missionEl) return;
     if (!list || !list.length) { missionEl.style.display = 'none'; missionEl.innerHTML = ''; return; }
     missionEl.style.display = 'block';
+    // Unified view: nest each live worker session under the mission it belongs to. A card belongs
+    // when card.projectContext.missionId === mission.id. projectContext may be null on plain NATO
+    // workers, so guard with optional chaining. Cards whose missionId matches nothing aren't dropped
+    // here — they still render as their own board card in workEl below.
+    const _boards = boards || (lastBoard && lastBoard.boards) || [];
+    const workersFor = (mid) => _boards.filter(b => b && b.uid && b.projectContext?.missionId === mid);
+    const workerRow = (b) => {
+        const cs = String(b.callsign || '').toUpperCase();
+        const idle = b.alive === false;
+        const doing = b.needsYou ? 'NEEDS YOU' : (b.doing || (idle ? 'quiet' : 'standing by'));
+        return '<div class="mworker" style="display:flex;align-items:baseline;gap:6px;font-size:11px;padding:2px 0;color:' + (idle ? '#6b7a89' : '#9bb0c4') + '">'
+            + '<span style="font-weight:bold;color:' + (idle ? '#6b7a89' : '#c9b98a') + ';letter-spacing:.5px">' + esc(cs) + '</span>'
+            + activityIndicator(b)
+            + '<span style="opacity:.9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(doing) + '</span>'
+            + '</div>';
+    };
     const items = list.map(mn => {
         const phs = mn.phases || [], tot = phs.length, done = phs.filter(p => p.done).length;
         const pct = typeof mn.progress === 'number' ? mn.progress : (tot ? Math.round(done / tot * 100) : 0);
@@ -506,11 +522,17 @@ function renderMissions(list) {
                     : '<span class="mdoc" style="cursor:default">🔗 ' + lbl + '</span>';
             }).join('') + '</div>'
             : '';
+        const mws = workersFor(mn.id);
+        const workerHtml = mws.length
+            ? '<div class="mworkers" style="margin-top:6px;padding-top:5px;border-top:1px solid #1f2c3a">'
+                + mws.map(workerRow).join('') + '</div>'
+            : '';
         return '<div class="mitem">'
             + '<div class="mtitle">' + esc(mn.title) + '<span class="mpct">' + pct + '%' + (tot ? ' · ' + done + '/' + tot : '') + '</span></div>'
             + '<div class="nmbar"><div class="nmbarfill" style="width:' + pct + '%"></div></div>'
             + (phaseHtml ? '<div class="mphases">' + phaseHtml + '</div>' : '')
             + docHtml
+            + workerHtml
             + '</div>';
     }).join('');
     missionEl.innerHTML = '<div class="mhead"><span class="mhicon">🎯</span> MISSION' + (list.length > 1 ? 'S' : '') + '</div>'
@@ -559,7 +581,7 @@ function renderBoards(d) {
     focusCS = d.focus;
     lastBoard = d;
     populateAddTaskCols(d);
-    renderMissions(d.missions || []);
+    renderMissions(d.missions || [], d.boards || []);
     if (typeof d.muted === 'boolean' && d.muted !== isMuted) window.__setMute(d.muted);
     if (typeof d.paused === 'boolean' && d.paused !== isPaused) window.__setPause(d.paused);
     if (typeof d.sttReady === 'boolean') sttReady = d.sttReady;
