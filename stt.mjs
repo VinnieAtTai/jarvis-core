@@ -79,7 +79,11 @@ export function ensureReady() {
         const deadline = Date.now() + 45000;
         (async function waitUp() {
             while (Date.now() < deadline) {
-                if (!child) return; // exited/errored while we waited
+                // Process died while we were waiting (crash, bad model, missing DLL). The 'error'
+                // handler already rejects a spawn failure, but a start-then-exit fires only 'exit'
+                // (which nulls child) — so reject here too, or ensureReady() would hang forever and
+                // wedge every future /stt call on the same unsettled promise.
+                if (!child) return reject(new Error('whisper-server exited during startup (check the model + DLLs under ' + STT_DIR + ')'));
                 try {
                     const r = await fetch(ORIGIN + '/', { method: 'GET' });
                     if (r.status) { ready = true; return resolve(); }
