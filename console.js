@@ -1018,7 +1018,12 @@ function attachFile(f) {
     r.onload = () => {
         const b64 = String(r.result).split(',')[1] || '';
         if (!b64) return;
-        const cs = (activeTab && activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis') ? activeTab : '';
+        // Target the tab you're VIEWING, not the hub's routing focus (they're independent). A session
+        // tab -> that worker's callsign; the JARVIS tab -> 'jarvis' (the hub resolves it to the bound
+        // jarvis worker via projectWorkerUid); all/general/ask -> no target (broadcast). Excluding
+        // 'jarvis' here sent cs='' and let the server fall back to focus — so a paste on the JARVIS
+        // tab landed in ALL whenever focus wasn't a live worker.
+        const cs = (activeTab && activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'ask') ? activeTab : '';
         fetch('/attach', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callsign: cs, data: b64, name: f.name || 'paste.png' }) }).catch(() => { });
     };
     r.readAsDataURL(f);
