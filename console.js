@@ -20,6 +20,10 @@ let archFilter = '';
 let lastHold = null;
 let activeTab = 'all';
 let nsRepos = [];
+// Per-mission worker filter: when Chris pins one worker inside a mission chat, narrow that chat to
+// just that identity. Keyed by mission tab id ('m:<id>') so each mission remembers its own pin;
+// view-only state, cleared to "show all" by unpinning. Never persisted (session-local).
+let missionWorkerPin = {};
 
 function fmtTok(n) {
     if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
@@ -282,6 +286,21 @@ function uiToast(message, kind) {
 }
 
 const REMOJI = { up: '👍', love: '❤️', squee: '🤩', fire: '🔥', down: '👎', poop: '💩' };
+// Worker-filter row pinned to the top of a mission chat: one toggle per worker on the mission
+// (labeled by name), plus an "ALL" reset. Clicking a name pins the chat to that worker; clicking
+// the pinned name again (or ALL) unpins. View-only — the workers still live under the mission.
+// Returns '' for non-mission tabs and for missions with fewer than two identities (nothing to
+// narrow). Ordered so it reads stable across re-renders.
+function missionFilterBar() {
+    if (!activeTab.startsWith('m:')) return '';
+    const ids = missionChatSets().byMission[activeTab.slice(2)];
+    if (!ids || ids.size < 2) return '';
+    const names = [...ids].sort();
+    const pin = missionWorkerPin[activeTab];
+    let chips = '<span class="mfchip' + (!pin ? ' on' : '') + '" data-mfpin="" title="show every worker on this mission">ALL</span>';
+    chips += names.map(n => '<span class="mfchip' + (pin === n ? ' on' : '') + '" data-mfpin="' + escAttr(n) + '" title="show only ' + escAttr(n.toUpperCase()) + '">' + esc(n.toUpperCase()) + '</span>').join('');
+    return '<div class="mfilter">' + chips + '</div>';
+}
 function renderChat() {
     renderTabs();
     const reactMap = {};
@@ -297,10 +316,13 @@ function renderChat() {
         } else groups.push({ who: e.who, texts: [e.text], ts: e.ts, lastTs: e.ts });
     }
     const show = expanded ? groups : groups.slice(-10);
-    chatEl.innerHTML = show.map(g => {
+    // In a mission chat, always label each bubble by its sending worker (never suppress the chip
+    // against focusCS) — the whole point is telling several workers apart in one aggregated chat.
+    const _mission = activeTab.startsWith('m:');
+    chatEl.innerHTML = missionFilterBar() + show.map(g => {
         if (g.divider) return '<div class="divider">&#9472;&#9472; ' + esc(g.divider) + ' &#9472;&#9472;</div>';
         const me = g.who === 'you';
-        const chip = (!me && g.who !== 'jarvis' && g.who !== focusCS) ? '<span class="chip">' + esc(g.who.toUpperCase()) + ' &#183; </span>' : '';
+        const chip = (!me && g.who !== 'jarvis' && (_mission || g.who !== focusCS)) ? '<span class="chip">' + esc(g.who.toUpperCase()) + ' &#183; </span>' : '';
         const cur = reactMap[g.ts];
         // Ordered happiest -> poop: squee, fire, love, up (positives, descending), then down, poop.
         const reactBar = '<span class="reacts">' + ['squee', 'fire', 'love', 'up', 'down', 'poop'].map(k => '<span class="rx' + (cur === k ? ' on' : '') + '" data-react="' + k + '" data-ts="' + escAttr(g.ts || '') + '">' + REMOJI[k] + '</span>').join('') + '</span>';
@@ -325,6 +347,14 @@ async function pollChat() {
     setTimeout(pollChat, 1500);
 }
 chatEl.addEventListener('click', (e) => {
+    const mf = e.target.closest ? e.target.closest('[data-mfpin]') : null;
+    if (mf && activeTab.startsWith('m:')) {
+        const n = mf.getAttribute('data-mfpin') || '';
+        if (!n || missionWorkerPin[activeTab] === n) delete missionWorkerPin[activeTab];   // ALL, or re-click pinned -> unpin
+        else missionWorkerPin[activeTab] = n;
+        renderChat();
+        return;
+    }
     const rx = e.target.closest ? e.target.closest('[data-react]') : null;
     if (rx) {
         fetch('/react', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ts: rx.getAttribute('data-ts'), reaction: rx.getAttribute('data-react') }) }).catch(() => { });
@@ -975,6 +1005,14 @@ function sendTyped() {
     if (target === 'general') out = t;
     else if (target === 'jarvis') out = 'jarvis ' + t;
     else if (target) out = 'on ' + target + ', ' + t;
+    else if (activeTab.startsWith('m:')) {
+        // Mission tab: route to the pinned worker if one is pinned, else to the mission's manager
+        // (its project callsign). Falls back to the general bus if the mission has no live member.
+        const ids = missionChatSets().byMission[activeTab.slice(2)] || new Set();
+        const pin = missionWorkerPin[activeTab];
+        const to = (pin && ids.has(pin)) ? pin : missionManagerCallsign(activeTab.slice(2));
+        out = to ? ('on ' + to + ', ' + t) : t;
+    }
     else {
         const sess = activeTab && activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
         out = activeTab === 'jarvis' ? ('jarvis ' + t) : sess ? ('on ' + activeTab + ', ' + t) : t;
@@ -1147,10 +1185,16 @@ function attachFile(f) {
         if (!b64) return;
         // Target the tab you're VIEWING, not the hub's routing focus (they're independent). A session
         // tab -> that worker's callsign; the JARVIS tab -> 'jarvis' (the hub resolves it to the bound
-        // jarvis worker via projectWorkerUid); all/general/ask -> no target (broadcast). Excluding
-        // 'jarvis' here sent cs='' and let the server fall back to focus — so a paste on the JARVIS
-        // tab landed in ALL whenever focus wasn't a live worker.
-        const cs = (activeTab && activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'ask') ? activeTab : '';
+        // jarvis worker via projectWorkerUid); a mission tab -> the pinned worker or the mission's
+        // manager (a mission id is not a real callsign); all/general/ask -> no target (broadcast).
+        // Excluding 'jarvis' here sent cs='' and let the server fall back to focus — so a paste on the
+        // JARVIS tab landed in ALL whenever focus wasn't a live worker.
+        let cs = (activeTab && activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'ask') ? activeTab : '';
+        if (activeTab.startsWith('m:')) {
+            const ids = missionChatSets().byMission[activeTab.slice(2)] || new Set();
+            const pin = missionWorkerPin[activeTab];
+            cs = (pin && ids.has(pin)) ? pin : missionManagerCallsign(activeTab.slice(2));
+        }
         fetch('/attach', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ callsign: cs, data: b64, name: f.name || 'paste.png' }) }).catch(() => { });
     };
     r.readAsDataURL(f);
@@ -1269,6 +1313,42 @@ document.getElementById('holdpanel').onclick = (e) => {
     if (act === 'resume') post('/unhold', { key: t.getAttribute('data-key'), cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
     else if (act === 'drophold') post('/unhold', { key: t.getAttribute('data-key'), callsign: t.getAttribute('data-cs'), drop: true });
 };
+// Mission-grouped chat. Chris wants ALL communication from every worker under a mission in ONE
+// chat, so he can live out of one chat per project. A board (project card) belongs to a mission
+// when board.projectContext.missionId === mission.id; its chat identities are BOTH its callsign
+// (e.g. "primeng", under which the manager posts) AND its bound worker's NATO callsign (e.g.
+// "oscar", under which the live worker speaks). Both used to surface as SEPARATE tabs — a live
+// "PRIMENG" session tab and a greyed "OSCAR" dead tab — which is the duplication Chris hit.
+// missionChatSets() maps each active mission to its identity set, plus the union of every
+// mission-bound identity so a mission member never also gets a standalone per-session tab.
+// projectContext may be null on plain NATO workers, so guard with optional chaining.
+function missionChatSets() {
+    const missions = (lastBoard && lastBoard.missions) || [];
+    const boards = (lastBoard && lastBoard.boards) || [];
+    const byMission = {};   // missionId -> Set of chat identities (callsign + worker)
+    const claimed = new Set();   // every identity that belongs to some active mission
+    for (const mn of missions) {
+        const ids = new Set();
+        for (const b of boards) {
+            if (!b || b.projectContext?.missionId !== mn.id) continue;
+            if (b.callsign) ids.add(b.callsign);
+            if (b.worker) ids.add(b.worker);
+        }
+        byMission[mn.id] = ids;
+        ids.forEach(id => claimed.add(id));
+    }
+    return { byMission, claimed, missions };
+}
+// The routable callsign for a mission's live manager: prefer the project card's own callsign (the
+// hub resolves it to the bound worker), falling back to any live worker on the mission. Returns
+// '' when nothing on the mission is live to receive a typed message.
+function missionManagerCallsign(mid) {
+    const boards = (lastBoard && lastBoard.boards) || [];
+    const proj = boards.find(b => b && b.projectContext?.missionId === mid && b.callsign);
+    if (proj && proj.uid) return proj.callsign;
+    const live = boards.find(b => b && b.projectContext?.missionId === mid && b.uid && b.alive !== false);
+    return live ? live.callsign : '';
+}
 function eventsForTab() {
     if (activeTab === 'ask') return [];   // ASK is a separate model chat, not the speech transcript
     if (activeTab === 'all') return chatEvts;
@@ -1278,45 +1358,74 @@ function eventsForTab() {
     const _jw = _jb && _jb.worker;
     if (activeTab === 'general') return chatEvts.filter(e => e.kind === 'sys' || e.who === 'jarvis' || (_jw && e.who === _jw) || (e.who === 'you' && !e.to));
     if (activeTab === 'jarvis') return chatEvts.filter(e => e.who === 'jarvis' || (_jw && e.who === _jw) || (e.who === 'you' && (!e.to || e.to === 'jarvis' || (_jw && e.to === _jw))));
+    // Mission tab: aggregate every message whose sender (or the human's routed target) is any
+    // identity belonging to this mission — one chat for the whole project, each bubble still
+    // labeled by the sending worker via the chip in renderChat.
+    if (activeTab.startsWith('m:')) {
+        const all = missionChatSets().byMission[activeTab.slice(2)] || new Set();
+        // A worker pin narrows the mission chat to one identity (plus the human's messages routed
+        // to it); unpinned shows every worker on the mission. Guard the pin against a worker that
+        // has since left the mission by only honoring it if still in the set.
+        const pin = missionWorkerPin[activeTab];
+        const ids = (pin && all.has(pin)) ? new Set([pin]) : all;
+        return chatEvts.filter(e => e.kind !== 'sys' && (ids.has(e.who) || (e.who === 'you' && ids.has(e.to))));
+    }
     return chatEvts.filter(e => e.kind !== 'sys' && (e.who === activeTab || (e.who === 'you' && e.to === activeTab)));
 }
 function renderTabs() {
     // Order session tabs the same way the cards are ordered (perm/needs-you float to the top,
     // board order otherwise) so the tab strip and the card column read top-to-bottom alike.
     const _tprio = b => b.pendingPerm ? 2 : b.needsYou ? 1 : 0;
-    const sessions = lastBoard ? lastBoard.boards.filter(b => b.callsign !== 'jarvis' && b.alive !== false).slice().sort((a, b) => _tprio(b) - _tprio(a)) : [];
+    // Mission-grouped chat: each active mission gets ONE aggregated tab, and every callsign/worker
+    // it owns is folded into that tab instead of getting its own standalone (or greyed dead) tab.
+    const { byMission, claimed, missions } = missionChatSets();
+    const missionTabs = missions.map(mn => ({ id: 'm:' + mn.id, label: mn.title || 'MISSION', title: mn.title || '' }));
+    const sessions = lastBoard ? lastBoard.boards.filter(b => b.callsign !== 'jarvis' && b.alive !== false && !claimed.has(b.callsign)).slice().sort((a, b) => _tprio(b) - _tprio(a)) : [];
     const base = ['all', 'general', 'jarvis', 'ask'];
     // Recently-retired sessions still present in the transcript keep a greyed, clickable tab so
     // their chat history stays reachable instead of vanishing the instant they retire (#7). Sourced
     // from chatEvts, so it is self-limited to the transcript window; anything currently live —
-    // including the bound jarvis worker, which is surfaced under JARVIS — is excluded.
+    // including the bound jarvis worker (surfaced under JARVIS) and any mission-owned worker
+    // (surfaced under its mission tab) — is excluded so it can't double as its own dead tab.
     const _liveSet = new Set(sessions.map(b => b.callsign));
     const _jbCur = lastBoard && lastBoard.boards.find(b => b.callsign === 'jarvis');
     const _skip = new Set(base); _skip.add('you'); _skip.add('jarvis'); if (_jbCur && _jbCur.worker) _skip.add(_jbCur.worker);
+    claimed.forEach(id => _skip.add(id));
     const _deadLast = {};
     for (const e of chatEvts) { const w = e.who; if (!w || _skip.has(w) || _liveSet.has(w)) continue; _deadLast[w] = e.ts || _deadLast[w]; }
     const deadTabs = Object.keys(_deadLast).sort((a, b) => Date.parse(_deadLast[b] || 0) - Date.parse(_deadLast[a] || 0)).slice(0, 4);
-    const ids = base.concat(sessions.map(b => b.callsign)).concat(deadTabs);
+    const ids = base.concat(missionTabs.map(m => m.id)).concat(sessions.map(b => b.callsign)).concat(deadTabs);
     if (!ids.includes(activeTab)) activeTab = 'all';
     let html = base.map(id => '<span class="stab' + (id === activeTab ? ' active' : '') + '" data-tab="' + id + '">' + id.toUpperCase() + '</span>').join('');
+    // One tab per mission — the single chat for that whole project (mission color token #c9b98a).
+    html += missionTabs.map(m => '<span class="stab mission' + (m.id === activeTab ? ' active' : '') + '" data-tab="' + escAttr(m.id) + '" title="' + escAttr(m.title + ' — all workers on this mission') + '">' + esc(m.label.toUpperCase()) + '</span>').join('');
     // Full purpose rides as a title tooltip on every session tab so multiple same-named jobs
     // (e.g. three TMS-20079 sessions) are distinguishable on hover.
     html += sessions.map(b => '<span class="stab' + (b.callsign === activeTab ? ' active' : '') + (b.needsYou ? ' needs' : '') + '" data-tab="' + esc(b.callsign) + '"' + (b.purpose ? ' title="' + escAttr(b.callsign.toUpperCase() + ' · ' + b.purpose) + '"' : '') + '>' + esc(b.callsign.toUpperCase()) + (b.needsYou ? '<span class="sbadge">!</span>' : '') + '</span>').join('');
     html += deadTabs.map(cs => '<span class="stab dead' + (cs === activeTab ? ' active' : '') + '" data-tab="' + esc(cs) + '" title="' + escAttr(cs.toUpperCase() + ' · retired — chat history') + '">' + esc(cs.toUpperCase()) + '</span>').join('');
     html += '<span class="stab plus" data-newsession="1" title="new session: spin up a fresh worker">+</span>';
     // Active session's purpose as a sub-line under the strip (real session tabs + the JARVIS
-    // tab, which borrows its bound worker's purpose). all/general/ask have no single purpose.
+    // tab, which borrows its bound worker's purpose; mission tabs show the mission title).
     const _activeB = sessions.find(b => b.callsign === activeTab);
     const _jb = lastBoard && lastBoard.boards.find(b => b.callsign === 'jarvis');
+    const _activeM = missionTabs.find(m => m.id === activeTab);
     let _sub = '';
     if (_activeB && _activeB.purpose) _sub = _activeB.callsign.toUpperCase() + ' · ' + _activeB.purpose;
     else if (activeTab === 'jarvis' && _jb && _jb.purpose) _sub = (_jb.worker ? _jb.worker.toUpperCase() + ' · ' : '') + _jb.purpose;
+    else if (_activeM) _sub = 'MISSION · ' + _activeM.title;
     if (_sub) html += '<span class="stabsub" title="' + escAttr(_sub) + '">' + esc(_sub) + '</span>';
     document.getElementById('stabs').innerHTML = html;
     populateSendTo();
     if (activeTab !== 'ask') {   // ASK manages its own placeholder (see applyTabMode)
-        const sess = activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
-        typeBox.placeholder = (sess ? ('Message ' + activeTab + ' - no focus change') : 'Type to jarvis (routes like speech; works while paused/muted)') + ' · Ctrl+Enter to send';
+        let ph;
+        if (activeTab.startsWith('m:')) {
+            const pin = missionWorkerPin[activeTab];
+            ph = 'Message ' + (pin ? pin : (_activeM ? _activeM.title : 'mission')) + ' - no focus change';
+        } else {
+            const sess = activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
+            ph = sess ? ('Message ' + activeTab + ' - no focus change') : 'Type to jarvis (routes like speech; works while paused/muted)';
+        }
+        typeBox.placeholder = ph + ' · Ctrl+Enter to send';
     }
     applyTabMode();
 }

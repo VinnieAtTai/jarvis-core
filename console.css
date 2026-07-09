@@ -141,6 +141,12 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .stab.dead{color:#566270}
 .stabsub{flex-basis:100%;color:#7a8a9c;font:11px Consolas,monospace;letter-spacing:0;margin:3px 2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .stab.needs{color:#fff;background:#a33;border-color:#e06c6c;animation:needpulse 1.4s infinite}
+.stab.mission{color:#c9b98a;border-color:#3a3420}
+.stab.mission.active{color:#e6d49a;border-color:#c9b98a;background:#0d1420}
+.mfilter{display:flex;flex-wrap:wrap;gap:5px;align-items:center;padding:0 2px 8px;margin-bottom:6px;border-bottom:1px solid #1f2c3a}
+.mfchip{font:bold 10px Consolas,monospace;letter-spacing:.5px;color:#7a8a9c;background:#0d1420;border:1px solid #1f2c3a;border-radius:5px;padding:2px 8px;cursor:pointer}
+.mfchip:hover{color:#c9b98a;border-color:#3a3420}
+.mfchip.on{color:#e6d49a;background:#16202c;border-color:#c9b98a}
 .sbadge{color:#fff;background:#a33;border-radius:8px;padding:0 5px;margin-left:6px;font-size:10px}
 @keyframes needpulse{0%,100%{box-shadow:0 0 0 0 rgba(224,108,108,.55)}50%{box-shadow:0 0 7px 2px rgba(224,108,108,.8)}}
 #chat{border-top-left-radius:6px}
