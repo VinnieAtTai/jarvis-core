@@ -265,3 +265,48 @@ export function capExceeded(spend, cap) {
     if (!(c > 0)) return false;   // a non-positive/invalid cap means "no cap"
     return usd >= c;
 }
+
+// —— Projects (persistent project-manager store). The pure shape/log helpers live here so they
+// unit-test without booting the hub; the file I/O + endpoints stay in jarvis-core.mjs.
+export const PROJECT_LOG_CAP = 50;   // keep the most-recent N log entries so the store can't grow forever
+// Coerce a stored project object into the current shape: backfill missing fields, clamp the log,
+// drop junk. Pure — never invents timestamps (the caller stamps createdAt/updatedAt), returns a
+// NEW object, and returns null for anything without a usable name so a bad row is dropped, not
+// silently half-migrated.
+export function normalizeProject(p) {
+    if (!p || typeof p !== 'object') return null;
+    const name = String(p.name == null ? '' : p.name).toLowerCase().trim();
+    if (!name) return null;
+    const c = (p.context && typeof p.context === 'object') ? p.context : {};
+    const docs = (Array.isArray(c.docs) ? c.docs : []).map(d => (d && typeof d === 'object')
+        ? { label: String(d.label == null ? (d.url || '') : d.label), url: String(d.url == null ? '' : d.url) }
+        : { label: String(d), url: String(d) });
+    const recentLog = (Array.isArray(c.recentLog) ? c.recentLog : [])
+        .filter(e => e && typeof e === 'object')
+        .map(e => ({ ts: String(e.ts || ''), from: String(e.from || ''), note: String(e.note == null ? '' : e.note) }))
+        .slice(-PROJECT_LOG_CAP);
+    return {
+        name,
+        title: String(p.title == null ? name : p.title).trim() || name,
+        status: ['active', 'paused', 'archived'].includes(p.status) ? p.status : 'active',
+        missionId: p.missionId ? String(p.missionId) : null,
+        managerUid: p.managerUid ? String(p.managerUid) : null,
+        context: {
+            summary: String(c.summary == null ? '' : c.summary),
+            currentFocus: String(c.currentFocus == null ? '' : c.currentFocus),
+            openThreads: (Array.isArray(c.openThreads) ? c.openThreads : []).map(String).map(s => s.trim()).filter(Boolean),
+            recentLog,
+            docs,
+        },
+        workers: (Array.isArray(p.workers) ? p.workers : []).filter(w => w && typeof w === 'object'),
+        createdAt: p.createdAt ? String(p.createdAt) : '',
+        updatedAt: p.updatedAt ? String(p.updatedAt) : '',
+    };
+}
+// Push an entry onto an append-only, capped log. Pure — returns a NEW array holding the most
+// recent `cap` entries, so a project's context store can't grow without bound.
+export function pushCapped(arr, entry, cap = PROJECT_LOG_CAP) {
+    const next = (Array.isArray(arr) ? arr.slice() : []);
+    next.push(entry);
+    return next.length > cap ? next.slice(next.length - cap) : next;
+}

@@ -592,6 +592,30 @@ function renderBoards(d) {
             + (queued.length ? '<span class="cnum queue">' + queued.length + ' queued</span>' : '')
             + (review.length ? '<span class="cnum review">' + review.length + ' in review</span>' : '')
             + (done.length ? '<span class="cnum done">' + done.length + ' done</span>' : '') + '</div>' : '';
+        // Durable project-context strip (project cards only — b.projectContext is null for a plain
+        // NATO worker). Current focus always shows; an expander reveals the curated summary, open
+        // threads, and the recent-work log a manager rehydrates from. Same boardExpand/data-x toggle
+        // as the task lanes. Inline styles keep it self-contained (no CSS-file dependency).
+        let pctx = '';
+        const pc = b.projectContext;
+        if (pc) {
+            const openP = boardExpand.has('pctx:' + cs);
+            const threadN = (pc.openThreads || []).length, logN = (pc.recentLog || []).length;
+            const focusLine = pc.currentFocus ? '<div style="color:#c9b98a">▸ ' + esc(pc.currentFocus) + '</div>' : '';
+            const hasMore = !!(pc.summary || threadN || logN || (pc.docs || []).length);
+            const cap = hasMore ? '<span class="pctoggle" data-x="pctx:' + esc(cs) + '" style="cursor:pointer;color:#6f8faf">'
+                + (openP ? '▾ less' : '▸ context' + (threadN ? ' · ' + threadN + ' open' : '') + (logN ? ' · ' + logN + ' log' : '')) + '</span>' : '';
+            let body = '';
+            if (openP) {
+                if (pc.summary) body += '<div style="margin:3px 0;color:#9fb3c8">' + esc(pc.summary) + '</div>';
+                if (threadN) body += '<div style="margin:2px 0">' + pc.openThreads.map(t => '<div>• ' + esc(t) + '</div>').join('') + '</div>';
+                if (logN) body += '<div style="margin:2px 0;opacity:.85">' + pc.recentLog.slice().reverse().map(e =>
+                    '<div><span style="color:#5f7286">' + esc(String(e.ts || '').slice(5, 16).replace('T', ' ')) + '</span> '
+                    + (e.from ? '<span style="color:#6f8faf">' + esc(e.from) + '</span> ' : '') + esc(e.note || '') + '</div>').join('') + '</div>';
+                if ((pc.docs || []).length) body += '<div style="margin:2px 0;color:#6f8faf">' + pc.docs.map(d => esc(d.label || d.url)).join(' · ') + '</div>';
+            }
+            if (focusLine || cap || body) pctx = '<div class="pctx" style="margin:4px 0;font-size:11px;color:#8fa6bd;border-left:2px solid #3a4a5c;padding-left:6px">' + focusLine + cap + body + '</div>';
+        }
         // Clean one-line task (glyph + text, consistent left edge); notes (if any) make the
         // whole line clickable and drop full-width below — no leading indent, no double glyph.
         const _laneArrs = { review, working, queued, done };
@@ -651,7 +675,7 @@ function renderBoards(d) {
         const pcount = b.pendingPermCount || 0;
         const batch = pcount > 1 ? '<div class="permbatch"><span class="pbtn ok" data-act="approveall" data-cs="' + esc(b.callsign) + '">Approve all (' + pcount + ')</span><span class="pbtn no" data-act="denyall" data-cs="' + esc(b.callsign) + '">Deny all</span></div>' : '';
         const perm = pp ? '<div class="permreq' + (pp.klass === 'danger' ? ' permdanger' : '') + '"><div class="permhead">' + (pp.klass === 'danger' ? '&#9888; RISKY: ' : '&#9888; ') + 'wants to run <b>' + esc(pp.tool) + '</b></div><div class="permdetail">' + esc((pp.detail || '').slice(0, 240)) + '</div><div class="permbtns"><span class="pbtn ok" data-act="approve" data-permid="' + esc(pp.id) + '">Approve</span><span class="pbtn no" data-act="deny" data-permid="' + esc(pp.id) + '">Deny</span><span class="pbtn" data-act="always" data-permid="' + esc(pp.id) + '" title="auto-allow this command family from now on">Always: ' + esc(pp.label || pp.tool) + '</span></div>' + batch + '</div>' : '';
-        return '<div class="card' + (focused ? ' cfocus' : '') + (dead ? ' cdead' : '') + ((b.needsYou || b.pendingPerm) ? ' cneeds' : '') + '" data-cs="' + esc(cs) + '">' + head + purpose + perm + doing + counts + tasks + '</div>';
+        return '<div class="card' + (focused ? ' cfocus' : '') + (dead ? ' cdead' : '') + ((b.needsYou || b.pendingPerm) ? ' cneeds' : '') + '" data-cs="' + esc(cs) + '">' + head + purpose + perm + doing + pctx + counts + tasks + '</div>';
     }).join('');
     const deadN = d.boards.filter(b => b.alive === false && b.callsign !== 'jarvis').length;
     if (deadN > 1) workEl.innerHTML = '<div style="margin-bottom:8px"><span class="cbtn" data-act="continueall" style="opacity:1;color:#5db4d9;font-weight:bold;font-size:12px">🚀 continue all (' + deadN + ')</span></div>' + workEl.innerHTML;

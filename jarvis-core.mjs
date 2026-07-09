@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -26,6 +26,7 @@ const BUSBASE = join(DATA, 'bus.base'); // persisted count of bus events dropped
 const REPOS = join(DATA, 'repos.json');
 const SCHEDULE = join(DATA, 'schedule.json');
 const MISSIONS = join(DATA, 'missions.json');        // persistent always-visible mission tracker
+const PROJECTS_FILE = join(DATA, 'projects.json');   // persistent project-manager context store
 const AI_THREADS = join(DATA, 'ai-threads.json');   // conversational-tab thread store
 const AI_SPEND = join(DATA, 'ai-spend.json');        // conversational-tab monthly spend tracker
 // Hard monthly spend cap for the /ai tab (USD). Configurable; default $20. A non-positive/garbage
@@ -460,6 +461,142 @@ function activeMissionsView() {
         .filter(x => x.status === 'active')
         .map(mn => ({ ...mn, progress: missionProgress(mn) }));
 }
+// —— Projects: the durable operational container behind a project worker (e.g. 'jarvis'). A
+// mission is the OBJECTIVE (PrimeNG 17→18 + phases); a board column is TRANSIENT tasks; a project
+// holds the REBUILDABLE CONTEXT a manager rehydrates on boot instead of starting cold — a curated
+// summary + current focus + open threads + an append-only log of recent work (incl. retired
+// sub-worker outcomes) + doc links. Model B (Chris, 2026-07-09): the DATA is durable and "manager"
+// is a role any session assumes by reading GET /project on register. Lives in DATA (outside the
+// repo), atomic writes, backup-on-corrupt — same robustness contract as missions.
+function makeProject(name, title, missionId) {
+    const n = String(name == null ? '' : name).toLowerCase().trim();
+    const now = new Date().toISOString();
+    return {
+        name: n,
+        title: String(title == null ? n : title).trim() || n,
+        status: 'active',
+        missionId: missionId ? String(missionId) : null,
+        managerUid: null,
+        context: { summary: '', currentFocus: '', openThreads: [], recentLog: [], docs: [] },
+        workers: [],
+        createdAt: now,
+        updatedAt: now,
+    };
+}
+// First-run seed (used only when projects.json is absent): elevate the existing 'jarvis' project
+// and stand up 'primeng' linked to its existing mission (Chris's dogfood pick for P1).
+function seedProjects() {
+    let primengMission = null;
+    try { primengMission = (loadMissions().missions || []).find(m => /primeng/i.test(m.title || '')); } catch { }
+    return {
+        version: 1,
+        projects: [
+            makeProject('jarvis', 'JARVIS core', null),
+            makeProject('primeng', 'PrimeNG 17 → 18', primengMission ? primengMission.id : null),
+            makeProject('waterfall', 'Waterfall Tendering PS-23', null),
+        ],
+    };
+}
+function loadProjects() {
+    if (existsSync(PROJECTS_FILE)) {
+        try {
+            const p = JSON.parse(readFileSync(PROJECTS_FILE, 'utf8'));
+            if (p && Array.isArray(p.projects)) { p.projects = p.projects.map(normalizeProject).filter(Boolean); return p; }
+        } catch { backupCorrupt(PROJECTS_FILE); }   // preserve + alert, don't silently reset
+    }
+    const seeded = seedProjects();
+    try { saveProjects(seeded); } catch { }
+    return seeded;
+}
+function saveProjects(p) {
+    atomicWrite(PROJECTS_FILE, JSON.stringify(p, null, 1));
+}
+function getProject(name) {
+    const n = String(name || '').toLowerCase().trim();
+    if (!n) return null;
+    return (loadProjects().projects || []).find(p => p.name === n) || null;
+}
+// Ensure a project row exists (auto-create the first time a worker registers with that .project).
+// Returns the (possibly newly created) project.
+function ensureProject(name, title) {
+    const n = String(name || '').toLowerCase().trim();
+    if (!n) return null;
+    const store = loadProjects();
+    let p = store.projects.find(x => x.name === n);
+    if (!p) { p = makeProject(n, title || n, null); store.projects.push(p); saveProjects(store); }
+    return p;
+}
+// Append one entry to a project's rebuildable log (append-only, capped) so the next manager can
+// "rebuild the context from what we've been working on recently". Returns false if no such project.
+function appendProjectLog(name, from, note) {
+    const n = String(name || '').toLowerCase().trim();
+    const store = loadProjects();
+    const p = store.projects.find(x => x.name === n);
+    if (!p) return false;
+    p.context.recentLog = pushCapped(p.context.recentLog, { ts: new Date().toISOString(), from: String(from || ''), note: String(note || '') }, PROJECT_LOG_CAP);
+    p.updatedAt = new Date().toISOString();
+    saveProjects(store);
+    return true;
+}
+// Bind/unbind the manager session on a project (set on register, cleared/reassigned on retire).
+function setProjectManager(name, uid) {
+    const n = String(name || '').toLowerCase().trim();
+    const store = loadProjects();
+    const p = store.projects.find(x => x.name === n);
+    if (!p) return false;
+    p.managerUid = uid || null;
+    p.updatedAt = new Date().toISOString();
+    saveProjects(store);
+    return true;
+}
+// Merge curated context fields from a manager checkpoint (only fields actually present are
+// touched); an optional `log` string/entry is appended to the recent-work log. Returns the
+// updated project, or null if unknown.
+function updateProjectContext(name, patch) {
+    const n = String(name || '').toLowerCase().trim();
+    const store = loadProjects();
+    const p = store.projects.find(x => x.name === n);
+    if (!p) return null;
+    const c = p.context;
+    if (patch.summary != null) c.summary = String(patch.summary);
+    if (patch.currentFocus != null) c.currentFocus = String(patch.currentFocus);
+    if (Array.isArray(patch.openThreads)) c.openThreads = patch.openThreads.map(String).map(s => s.trim()).filter(Boolean);
+    if (Array.isArray(patch.docs)) c.docs = patch.docs.map(d => (d && typeof d === 'object') ? { label: String(d.label == null ? (d.url || '') : d.label), url: String(d.url == null ? '' : d.url) } : { label: String(d), url: String(d) });
+    if (patch.status && ['active', 'paused', 'archived'].includes(patch.status)) p.status = patch.status;
+    if (patch.missionId != null) p.missionId = patch.missionId ? String(patch.missionId) : null;
+    const logNote = (patch.log && typeof patch.log === 'object') ? patch.log.note : patch.log;
+    if (logNote != null && String(logNote).trim()) {
+        c.recentLog = pushCapped(c.recentLog, { ts: new Date().toISOString(), from: String((patch.log && patch.log.from) || patch.from || ''), note: String(logNote) }, PROJECT_LOG_CAP);
+    }
+    p.updatedAt = new Date().toISOString();
+    saveProjects(store);
+    return p;
+}
+// Compact per-project view for the console (name/title/status/focus + recent-log tail + mission link).
+function projectsView() {
+    return (loadProjects().projects || []).map(p => ({
+        name: p.name, title: p.title, status: p.status, missionId: p.missionId,
+        managerUid: p.managerUid, updatedAt: p.updatedAt,
+        summary: p.context.summary, currentFocus: p.context.currentFocus,
+        openThreads: p.context.openThreads, docs: p.context.docs,
+        recentLog: (p.context.recentLog || []).slice(-8),
+        workerCount: (p.workers || []).length,
+    }));
+}
+// Compact context view from a project object (pure — no I/O), so the /board hot path can build it
+// from a single loadProjects() instead of re-reading the file per card.
+function compactProjectContext(p) {
+    if (!p) return null;
+    return {
+        name: p.name, title: p.title, status: p.status, missionId: p.missionId,
+        summary: p.context.summary, currentFocus: p.context.currentFocus,
+        openThreads: p.context.openThreads, docs: p.context.docs,
+        recentLog: (p.context.recentLog || []).slice(-8),
+    };
+}
+function projectContextFor(name) {
+    return compactProjectContext(getProject(name));
+}
 // —— Reminders: ad-hoc timed to-dos that live in the calendar next to meetings. Unlike the
 // meeting list (volatile, re-pasted daily, date-gated), a reminder carries an absolute time,
 // survives a schedule re-paste, and announces ONCE when due. The pure parsers (clk, remTitle,
@@ -708,6 +845,10 @@ function registerSession(cwd, purpose, pin, project) {
     const w = loadWork();
     // A project worker binds to the project's durable card/column and gets NO separate card.
     ensureBoard(w, proj || cs);
+    // ...and to the project's durable CONTEXT store: ensure the row exists and claim the manager
+    // role. The boot prompt tells it to rehydrate from GET /project; we also hand the context back
+    // in the register response so it resumes from minute one without a second round-trip.
+    if (proj) { try { ensureProject(proj, purpose); setProjectManager(proj, uid); } catch { } }
     let focusedNote = '';
     if (proj) { w.focus = proj; focusedNote = ' Focused on ' + proj + '.'; }
     else if (liveCallsigns().length === 1) { w.focus = cs; focusedNote = ' Focused on it.'; }
@@ -726,6 +867,7 @@ function registerSession(cwd, purpose, pin, project) {
     roster.handoffs = roster.handoffs || {};
     const h = cwd ? roster.handoffs[cwdKey(cwd)] : null;
     if (h) out.handoff = { summary: h.summary, from: h.from, ts: h.ts, hint: 'GET /handoff?cwd=<your cwd> for full notes, then resume.' };
+    if (proj) { try { out.project = projectContextFor(proj); } catch { } }   // rehydrate on register (model B)
     return out;
 }
 // opts.successor (bool): when true and the session has a cwd+purpose, spawn a fresh
@@ -769,6 +911,13 @@ function retireSession(uid, summary, opts = {}) {
         if (opts.successor && s.cwd && s.purpose) {
             try { psucc = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec, undefined, s.project); } catch { psucc = null; }
         }
+        // Feed the retiring manager's summary into the durable project log so the successor
+        // rebuilds context from recent work, and release the manager slot — the successor re-claims
+        // it when it registers (it hasn't yet; spawnWorker only launches the ConPTY).
+        try {
+            if (s.summary) appendProjectLog(s.project, cs, 'manager retired: ' + s.summary);
+            setProjectManager(s.project, null);
+        } catch { }
         saveWork(w);
         saveRoster();
         record({ kind: 'sys', text: cs + ' (' + s.project + ' worker) retired (' + uid + ')' + (psucc ? ' -> successor ' + psucc : '') });
@@ -957,7 +1106,8 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting) {
     } else {
         boot += ' Then wait for instructions on the poll loop.';
     }
-    if (project) boot += ' You are the ' + project + ' PROJECT worker: your task board IS the ' + project + ' column - use callsign "' + project + '" for every /worklist op (add/start/done/etc), not your own callsign, and speech the human points at ' + project + ' arrives on your poll loop. When you must hand off, /retire with successor:true so a fresh ' + project + ' worker takes over.';
+    if (project) boot += ' You are the ' + project + ' PROJECT worker: your task board IS the ' + project + ' column - use callsign "' + project + '" for every /worklist op (add/start/done/etc), not your own callsign, and speech the human points at ' + project + ' arrives on your poll loop. When you must hand off, /retire with successor:true so a fresh ' + project + ' worker takes over.'
+        + ' You are also this project\'s persistent MANAGER: the project owns a durable context store. The moment you register, GET http://127.0.0.1:' + PORT + '/project?name=' + project + ' to rehydrate that context (summary, current focus, open threads, recent-work log, doc links) and RESUME from it - do not start cold. As the project moves, keep it current so the next manager rebuilds from recent work: POST http://127.0.0.1:' + PORT + '/project-context {"name":"' + project + '","summary":"...","currentFocus":"...","openThreads":[...],"log":"one line of what just happened"} (send only the fields that changed; log entries are append-only and capped).';
     if (meeting && meeting.title) {
         boot += ' You are a MEETING worker for "' + meeting.title + '"' + (meeting.start && meeting.end ? ' (' + meeting.start + ' to ' + meeting.end + ')' : '') + '. Assist Chris live during this call: capture decisions and action items, draft Jira items when he asks, and pull up references.';
         if (meeting.join) boot += ' Meet link: ' + meeting.join + '.';
@@ -1511,6 +1661,7 @@ async function handleRequest(req, res) {
     if (key === 'GET /worklist') return json(res, 200, loadWork());
     if (key === 'GET /board') {
         const w = loadWork();
+        const projById = {}; for (const p of (loadProjects().projects || [])) projById[p.name] = p;   // one read per /board, not per card
         const lives = liveCallsigns().filter(c => !(roster.sessions[liveUidOf(c)] || {}).project);
         const order = [w.focus, ...lives.filter(cs => cs !== w.focus), ...(w.focus === 'jarvis' ? [] : ['jarvis'])];
         const extras = Object.keys(w.sessions).filter(cs => !order.includes(cs));
@@ -1534,12 +1685,32 @@ async function handleRequest(req, res) {
                 voiceMuted: uid ? !!roster.sessions[uid].voiceMuted : false,
                 pendingPerm: pends[0] ? { id: pends[0].id, tool: pends[0].tool, detail: pends[0].detail, klass: pends[0].klass || 'neutral', label: permLabel(pends[0].tool, pends[0].detail) } : null,
                 pendingPermCount: pends.length,
+                // Durable project context for a project card (jarvis, primeng, ...); null for a
+                // plain NATO worker card. Lets the console show what the project stands on.
+                projectContext: compactProjectContext(projById[cs] || null),
                 working: b.working, queued: b.queued, done: b.done, review: b.review || [],
             };
         });
         return json(res, 200, { focus: w.focus, muted, paused: discard, sttBackend, sttReady: stt.isReady(), boards, awayUntil: roster.awayUntil || 0, missions: activeMissionsView() });
     }
     if (key === 'GET /missions') return json(res, 200, loadMissions());
+    if (key === 'GET /projects') return json(res, 200, { projects: projectsView() });
+    if (key === 'GET /project') {
+        // A manager rehydrates its durable project context on boot from here (model B).
+        const name = String(u.searchParams.get('name') || '').trim();
+        const p = projectContextFor(name);
+        if (!p) return json(res, 404, { error: 'no project ' + name });
+        return json(res, 200, p);
+    }
+    if (key === 'POST /project-context') {
+        // A manager checkpoints its curated context + appends a recent-work log line.
+        const b = await readBody(req);
+        const name = String(b.name || '').toLowerCase().trim();
+        if (!name) return json(res, 400, { error: 'name is required' });
+        const p = updateProjectContext(name, b);
+        if (!p) return json(res, 404, { error: 'no project ' + name });
+        return json(res, 200, { ok: true, project: projectContextFor(name) });
+    }
     if (key === 'GET /roster') {
         const live = liveCallsigns().map(cs => {
             const uid = liveUidOf(cs);
