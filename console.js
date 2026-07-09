@@ -1439,14 +1439,37 @@ startRec();
 // result, so mute, INSTANT commands, TTS-echo rejection, and the 2.5s merge all behave identically.
 let localCap = null;         // { stream, ac, node, src } while capturing, else null
 let sttErrToasted = false;   // only nag once per outage, reset on the next success
-function pushFinalLocal(t) {
-    if (!t) return;
+// Local STT reassembles utterances through an ordered queue. The VAD stamps each utterance a
+// sequence number at end-of-speech (the true spoken order), but whisper transcriptions come back
+// at variable latency and can finish out of order. We hold each completed transcription until every
+// earlier one has arrived, then feed them to the shared buffer in spoken order — and we never let
+// the 2.5s merge timer fire while a transcription is still in flight. Those two races (out-of-order
+// POSTs, and the merge beating a slow transcription) were what dropped / garbled / split spoken input.
+let sttSeq = 0;             // last utterance number handed out (spoken order)
+let sttNextEmit = 1;        // next seq allowed to reach the buffer
+let sttInFlight = 0;        // utterances captured but not yet transcribed
+let sttGen = 0;             // bumped on start/stop to void in-flight results from a prior capture
+const sttDone = new Map();  // seq -> transcribed text, waiting for earlier seqs to drain
+function resetSttQueue() { sttSeq = 0; sttNextEmit = 1; sttInFlight = 0; sttDone.clear(); sttGen++; }
+// Append one in-order transcribed utterance to the shared buffer — TTS-echo drop + INSTANT handling
+// identical to a cloud final. Empty strings never reach here; they only advance the queue.
+function appendLocal(t) {
     if (speaking) { if (!isNovelSpeech(t)) return; speechSynthesis.cancel(); }  // drop our own TTS echo; allow barge-in
     buf.push(t);
     const joined = buf.join(' ');
     if (INSTANT.some(re => re.test(joined))) { flushBuf(); return; }
     setInterim(joined + ' …');
-    armFlush();
+}
+function emitLocal(seq, text) {
+    sttDone.set(seq, text);
+    while (sttDone.has(sttNextEmit)) {   // drain every consecutive completed utterance, in spoken order
+        const t = sttDone.get(sttNextEmit); sttDone.delete(sttNextEmit); sttNextEmit++;
+        if (t) appendLocal(t);
+    }
+    // Arm the merge only when the queue is quiet: nothing left to transcribe and no earlier gap. A
+    // newly captured utterance clears this timer again (see finalizeUtterance), so a burst of speech
+    // merges into one message instead of racing whisper's per-utterance latency.
+    if (sttInFlight === 0 && sttDone.size === 0 && buf.length) armFlush();
 }
 async function startLocalCapture() {
     if (localCap || stopped) return;
@@ -1454,6 +1477,7 @@ async function startLocalCapture() {
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
     catch (e) { if (typeof uiToast === 'function') uiToast('Local STT: mic access failed (' + e.name + ')', 'error'); return; }
     if (sttBackend !== 'local' || stopped) { stream.getTracks().forEach(t => t.stop()); return; }
+    resetSttQueue();   // fresh ordered queue for this capture; voids any straggler from a prior session
     const ac = new (window.AudioContext || window.webkitAudioContext)();
     const src = ac.createMediaStreamSource(stream);
     const node = ac.createScriptProcessor(4096, 1, 1);   // deprecated but ubiquitous; we never fill
@@ -1480,25 +1504,29 @@ async function startLocalCapture() {
 function stopLocalCapture() {
     if (!localCap) return;
     const { stream, ac, node, src } = localCap; localCap = null;
+    sttGen++;   // void any in-flight transcription so a late result can't inject after we stop/switch
     try { node.disconnect(); } catch { }
     try { src.disconnect(); } catch { }
     try { stream.getTracks().forEach(t => t.stop()); } catch { }
     try { ac.close(); } catch { }
 }
 async function finalizeUtterance(frames, inRate) {
+    const gen = sttGen, seq = ++sttSeq;   // stamp the spoken order NOW, before the async round-trip
+    sttInFlight++;
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }  // fresh speech captured — hold any pending merge
     const wav = encodeWav16k(frames, inRate);
     let text = '';
     try {
         const r = await fetch('/stt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ audio: bytesToB64(wav) }) });
-        if (!r.ok) {
+        if (r.ok) { sttErrToasted = false; text = (await r.json()).text || ''; }
+        else {
             const j = await r.json().catch(() => ({}));
             if (!sttErrToasted && typeof uiToast === 'function') { uiToast('Local STT unavailable: ' + (j.error || r.status), 'error'); sttErrToasted = true; }
-            return;
         }
-        sttErrToasted = false;
-        text = (await r.json()).text || '';
-    } catch { return; }
-    if (text) pushFinalLocal(text);
+    } catch { /* network/hub blip — fall through and emit empty so the queue can't stall on this seq */ }
+    if (gen !== sttGen) return;   // capture was stopped/switched while we waited; drop the stale result
+    sttInFlight--;
+    emitLocal(seq, text);         // even '' advances the queue so a later utterance isn't blocked forever
 }
 // Merge Float32 frames captured at inRate, downsample to 16 kHz mono, encode a PCM16 WAV. -> Uint8Array
 function encodeWav16k(frames, inRate) {
