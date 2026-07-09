@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -410,19 +410,11 @@ function newMissionId() {
     return 'm_' + Date.now().toString(36) + (missionSeq++).toString(36) + Math.random().toString(36).slice(2, 4);
 }
 function makeMission(title, phases, docs) {
-    return {
-        id: newMissionId(),
-        title: String(title == null ? '' : title).trim(),
-        phases: (Array.isArray(phases) ? phases : []).map(p => (p && typeof p === 'object')
-            ? { text: String(p.text == null ? '' : p.text), done: !!p.done }
-            : { text: String(p), done: false }),
-        docs: (Array.isArray(docs) ? docs : []).map(d => (d && typeof d === 'object')
-            ? { label: String(d.label == null ? (d.url || '') : d.label), url: String(d.url == null ? '' : d.url) }
-            : { label: String(d), url: String(d) }),
-        status: 'active',
-        createdAt: new Date().toISOString(),
-        archivedAt: null,
-    };
+    // Pure shaping lives in jarvis-text.mjs (normalizeMission); the hub stamps the one non-pure
+    // field — a fresh creation timestamp — here.
+    const m = normalizeMission({ title, phases, docs }, newMissionId());
+    m.createdAt = new Date().toISOString();
+    return m;
 }
 // One-time seed: Chris's first mission (his ask 2026-06-29). Only used when missions.json is absent.
 function seedMissions() {
@@ -450,11 +442,7 @@ function loadMissions() {
 function saveMissions(m) {
     atomicWrite(MISSIONS, JSON.stringify(m, null, 1));
 }
-function missionProgress(mn) {
-    const ph = mn.phases || [];
-    if (!ph.length) return 0;
-    return Math.round(ph.filter(p => p.done).length / ph.length * 100);
-}
+// missionProgress is pure (imported from jarvis-text.mjs).
 // Active missions, decorated with derived progress, for the console rail.
 function activeMissionsView() {
     return (loadMissions().missions || [])
@@ -1209,7 +1197,7 @@ function handleUtterance(rawText, typed) {
     // stray "mission accomplished" can't wipe a long-running objective; creating one is a single
     // phrase. ——
     if (pendingMissionClose && Date.now() < pendingMissionClose.until) {
-        if (/\b(ye(s|ah|p)|confirm(ed)?|do it|affirmative|i'?m sure|absolutely|aye)\b/.test(lower)) {
+        if (isMissionConfirm(lower)) {
             const mm = loadMissions();
             const mn = (mm.missions || []).find(x => x.id === pendingMissionClose.id && x.status === 'active');
             const title = pendingMissionClose.title; pendingMissionClose = null;
@@ -1220,7 +1208,7 @@ function handleUtterance(rawText, typed) {
             } else enqueueSay('That mission is already closed.', 'jarvis');
             return;
         }
-        if (/\b(no|nope|cancel|stop|never ?mind|not yet|hold on|wait)\b/.test(lower)) {
+        if (isMissionCancel(lower)) {
             const title = pendingMissionClose.title; pendingMissionClose = null;
             record({ kind: 'sys', text: 'mission close cancelled: ' + title });
             enqueueSay('Okay, leaving it open.', 'jarvis');
@@ -1228,11 +1216,10 @@ function handleUtterance(rawText, typed) {
         }
         pendingMissionClose = null;   // anything else: drop the gate, don't trap unrelated speech
     }
-    if (/\bmission accomplished\b|\b(close|complete|finish|archive) (the |this )?mission\b/.test(lower)) {
+    if (isMissionCloseIntent(lower)) {
         const act = (loadMissions().missions || []).filter(x => x.status === 'active');
         if (!act.length) { enqueueSay('There are no active missions.', 'jarvis'); return; }
-        const target = act.length === 1 ? act[0]
-            : act.find(x => x.title && lower.includes(x.title.toLowerCase().split(/[\s→>\-]+/)[0]));
+        const target = matchMissionByPhrase(act, lower);
         if (!target) { enqueueSay('Which mission? You have ' + act.length + ' active. Name it, then say mission accomplished.', 'jarvis'); return; }
         pendingMissionClose = { id: target.id, title: target.title, until: Date.now() + 60000 };
         record({ kind: 'sys', text: 'mission close requested: ' + target.title });
@@ -1240,12 +1227,11 @@ function handleUtterance(rawText, typed) {
         return;
     }
     {
-        const nm = /^(?:jarvis[\s,.!]+)?(?:new|start|begin|create|add) (?:a )?mission[:\s]+(.+)$/i.exec(text.trim());
-        if (nm) {
-            const title = nm[1].trim();
-            if (title) {
+        const nmTitle = parseNewMissionTitle(text);
+        if (nmTitle !== null) {
+            if (nmTitle) {
                 const mm = loadMissions();
-                const created = makeMission(title, [], []);
+                const created = makeMission(nmTitle, [], []);
                 mm.missions.push(created); saveMissions(mm);
                 record({ kind: 'sys', text: 'mission created: ' + created.title });
                 enqueueSay('New mission: ' + created.title + '. Pinned to the rail.', 'jarvis');

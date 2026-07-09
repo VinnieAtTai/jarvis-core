@@ -310,3 +310,74 @@ export function pushCapped(arr, entry, cap = PROJECT_LOG_CAP) {
     next.push(entry);
     return next.length > cap ? next.slice(next.length - cap) : next;
 }
+
+// —— Missions (persistent, voice-gated objective tracker). The pure shape + phrase helpers live
+// here so they unit-test without booting the hub; the file I/O, id/timestamp stamping, and the
+// voice state machine stay in jarvis-core.mjs. Closing a mission is a two-step spoken gate
+// ("mission accomplished" -> "yes"), so the phrase predicates below are the safety-critical bits
+// most worth testing in isolation.
+
+// Coerce a raw mission into the canonical shape: trimmed title, phases as {text,done}, docs as
+// {label,url}, status restricted to active|archived. Pure — never invents timestamps (createdAt/
+// archivedAt are preserved as-is; the caller stamps a fresh mission), keeps an existing `id` else
+// falls back to the supplied one, and returns null only for a non-object so a junk row is dropped
+// rather than half-shaped. Lenient on an empty title (the /mission add endpoint rejects those with
+// a 400; a transient blank must not collapse to null).
+export function normalizeMission(raw, fallbackId) {
+    if (!raw || typeof raw !== 'object') return null;
+    const id = (typeof raw.id === 'string' && raw.id.trim()) ? raw.id : String(fallbackId == null ? '' : fallbackId);
+    const phases = (Array.isArray(raw.phases) ? raw.phases : []).map(p => (p && typeof p === 'object')
+        ? { text: String(p.text == null ? '' : p.text), done: !!p.done }
+        : { text: String(p), done: false });
+    const docs = (Array.isArray(raw.docs) ? raw.docs : []).map(d => (d && typeof d === 'object')
+        ? { label: String(d.label == null ? (d.url || '') : d.label), url: String(d.url == null ? '' : d.url) }
+        : { label: String(d), url: String(d) });
+    return {
+        id,
+        title: String(raw.title == null ? '' : raw.title).trim(),
+        phases,
+        docs,
+        status: raw.status === 'archived' ? 'archived' : 'active',
+        createdAt: String(raw.createdAt == null ? '' : raw.createdAt),
+        archivedAt: raw.archivedAt == null ? null : String(raw.archivedAt),
+    };
+}
+
+// Percent of a mission's phases that are done (0 when it has none). Pure.
+export function missionProgress(mn) {
+    const ph = (mn && Array.isArray(mn.phases)) ? mn.phases : [];
+    if (!ph.length) return 0;
+    return Math.round(ph.filter(p => p.done).length / ph.length * 100);
+}
+
+// —— Voice-gate phrase predicates. These operate on already-canonicalized lowercase speech, except
+// parseNewMissionTitle which takes the raw text so it can keep the spoken title's casing. The
+// regexes are copied verbatim from the handleUtterance gate so spoken behavior is unchanged —
+// extracted only so the gate can be tested without the server.
+
+// "mission accomplished" / "close|complete|finish|archive [the|this] mission" — arms the close gate.
+export function isMissionCloseIntent(lower) {
+    return /\bmission accomplished\b|\b(close|complete|finish|archive) (the |this )?mission\b/.test(String(lower == null ? '' : lower));
+}
+// Affirmative confirmation of an armed close gate.
+export function isMissionConfirm(lower) {
+    return /\b(ye(s|ah|p)|confirm(ed)?|do it|affirmative|i'?m sure|absolutely|aye)\b/.test(String(lower == null ? '' : lower));
+}
+// Explicit cancel of an armed close gate.
+export function isMissionCancel(lower) {
+    return /\b(no|nope|cancel|stop|never ?mind|not yet|hold on|wait)\b/.test(String(lower == null ? '' : lower));
+}
+// "new|start|begin|create|add [a] mission: <title>" — returns the trimmed title, or null when the
+// phrase isn't a mission-create. An empty string means the phrase matched but named nothing.
+export function parseNewMissionTitle(text) {
+    const m = /^(?:jarvis[\s,.!]+)?(?:new|start|begin|create|add) (?:a )?mission[:\s]+(.+)$/i.exec(String(text == null ? '' : text).trim());
+    return m ? m[1].trim() : null;
+}
+// Which active mission a spoken close refers to: the only one when a single mission is active, else
+// the first whose title's leading word appears in the utterance. null when nothing matches.
+export function matchMissionByPhrase(active, lower) {
+    const list = Array.isArray(active) ? active : [];
+    if (list.length === 1) return list[0];
+    const l = String(lower == null ? '' : lower);
+    return list.find(x => x && x.title && l.includes(String(x.title).toLowerCase().split(/[\s→>\-]+/)[0])) || null;
+}
