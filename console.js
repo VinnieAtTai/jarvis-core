@@ -657,7 +657,10 @@ function renderBoards(d) {
             let h = vis.map((it, j) => item(it, list, mark, _laneOff[list] + j + 1)).join('');
             if (items.length > cap) {
                 const label = open ? '&#9662; less' : '&#9656; ' + (cap ? (items.length - cap) + ' more ' + list : items.length + ' ' + list);
-                h += '<div class="ctoggle" data-x="' + cs + ':' + list + '">' + label + '</div>';
+                // Toggle rides at the TOP of the lane so it never moves: you expand and collapse from
+                // the same spot. Before, "less" sat below the list, so collapsing an expanded lane
+                // (esp. the long done history) meant scrolling all the way to the bottom to find it.
+                h = '<div class="ctoggle" data-x="' + cs + ':' + list + '">' + label + '</div>' + h;
             }
             return h;
         };
