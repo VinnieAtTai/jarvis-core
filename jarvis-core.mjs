@@ -1709,7 +1709,37 @@ async function handleRequest(req, res) {
         // live worker keeps its NATO callsign; it just re-anchors its /worklist ops to the new key.
         const b = await readBody(req);
         const op = String(b.op || '').toLowerCase();
-        if (op !== 'rename') return json(res, 400, { error: 'op must be rename' });
+        if (op === 'bind') {
+            // Attach an ALREADY-LIVE worker to a project so its board + routing fold into the
+            // project card and it nests under the project's mission — the live-session analogue of
+            // spawning with a project (model B). Targets by uid or callsign; the project must exist.
+            // Its NATO board key is migrated into the project column so it does not orphan as a
+            // second ghost card; the session keeps its NATO callsign for the permission hook.
+            const project = String(b.project || '').toLowerCase().trim();
+            if (!project) return json(res, 400, { error: 'bind needs project' });
+            if (!loadProjects().projects.some(x => x.name === project)) return json(res, 404, { error: 'no project ' + project });
+            let bindUid = (b.uid && roster.sessions[b.uid] && !roster.sessions[b.uid].ended) ? b.uid : null;
+            if (!bindUid && b.callsign) bindUid = liveUidOf(String(b.callsign).toLowerCase());
+            const bs = bindUid ? roster.sessions[bindUid] : null;
+            if (!bs || bs.ended) return json(res, 404, { error: 'no live session for that uid/callsign' });
+            const fromKey = bs.callsign;
+            bs.project = project;
+            saveRoster();
+            const wb = loadWork();
+            if (wb.sessions && wb.sessions[fromKey] && fromKey !== project) {
+                const dst = ensureBoard(wb, project), src = wb.sessions[fromKey];
+                for (const col of ['working', 'queued', 'done', 'review']) {
+                    for (const t of (src[col] || [])) if (!dst[col].some(x => textOf(x) === textOf(t))) dst[col].push(t);
+                }
+                delete wb.sessions[fromKey];
+                if (wb.focus === fromKey) wb.focus = project;
+                saveWork(wb);
+            }
+            record({ kind: 'sys', text: bs.callsign + ' bound to project ' + project });
+            enqueueSay(bs.callsign + ' is now on ' + project + '.', 'jarvis');
+            return json(res, 200, { ok: true, uid: bindUid, callsign: bs.callsign, project, projectContext: projectContextFor(project) });
+        }
+        if (op !== 'rename') return json(res, 400, { error: 'op must be rename or bind' });
         const from = String(b.from || '').toLowerCase().trim();
         const to = String(b.to || '').toLowerCase().trim().replace(/[^a-z0-9-]/g, '');
         if (!from || !to) return json(res, 400, { error: 'rename needs from and to' });
