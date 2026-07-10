@@ -434,3 +434,12 @@ export function orderedTasks(board) {
     }
     return out;
 }
+
+// Reverse of the mission<->project link: the project that hosts a mission's coordinator. Missions
+// point nowhere; projects carry project.missionId, so this scans projects for the match. Returns
+// the first matching project object or null. Used to route "talk to the mission" -> its manager.
+export function projectForMission(projects, missionId) {
+    if (!missionId) return null;
+    const list = Array.isArray(projects) ? projects : [];
+    return list.find(p => p && p.missionId === missionId) || null;
+}

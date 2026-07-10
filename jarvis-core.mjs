@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -942,6 +942,29 @@ function routeTo(cs, msg) {
     }
     return true;
 }
+// Route a message to a MISSION rather than a single session. The mission conversation is the
+// durable, mission-keyed thread Chris talks into: it is always persisted (tagged with missionId)
+// so it survives sub-workers retiring and respawning, whether or not a coordinator is live right
+// now. If the mission's linked project has a live manager, the message is also bused to it so the
+// coordinator can act + dispatch to its sub-workers. Returns false only for an unknown mission.
+function routeToMission(missionId, text) {
+    const mm = loadMissions();
+    const mn = (mm.missions || []).find(x => x.id === missionId);
+    if (!mn) return false;
+    record({ kind: 'speech', text, to: 'm:' + missionId, missionId, mission: mn.title });
+    const proj = projectForMission(loadProjects().projects || [], missionId);
+    const uid = proj ? projectWorkerUid(proj.name) : null;
+    if (uid) {
+        busAppend({ from: 'human', to: uid, kind: 'speech', text, missionId }, SPEECH_DEBOUNCE);
+        if (roster.sessions[uid] && roster.sessions[uid].needsYou) {
+            roster.sessions[uid].needsYou = false;
+            saveRoster();
+        }
+    }
+    // No live coordinator: the message is persisted to the mission thread above; the next
+    // coordinator rehydrates it on boot. (T2 will auto-revive the coordinator right here.)
+    return true;
+}
 function findRepo(spoken) {
     const repos = loadRepos();
     const clean = spoken.toLowerCase().replace(/\b(the|a|an|repo|repository|project|folder|workspace)\b/g, ' ').replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
@@ -1563,6 +1586,19 @@ function handleUtterance(rawText, typed) {
         enqueueSay(spoken ? prefix + spoken : prefix + 'The list is empty.', 'jarvis');
         return;
     }
+    // "on mission <id-or-title>, <text>" — the human is talking TO a mission (typed from a mission
+    // tab or the send-to dropdown). Resolve to the mission thread + its coordinator and never drop,
+    // even with no live worker. Must precede the generic "on <word>" parse below ("mission" is not
+    // a callsign, so it would otherwise fall through).
+    if ((m = canon(text).match(/^on\s+mission\s+(\S+?)[\s,.!]+(.+)$/i))) {
+        const token = m[1].replace(/^m:/i, '');
+        const body = m[2].trim();
+        const all = loadMissions().missions || [];
+        const mn = all.find(x => x.id === token) || matchMissionByPhrase(all.filter(x => x.status === 'active'), (token + ' ' + body).toLowerCase());
+        if (mn) { routeToMission(mn.id, body); return; }
+        enqueueSay('I do not have a mission matching ' + m[1] + '.', 'jarvis');
+        return;
+    }
     if ((m = canon(text).match(/^on\s+(\S+)[\s,.!]+(.+)$/i))) {
         const cs = csFrom(m[1]);
         if (cs && cs !== 'jarvis') { routeTo(cs, m[2].trim()); return; }
@@ -1897,11 +1933,40 @@ async function handleRequest(req, res) {
             kind: e.kind === 'sys' ? 'sys' : e.kind === 'react' ? 'react' : 'msg',
             who: e.kind === 'speech' ? 'you' : e.kind === 'sys' ? 'sys' : (e.from || 'jarvis'),
             to: e.to || null,
+            missionId: e.missionId || null,
             img: e.img || null,
             text: e.text,
             ...(e.kind === 'react' ? { target: e.target, reaction: e.reaction } : {}),
         }));
         return json(res, 200, lim > 0 ? evts.slice(-lim) : evts);
+    }
+    // The durable, mission-keyed conversation thread: every event tagged with this missionId, plus
+    // any message bused to a worker currently bound to the mission's project. Survives sub-worker
+    // turnover because it is keyed by the mission, not by any one callsign.
+    if (key === 'GET /mission-chat') {
+        const id = String(u.searchParams.get('missionId') || '').trim();
+        const lim = Number(u.searchParams.get('limit') || 200);
+        if (!id) return json(res, 400, { error: 'missionId required' });
+        const proj = projectForMission(loadProjects().projects || [], id);
+        const memberUids = new Set();
+        for (const uid in roster.sessions) {
+            const s = roster.sessions[uid];
+            if (s && proj && s.project === proj.name) memberUids.add(uid);
+        }
+        const memberCs = new Set([...memberUids].map(uid => roster.sessions[uid].callsign).filter(Boolean));
+        const kinds = { speech: 1, tts: 1, chat: 1 };
+        const evts = transcriptCache.filter(e =>
+            kinds[e.kind] && (e.missionId === id || memberCs.has(e.from) || (e.to && memberCs.has(e.to)))
+        ).map(e => ({
+            ts: e.ts,
+            kind: 'msg',
+            who: e.kind === 'speech' ? 'you' : (e.from || 'jarvis'),
+            to: e.to || null,
+            missionId: e.missionId || null,
+            img: e.img || null,
+            text: e.text,
+        }));
+        return json(res, 200, { missionId: id, project: proj ? proj.name : null, messages: lim > 0 ? evts.slice(-lim) : evts });
     }
     if (key === 'GET /tokens') {
         return json(res, 200, tokenStats);

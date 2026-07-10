@@ -2,7 +2,7 @@
 // No server boot, no I/O — these import the real functions the hub uses.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { clk, remTitle, parseReminder, parseScheduleText, shortTitle, summarizeBoard, permSig, permLabel, canon, orderedTasks } from '../jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, shortTitle, summarizeBoard, permSig, permLabel, canon, orderedTasks, projectForMission } from '../jarvis-text.mjs';
 
 const minutesFromNow = iso => (Date.parse(iso) - Date.now()) / 60000;
 
@@ -208,4 +208,31 @@ test('orderedTasks — flattens lanes in display order with lane + index', () =>
 
 test('orderedTasks — missing lanes are treated as empty', () => {
     assert.deepEqual(orderedTasks({ working: [{ text: 'only' }] }).map(o => o.item.text), ['only']);
+});
+
+test('projectForMission — finds the project whose missionId matches', () => {
+    const projects = [
+        { name: 'jarvis', missionId: null },
+        { name: 'primeng', missionId: 'm_abc' },
+        { name: 'waterfall', missionId: 'm_xyz' },
+    ];
+    assert.equal(projectForMission(projects, 'm_abc').name, 'primeng');
+    assert.equal(projectForMission(projects, 'm_xyz').name, 'waterfall');
+});
+
+test('projectForMission — no match / no id / bad input yields null', () => {
+    const projects = [{ name: 'primeng', missionId: 'm_abc' }];
+    assert.equal(projectForMission(projects, 'm_nope'), null);
+    assert.equal(projectForMission(projects, ''), null);
+    assert.equal(projectForMission(projects, null), null);
+    assert.equal(projectForMission(null, 'm_abc'), null);
+    assert.equal(projectForMission(undefined, 'm_abc'), null);
+});
+
+test('projectForMission — returns the FIRST project when several link the same mission', () => {
+    const projects = [
+        { name: 'first', missionId: 'm_shared' },
+        { name: 'second', missionId: 'm_shared' },
+    ];
+    assert.equal(projectForMission(projects, 'm_shared').name, 'first');
 });
