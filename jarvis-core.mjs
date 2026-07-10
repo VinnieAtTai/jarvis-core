@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -107,25 +107,6 @@ const sayQueue = [];
 const pendingPerms = new Map();
 let permSeq = 0;
 const pendingTier = new Map();
-const PERM_MULTIWORD = new Set(['git', 'npm', 'pnpm', 'yarn', 'dotnet', 'ng', 'npx', 'node', 'python', 'python3', 'pip', 'go', 'cargo', 'docker', 'kubectl', 'powershell']);
-// A coarse signature so one "Always" covers a whole command family: Bash/PowerShell collapse to
-// their leading verb ("git show abc" -> "Bash::git show"); other tools collapse to the tool name.
-function permSig(tool, detail) {
-    if (tool === 'Bash' || tool === 'PowerShell') {
-        const toks = String(detail || '').trim().split(/\s+/);
-        const n = PERM_MULTIWORD.has((toks[0] || '').toLowerCase()) ? 2 : 1;
-        return tool + '::' + toks.slice(0, n).join(' ').toLowerCase();
-    }
-    return tool + '::*';
-}
-function permLabel(tool, detail) {
-    if (tool === 'Bash' || tool === 'PowerShell') {
-        const toks = String(detail || '').trim().split(/\s+/);
-        const n = PERM_MULTIWORD.has((toks[0] || '').toLowerCase()) ? 2 : 1;
-        return toks.slice(0, n).join(' ') + ' *';
-    }
-    return tool;
-}
 let discard = false, meetingMode = false, running = true;
 let screenGrant = 0;
 let muted = false, autoMutedBy = null, consolePageRef = null;
@@ -673,15 +654,6 @@ async function callAnthropic(model, messages) {
     return { text, inTok: u.input_tokens || 0, outTok: u.output_tokens || 0, stop: data.stop_reason };
 }
 
-// Display-order task list for a session (matches the console card: review -> working -> queued
-// -> done). The position in this array is the 1-based index the human sees and speaks.
-function orderedTasks(board) {
-    const out = [];
-    for (const list of ['review', 'working', 'queued', 'done']) {
-        (board[list] || []).forEach((item, i) => out.push({ item, list, i }));
-    }
-    return out;
-}
 const NUMWORDS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
 const IDX_FILLER = new Set(['item', 'number', 'no', 'task', 'the', 'on', 'to']);
 function liveUidOf(cs) {
@@ -727,9 +699,6 @@ function csFrom(word) {
     const n = word.toLowerCase().replace(/[^a-z]/g, '');
     if (n === 'jarvis') return 'jarvis';
     return liveUidOf(n) ? n : null;
-}
-function canon(s) {
-    return s.replace(/\bx[\s-]ray\b/gi, 'xray').replace(/\bjuliette\b/gi, 'juliet');
 }
 const pendingPins = new Map();
 function assignCallsign(pin) {

@@ -396,3 +396,41 @@ export function matchMissionByPhrase(active, lower) {
     const l = String(lower == null ? '' : lower);
     return list.find(x => x && x.title && l.includes(String(x.title).toLowerCase().split(/[\s→>\-]+/)[0])) || null;
 }
+
+// Command families where the second word is the real verb, so one "Always" covers the family
+// ("git show" / "npm run") rather than every distinct argument list.
+export const PERM_MULTIWORD = new Set(['git', 'npm', 'pnpm', 'yarn', 'dotnet', 'ng', 'npx', 'node', 'python', 'python3', 'pip', 'go', 'cargo', 'docker', 'kubectl', 'powershell']);
+// A coarse signature so one "Always" covers a whole command family: Bash/PowerShell collapse to
+// their leading verb ("git show abc" -> "Bash::git show"); other tools collapse to the tool name.
+export function permSig(tool, detail) {
+    if (tool === 'Bash' || tool === 'PowerShell') {
+        const toks = String(detail || '').trim().split(/\s+/);
+        const n = PERM_MULTIWORD.has((toks[0] || '').toLowerCase()) ? 2 : 1;
+        return tool + '::' + toks.slice(0, n).join(' ').toLowerCase();
+    }
+    return tool + '::*';
+}
+// Human-readable label for a permission family ("git show *" / "Bash").
+export function permLabel(tool, detail) {
+    if (tool === 'Bash' || tool === 'PowerShell') {
+        const toks = String(detail || '').trim().split(/\s+/);
+        const n = PERM_MULTIWORD.has((toks[0] || '').toLowerCase()) ? 2 : 1;
+        return toks.slice(0, n).join(' ') + ' *';
+    }
+    return tool;
+}
+
+// Normalize the NATO aliases STT commonly mangles (x-ray / x ray -> xray, juliette -> juliet).
+export function canon(s) {
+    return s.replace(/\bx[\s-]ray\b/gi, 'xray').replace(/\bjuliette\b/gi, 'juliet');
+}
+
+// Display-order task list for a session (matches the console card: review -> working -> queued
+// -> done). The position in this array is the 1-based index the human sees and speaks.
+export function orderedTasks(board) {
+    const out = [];
+    for (const list of ['review', 'working', 'queued', 'done']) {
+        (board[list] || []).forEach((item, i) => out.push({ item, list, i }));
+    }
+    return out;
+}

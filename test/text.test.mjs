@@ -2,7 +2,7 @@
 // No server boot, no I/O — these import the real functions the hub uses.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { clk, remTitle, parseReminder, parseScheduleText, shortTitle, summarizeBoard } from '../jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, shortTitle, summarizeBoard, permSig, permLabel, canon, orderedTasks } from '../jarvis-text.mjs';
 
 const minutesFromNow = iso => (Date.parse(iso) - Date.now()) / 60000;
 
@@ -172,4 +172,40 @@ test('summarizeBoard — tolerates legacy string tasks and blank entries', () =>
     assert.equal(summarizeBoard({ working: ['legacy string task'], queued: [] }), 'Working on legacy string task.');
     // blank-text tasks do not count toward the summary
     assert.equal(summarizeBoard({ working: [{ text: '' }, { text: '   ' }], queued: [{ text: 'real one' }] }), '1 queued, real one.');
+});
+
+test('permSig — Bash single-word command collapses to one verb', () => {
+    assert.equal(permSig('Bash', 'ls -la'), 'Bash::ls');
+});
+
+test('permSig — multiword family keeps two leading words, lowercased', () => {
+    assert.equal(permSig('Bash', 'git SHOW abc123'), 'Bash::git show');
+    assert.equal(permSig('PowerShell', 'npm run build'), 'PowerShell::npm run');
+});
+
+test('permSig — non-shell tools collapse to the tool name', () => {
+    assert.equal(permSig('Read', '/etc/hosts'), 'Read::*');
+});
+
+test('permLabel — shell families get a trailing wildcard, non-shell just the tool', () => {
+    assert.equal(permLabel('Bash', 'git show abc'), 'git show *');
+    assert.equal(permLabel('Bash', 'ls -la'), 'ls *');
+    assert.equal(permLabel('Edit', 'foo.js'), 'Edit');
+});
+
+test('canon — normalizes the NATO aliases STT mangles', () => {
+    assert.equal(canon('tell x-ray and x ray and juliette'), 'tell xray and xray and juliet');
+    assert.equal(canon('no aliases here'), 'no aliases here');
+});
+
+test('orderedTasks — flattens lanes in display order with lane + index', () => {
+    const board = { working: [{ text: 'w0' }], queued: [{ text: 'q0' }, { text: 'q1' }], done: [{ text: 'd0' }], review: [{ text: 'r0' }] };
+    const ord = orderedTasks(board);
+    assert.deepEqual(ord.map(o => o.list), ['review', 'working', 'queued', 'queued', 'done']);
+    assert.deepEqual(ord.map(o => o.item.text), ['r0', 'w0', 'q0', 'q1', 'd0']);
+    assert.equal(ord[2].i, 0); // first queued keeps its within-lane index
+});
+
+test('orderedTasks — missing lanes are treated as empty', () => {
+    assert.deepEqual(orderedTasks({ working: [{ text: 'only' }] }).map(o => o.item.text), ['only']);
 });
