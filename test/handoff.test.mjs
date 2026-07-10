@@ -4,7 +4,7 @@
 // successor decision and board-transfer accounting are exercised exactly as retireSession sees them.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cwdKey, shouldSpawnSuccessor, boardHasWork, transferBoard } from '../jarvis-text.mjs';
+import { cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard } from '../jarvis-text.mjs';
 
 // A v3 task object, shaped like the ones on the board.
 const task = (id, text) => ({ id, text, addedAt: 'STAMP' });
@@ -21,6 +21,46 @@ test('cwdKey — nullish/empty', () => {
     assert.equal(cwdKey(null), '');
     assert.equal(cwdKey(undefined), '');
     assert.equal(cwdKey(''), '');
+});
+
+test('handoffKey — same cwd, different purposes -> different keys (the bug fix)', () => {
+    // The regression: d:/code/tms hosted both a PrimeNG-QA worker and a TMS-20018 mileage worker.
+    // Keyed by cwd alone they collided; scoped by purpose they must not.
+    const a = handoffKey('d:/code/tms', 'PrimeNG 17->18 visual QA of modals/forms');
+    const b = handoffKey('d:/code/tms', 'TMS-20018 multi-stop/round-trip mileage bug');
+    assert.notEqual(a, b, 'two unrelated jobs on one cwd must get distinct handoff keys');
+});
+
+test('handoffKey — same cwd + same purpose -> same key (a restart finds its own handoff)', () => {
+    assert.equal(
+        handoffKey('D:\\code\\tms', 'PrimeNG visual QA'),
+        handoffKey('d:/code/tms/', 'PrimeNG visual QA'),
+        'a manual restart of the same job re-derives the same key',
+    );
+});
+
+test('handoffKey — purpose is normalized (case, surrounding + collapsed whitespace)', () => {
+    assert.equal(
+        handoffKey('d:/code/tms', '  PrimeNG   visual   QA '),
+        handoffKey('d:/code/tms', 'primeng visual qa'),
+        'trivial re-typings of the purpose still match',
+    );
+});
+
+test('handoffKey — cwd component is cwdKey-normalized', () => {
+    // The cwd half of the key normalizes exactly like cwdKey (case/separator/trailing-slash).
+    assert.ok(handoffKey('D:/Code/TMS/', 'x').startsWith(cwdKey('d:\\code\\tms')));
+});
+
+test('handoffKey — no boundary collision between (cwd, purpose) pairs', () => {
+    // A path can contain spaces and a purpose is free text, so a plain-space joiner could let
+    // ("c:/a", "b c") and ("c:/a b", "c") collide. The newline joiner makes that impossible.
+    assert.notEqual(handoffKey('c:/a', 'b c'), handoffKey('c:/a b', 'c'));
+});
+
+test('handoffKey — nullish/empty purpose is stable', () => {
+    assert.equal(handoffKey('d:/code/tms', null), handoffKey('d:/code/tms', undefined));
+    assert.equal(handoffKey('d:/code/tms', ''), handoffKey('d:/code/tms', null));
 });
 
 test('shouldSpawnSuccessor — explicit true always spawns (even with no work)', () => {

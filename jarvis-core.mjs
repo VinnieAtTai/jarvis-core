@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -380,8 +380,9 @@ function loadRepos() {
     return {};
 }
 // cwdKey (stable key for a job's working directory: separator/case/trailing-slash insensitive)
-// is imported from jarvis-text.mjs. Handoff records are stored under this so a successor on the
-// same cwd can find them.
+// and handoffKey (cwd + purpose, so unrelated jobs sharing one cwd don't clobber each other's
+// handoff) are imported from jarvis-text.mjs. Durable handoff records are stored under handoffKey
+// so a successor on the same JOB — not merely the same cwd — finds them.
 // Resolve a registered repo by cwd, falling back to an ad-hoc repo (same logic /spawn used).
 function resolveRepo(cwd) {
     const repos = loadRepos();
@@ -850,11 +851,13 @@ function registerSession(cwd, purpose, pin, project) {
         enqueueSay((reborn ? cs + ' is now ' : 'New session. ' + cs + ' is ') + (purpose || 'unnamed work') + '.' + focusedNote, 'jarvis');
     }
     const out = { uid, callsign: cs };
-    // Tell a fresh session if a predecessor on this cwd left a handoff — covers the manual
-    // "kill the terminal and start over" path that never goes through spawnWorker.
+    // Tell a fresh session if a predecessor on this SAME JOB (cwd + purpose) left a handoff —
+    // covers the manual "kill the terminal and start over" path that never goes through
+    // spawnWorker. Scoping by purpose stops a new worker inheriting a different job's notes when
+    // several jobs share one cwd. The hint carries the purpose so the follow-up GET resolves.
     roster.handoffs = roster.handoffs || {};
-    const h = cwd ? roster.handoffs[cwdKey(cwd)] : null;
-    if (h) out.handoff = { summary: h.summary, from: h.from, ts: h.ts, hint: 'GET /handoff?cwd=<your cwd> for full notes, then resume.' };
+    const h = cwd ? roster.handoffs[handoffKey(cwd, purpose)] : null;
+    if (h) out.handoff = { summary: h.summary, from: h.from, ts: h.ts, hint: 'GET /handoff?cwd=' + encodeURIComponent(cwd) + '&purpose=' + encodeURIComponent(purpose || '') + ' for full notes, then resume.' };
     if (proj) { try { out.project = projectContextFor(proj); } catch { } }   // rehydrate on register (model B)
     return out;
 }
@@ -885,7 +888,7 @@ function retireSession(uid, summary, opts = {}) {
         ts: s.ended,
     };
     roster.handoffs = roster.handoffs || {};
-    if (s.cwd) roster.handoffs[cwdKey(s.cwd)] = rec;
+    if (s.cwd) roster.handoffs[handoffKey(s.cwd, s.purpose)] = rec;
     writeFileSync(join(ARCHIVE, uid + '.json'), JSON.stringify({
         uid, callsign: cs, cwd: s.cwd, purpose: s.purpose,
         started: s.started, ended: s.ended, summary: s.summary || null,
@@ -1749,7 +1752,7 @@ async function handleRequest(req, res) {
         const items = (roster.held || []).map(h => ({
             key: h.key, callsign: h.callsign || null, cwd: h.cwd || '', purpose: h.purpose || '',
             summary: h.summary || null, parkedAt: h.parkedAt || null,
-            hasHandoff: !!(roster.handoffs && (roster.handoffs[cwdKey(h.cwd)] || (h.callsign && roster.handoffs['cs:' + h.callsign]))),
+            hasHandoff: !!(roster.handoffs && (roster.handoffs[handoffKey(h.cwd, h.purpose)] || (h.callsign && roster.handoffs['cs:' + h.callsign]))),
         }));
         return json(res, 200, { count: items.length, items });
     }
@@ -1807,7 +1810,7 @@ async function handleRequest(req, res) {
         }
         let cs = null;
         roster.handoffs = roster.handoffs || {};
-        const handoff = roster.handoffs[cwdKey(h.cwd)] || null;
+        const handoff = roster.handoffs[handoffKey(h.cwd, h.purpose)] || null;
         try { cs = spawnWorker(resolveRepo(h.cwd), h.purpose, b.model, handoff); } catch { cs = null; }
         if (!cs) {
             enqueueSay('I could not spin that back up, so it is still on hold. Try again.', 'jarvis');
@@ -2026,7 +2029,7 @@ async function handleRequest(req, res) {
         if (!cwd || !purpose) return json(res, 400, { error: 'need cwd and purpose' });
         const repo = resolveRepo(cwd);
         roster.handoffs = roster.handoffs || {};
-        const handoff = roster.handoffs[cwdKey(cwd)] || null;
+        const handoff = roster.handoffs[handoffKey(cwd, purpose)] || null;
         const cs = spawnWorker(repo, purpose, b.model, handoff, b.tier, b.project, b.meeting);
         const launchWhat = b.meeting && b.meeting.title ? 'meeting worker for ' + b.meeting.title : (b.project ? b.project + ' worker' : cs);
         enqueueSay('Launching ' + launchWhat + ' in ' + repo.key + (handoff ? ', resuming the handoff' : '') + '.', 'jarvis');
@@ -2251,7 +2254,7 @@ async function handleRequest(req, res) {
         const w = loadWork();
         const board = w.sessions[s.callsign] || { working: [], queued: [] };
         roster.handoffs = roster.handoffs || {};
-        if (s.cwd) roster.handoffs[cwdKey(s.cwd)] = {
+        if (s.cwd) roster.handoffs[handoffKey(s.cwd, s.purpose)] = {
             summary: s.summary || null, notes: s.handoff || '',
             board: { working: board.working || [], queued: board.queued || [] },
             from: s.callsign, fromUid: b.uid, cwd: s.cwd, purpose: s.purpose,
@@ -2272,7 +2275,18 @@ async function handleRequest(req, res) {
             delete roster.handoffs['cs:' + csq];
             saveRoster();
         } else if (cwdq) {
-            rec = roster.handoffs[cwdKey(cwdq)] || null;
+            // Durable per-job record, keyed by cwd + purpose (register hands back a hint that
+            // carries the purpose). Bare legacy calls with no purpose fall back to the most recent
+            // record on that cwd so an old-style GET /handoff?cwd=... still resolves.
+            const purposeq = u.searchParams.get('purpose');
+            rec = roster.handoffs[handoffKey(cwdq, purposeq)] || null;
+            if (!rec && purposeq == null) {
+                const pref = cwdKey(cwdq);
+                rec = Object.entries(roster.handoffs)
+                    .filter(([k, r]) => !k.startsWith('cs:') && r && cwdKey(r.cwd) === pref)
+                    .map(([, r]) => r)
+                    .sort((a, b2) => Date.parse(b2.ts) - Date.parse(a.ts))[0] || null;
+            }
         } else if (csq) {
             rec = Object.entries(roster.handoffs)
                 .filter(([k, r]) => !k.startsWith('cs:') && r && r.from === csq)

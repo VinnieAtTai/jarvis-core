@@ -165,6 +165,21 @@ export function cwdKey(cwd) {
     return String(cwd || '').toLowerCase().replace(/\\/g, '/').replace(/\/+$/, '');
 }
 
+// Key for the DURABLE per-job handoff store (roster.handoffs). cwdKey alone was too coarse: one
+// working directory is shared by many unrelated jobs (e.g. d:/code/tms hosts a PrimeNG-QA worker,
+// a TMS-20018 mileage-bug worker, a PRD-23 worker...), so whoever retired last on that cwd
+// overwrote the single slot and the next fresh worker on it inherited a DIFFERENT job's handoff.
+// Scoping by cwd + the job's purpose (the human-facing description, present at every register/
+// retire/hold/spawn site and stable across a manual restart of the same job) keeps each job's
+// handoff separate, so a successor only ever picks up its own job's notes. Purpose is normalized
+// (lowercased, trimmed, whitespace-collapsed) so trivial re-typings still match. The newline
+// joiner can never appear in a path or a whitespace-collapsed purpose, so two different
+// (cwd, purpose) pairs can never collide onto one key.
+export function handoffKey(cwd, purpose) {
+    const p = String(purpose || '').toLowerCase().trim().replace(/\s+/g, ' ');
+    return cwdKey(cwd) + String.fromCharCode(10) + p;
+}
+
 // The auto-successor rule for POST /retire: spawn a successor when work remains, but let an
 // explicit request override either way. `requested` is the body's `successor` field (may be
 // undefined); `hasWork` is whether the retiring board still has working+queued tasks.
