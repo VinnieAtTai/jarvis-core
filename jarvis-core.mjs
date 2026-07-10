@@ -1700,6 +1700,64 @@ async function handleRequest(req, res) {
         if (!p) return json(res, 404, { error: 'no project ' + name });
         return json(res, 200, { ok: true, project: projectContextFor(name) });
     }
+    if (key === 'POST /project') {
+        // Structural project op. op:rename atomically re-keys a project across every store that
+        // keys off its name — the project row, its board column (worklist), the roster FOCUS, and
+        // the live worker's session.project binding — so a plain /project-context can't be used
+        // (that would create a duplicate under the new name and orphan the old column/focus). The
+        // mission link (missionId) and curated context ride along on the same row untouched. The
+        // live worker keeps its NATO callsign; it just re-anchors its /worklist ops to the new key.
+        const b = await readBody(req);
+        const op = String(b.op || '').toLowerCase();
+        if (op !== 'rename') return json(res, 400, { error: 'op must be rename' });
+        const from = String(b.from || '').toLowerCase().trim();
+        const to = String(b.to || '').toLowerCase().trim().replace(/[^a-z0-9-]/g, '');
+        if (!from || !to) return json(res, 400, { error: 'rename needs from and to' });
+        if (from === to) return json(res, 400, { error: 'from and to are identical' });
+        const store = loadProjects();
+        const proj = store.projects.find(x => x.name === from);
+        if (!proj) return json(res, 404, { error: 'no project ' + from });
+        if (store.projects.some(x => x.name === to)) return json(res, 409, { error: 'project ' + to + ' already exists' });
+        // 1) project row (keep missionId, context, managerUid; optionally refresh the display title)
+        proj.name = to;
+        if (b.title != null && String(b.title).trim()) proj.title = String(b.title).trim();
+        proj.updatedAt = new Date().toISOString();
+        saveProjects(store);
+        // 2) board column: carry the tasks over to the new key (and follow focus)
+        const w = loadWork();
+        if (w.sessions && w.sessions[from]) {
+            w.sessions[to] = { ...(w.sessions[to] || {}), ...w.sessions[from] };
+            delete w.sessions[from];
+        }
+        if (w.focus === from) w.focus = to;
+        saveWork(w);
+        // 3) live session project-binding (the worker re-anchors its own /worklist ops to `to`)
+        for (const uid in roster.sessions) {
+            const s = roster.sessions[uid];
+            if (!s.ended && s.project === from) s.project = to;
+        }
+        saveRoster();
+        record({ kind: 'sys', text: 'project renamed: ' + from + ' -> ' + to });
+        enqueueSay('Project ' + from + ' is now ' + to + '.', 'jarvis');
+        return json(res, 200, { ok: true, project: projectContextFor(to) });
+    }
+    if (key === 'POST /trust') {
+        // Flip a single live session's trust tier (trusted = its non-danger tool calls auto-approve
+        // in POST /permission; guarded = they prompt). Takes effect immediately — the permission
+        // check reads sess.tier live — so no respawn is needed. Targets by uid or callsign. The
+        // danger floor in POST /permission still gates destructive actions regardless of tier.
+        const b = await readBody(req);
+        const tier = b.tier === 'guarded' ? 'guarded' : 'trusted';
+        let uid = (b.uid && roster.sessions[b.uid] && !roster.sessions[b.uid].ended) ? b.uid : null;
+        if (!uid && b.callsign) uid = liveUidOf(String(b.callsign).toLowerCase());
+        const s = uid ? roster.sessions[uid] : null;
+        if (!s || s.ended) return json(res, 404, { error: 'no live session for that uid/callsign' });
+        s.tier = tier;
+        saveRoster();
+        record({ kind: 'sys', text: s.callsign + ' trust tier set to ' + tier });
+        enqueueSay(s.callsign + ' is now ' + tier + '.', 'jarvis');
+        return json(res, 200, { ok: true, uid, callsign: s.callsign, tier });
+    }
     if (key === 'GET /roster') {
         const live = liveCallsigns().map(cs => {
             const uid = liveUidOf(cs);
