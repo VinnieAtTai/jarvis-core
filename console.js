@@ -1073,14 +1073,16 @@ function sendTyped() {
     let out;
     if (target === 'general') out = t;
     else if (target === 'jarvis') out = 'jarvis ' + t;
+    else if (target.startsWith('m:')) out = 'on mission ' + target.slice(2) + ', ' + t;   // a mission chosen in the dropdown
     else if (target) out = 'on ' + target + ', ' + t;
     else if (activeTab.startsWith('m:')) {
-        // Mission tab: route to the pinned worker if one is pinned, else to the mission's manager
-        // (its project callsign). Falls back to the general bus if the mission has no live member.
-        const ids = missionChatSets().byMission[activeTab.slice(2)] || new Set();
+        // Mission tab: if a worker is pinned, aim at just that worker; otherwise address the MISSION
+        // itself. The hub routes a mission message to its coordinator AND always persists it to the
+        // mission's durable thread, so a message is never dropped even when no worker is live now.
+        const mid = activeTab.slice(2);
         const pin = missionWorkerPin[activeTab];
-        const to = (pin && ids.has(pin)) ? pin : missionManagerCallsign(activeTab.slice(2));
-        out = to ? ('on ' + to + ', ' + t) : t;
+        const ids = missionChatSets().byMission[mid] || new Set();
+        out = (pin && ids.has(pin)) ? ('on ' + pin + ', ' + t) : ('on mission ' + mid + ', ' + t);
     }
     else {
         const sess = activeTab && activeTab !== 'all' && activeTab !== 'general' && activeTab !== 'jarvis';
@@ -1095,7 +1097,10 @@ function populateSendTo() {
     const sel = document.getElementById('sendto');
     if (!sel || sel === document.activeElement) return;
     const sessions = lastBoard ? lastBoard.boards.filter(b => b.callsign !== 'jarvis' && b.alive !== false).map(b => b.callsign) : [];
-    const opts = [['', '↪ tab'], ['general', 'general'], ['jarvis', 'jarvis']].concat(sessions.map(c => [c, c]));
+    const missions = (lastBoard && lastBoard.missions) || [];
+    const opts = [['', '↪ tab'], ['general', 'general'], ['jarvis', 'jarvis']]
+        .concat(sessions.map(c => [c, c]))
+        .concat(missions.map(mn => ['m:' + mn.id, '◈ ' + (mn.title || 'mission')]));   // target a whole mission
     const sig = opts.map(o => o[0]).join('|');
     if (sel.dataset.sig === sig) return;
     const cur = sel.value;
@@ -1431,13 +1436,20 @@ function eventsForTab() {
     // identity belonging to this mission — one chat for the whole project, each bubble still
     // labeled by the sending worker via the chip in renderChat.
     if (activeTab.startsWith('m:')) {
-        const all = missionChatSets().byMission[activeTab.slice(2)] || new Set();
+        const mid = activeTab.slice(2);
+        const all = missionChatSets().byMission[mid] || new Set();
         // A worker pin narrows the mission chat to one identity (plus the human's messages routed
         // to it); unpinned shows every worker on the mission. Guard the pin against a worker that
         // has since left the mission by only honoring it if still in the set.
         const pin = missionWorkerPin[activeTab];
         const ids = (pin && all.has(pin)) ? new Set([pin]) : all;
-        return chatEvts.filter(e => e.kind !== 'sys' && (ids.has(e.who) || (e.who === 'you' && ids.has(e.to))));
+        // Unpinned, also show messages addressed to the MISSION itself (missionId-tagged: the human
+        // talking to the mission, and the coordinator's mission-scoped replies) so the thread reads
+        // continuously even before any worker is bound or after they all retire.
+        return chatEvts.filter(e => e.kind !== 'sys' && (
+            (!pin && (e.missionId === mid || e.to === 'm:' + mid)) ||
+            ids.has(e.who) || (e.who === 'you' && ids.has(e.to))
+        ));
     }
     return chatEvts.filter(e => e.kind !== 'sys' && (e.who === activeTab || (e.who === 'you' && e.to === activeTab)));
 }
