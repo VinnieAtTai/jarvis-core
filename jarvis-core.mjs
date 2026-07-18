@@ -1770,6 +1770,9 @@ async function handleRequest(req, res) {
                 // Durable project context for a project card (jarvis, primeng, ...); null for a
                 // plain NATO worker card. Lets the console show what the project stands on.
                 projectContext: compactProjectContext(projById[cs] || null),
+                // The project a SUB-WORKER is nested under (its .parentProject), so the console can
+                // group its card beneath that project/mission; null for coordinators + plain workers.
+                parentProject: (uid && roster.sessions[uid] && roster.sessions[uid].parentProject) || null,
                 working: b.working, queued: b.queued, done: b.done, review: b.review || [],
             };
         });
