@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -782,7 +782,7 @@ function eventsFor(uid, cursor) {
     }
     return { cursor: busBase + bus.length, events };
 }
-function registerSession(cwd, purpose, pin, project) {
+function registerSession(cwd, purpose, pin, project, parentProject) {
     const cs = assignCallsign(pin);
     pendingPins.delete(cs);
     let tier = pendingTier.get(cs); pendingTier.delete(cs);
@@ -791,8 +791,12 @@ function registerSession(cwd, purpose, pin, project) {
     const uid = 's_' + String(roster.nextUid++).padStart(4, '0');
     const now = new Date().toISOString();
     const proj = project ? String(project).toLowerCase().trim() : null;
+    // A SUB-WORKER carries .parentProject (its ephemeral card nests under the project) — kept DISTINCT
+    // from .project so pickProjectWorker (which matches .project only) can never resolve it as the
+    // coordinator. A session is one or the other, never both: a .project coordinator ignores parentProject.
+    const pproj = (!proj && parentProject) ? String(parentProject).toLowerCase().trim() : null;
     roster.callsigns[cs] = [uid, ...(roster.callsigns[cs] || [])];
-    roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier, ...(proj ? { project: proj } : {}) };
+    roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier, ...(proj ? { project: proj } : {}), ...(pproj ? { parentProject: pproj } : {}) };
     if (roster.awayUntil && Date.now() < roster.awayUntil) roster.sessions[uid].trustUntil = roster.awayUntil;
     saveRoster();
     const w = loadWork();
@@ -1118,7 +1122,7 @@ function spawnWorkerConsoleless(cs, repo, boot, model, hookSettings) {
     workerPtys.set(cs, proc);
     return true;
 }
-function spawnWorker(repo, purpose, model, handoff, tier, project, meeting) {
+function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, parentProject) {
     const cs = assignCallsign();
     pendingPins.set(cs, Date.now());
     const effTier = (tier || repo.tier) === 'trusted' ? 'trusted' : null;
@@ -1128,7 +1132,10 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting) {
     // phantom callsign. Strip it alongside the other shell/wt specials.
     const safePurpose = purpose.replace(/["'^&<>|%;]/g, '');
     const tabTitle = cs + ' - ' + safePurpose;
-    let boot = 'You are a JARVIS worker session. Fetch http://127.0.0.1:' + PORT + '/protocol with a plain GET request and follow it exactly. Register with pin: ' + cs + ' and purpose: ' + safePurpose + (project ? ' and project: ' + project : '') + '.';
+    // A sub-worker registers with parentProject (never project) so it nests under the project without
+    // ever resolving as its coordinator; a worker is one role or the other, never both.
+    const subOf = (!project && parentProject) ? String(parentProject).toLowerCase().trim() : null;
+    let boot = 'You are a JARVIS worker session. Fetch http://127.0.0.1:' + PORT + '/protocol with a plain GET request and follow it exactly. Register with pin: ' + cs + ' and purpose: ' + safePurpose + (project ? ' and project: ' + project : '') + (subOf ? ' and parentProject: ' + subOf : '') + '.';
     if (handoff) {
         // Stash the handoff under this callsign (plain letters -> safe in the .cmd, no %-encoding)
         // so the successor can pull it the moment it boots and resume without a human re-brief.
@@ -1149,6 +1156,18 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting) {
         let mlink = null;
         try { const pr = getProject(project); if (pr && pr.missionId) { const ms = (loadMissions().missions || []).find(x => x.id === pr.missionId); if (ms) mlink = { id: pr.missionId, title: ms.title }; } } catch { }
         if (mlink) boot += ' This project drives the mission "' + mlink.title + '". The human talks to the MISSION, not to you by callsign, so the moment you register GET http://127.0.0.1:' + PORT + '/mission-chat?missionId=' + mlink.id + ' to read the ongoing mission conversation and treat its most recent messages - including any that arrived while no coordinator was live - as your live prompt: reply there with /say and /send and dispatch sub-workers as needed. New mission messages arrive on your poll loop from then on.';
+    }
+    // A SUB-WORKER inherits the parent project's STORY (Chris: "workers get their context from the
+    // mission") — mission + project context seeded read-only into the boot prompt so it starts with the
+    // history, not a cold start — while its TASK stays its own. It is NOT the coordinator: it uses its
+    // own callsign, never touches the project column or rehydrates the store, and its retire summary is
+    // what feeds back up (auto-appended to the project log).
+    if (subOf) {
+        let pr = null, ms = null;
+        try { pr = getProject(subOf); if (pr && pr.missionId) ms = (loadMissions().missions || []).find(x => x.id === pr.missionId) || null; } catch { }
+        const brief = subworkerBrief(pr, ms);
+        boot += ' You are a SUB-WORKER under ' + (brief || ('the ' + subOf + ' project.'))
+            + ' That is your STORY/context so you carry the history without rebuilding it; your TASK is only what is described above. You are NOT the ' + subOf + ' coordinator: use your OWN callsign for every /worklist op, do not touch the ' + subOf + ' board column, and do not rehydrate or POST project context. When your task is done, /retire with a crisp one-line summary — it auto-appends to the ' + subOf + ' project log so the coordinator and the next worker rebuild from your outcome.';
     }
     if (meeting && meeting.title) {
         boot += ' You are a MEETING worker for "' + meeting.title + '"' + (meeting.start && meeting.end ? ' (' + meeting.start + ' to ' + meeting.end + ')' : '') + '. Assist Chris live during this call: capture decisions and action items, draft Jira items when he asks, and pull up references.';
@@ -2089,7 +2108,7 @@ async function handleRequest(req, res) {
         if (!String(b.purpose || '').trim() || !String(b.cwd || '').trim()) {
             return json(res, 400, { error: 'purpose and cwd are required. purpose is the one-line description the human sees on the board and hears in announcements; make it specific. Re-POST with both.' });
         }
-        try { return json(res, 200, registerSession(b.cwd, b.purpose, b.pin, b.project)); }
+        try { return json(res, 200, registerSession(b.cwd, b.purpose, b.pin, b.project, b.parentProject)); }
         catch (e) { return json(res, 409, { error: e.message }); }
     }
     if (key === 'POST /away') {
@@ -2216,8 +2235,9 @@ async function handleRequest(req, res) {
         const repo = resolveRepo(cwd);
         roster.handoffs = roster.handoffs || {};
         const handoff = roster.handoffs[handoffKey(cwd, purpose)] || null;
-        const cs = spawnWorker(repo, purpose, b.model, handoff, b.tier, b.project, b.meeting);
-        const launchWhat = b.meeting && b.meeting.title ? 'meeting worker for ' + b.meeting.title : (b.project ? b.project + ' worker' : cs);
+        const cs = spawnWorker(repo, purpose, b.model, handoff, b.tier, b.project, b.meeting, b.parentProject);
+        const subOf = (!b.project && b.parentProject) ? String(b.parentProject).toLowerCase().trim() : null;
+        const launchWhat = b.meeting && b.meeting.title ? 'meeting worker for ' + b.meeting.title : (b.project ? b.project + ' worker' : (subOf ? subOf + ' sub-worker' : cs));
         enqueueSay('Launching ' + launchWhat + ' in ' + repo.key + (handoff ? ', resuming the handoff' : '') + '.', 'jarvis');
         return json(res, 200, { ok: true, callsign: cs });
     }

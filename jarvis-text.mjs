@@ -326,6 +326,31 @@ export function pushCapped(arr, entry, cap = PROJECT_LOG_CAP) {
     return next.length > cap ? next.slice(next.length - cap) : next;
 }
 
+// Compose the read-only STORY brief a parentProject SUB-WORKER is seeded with on boot (Chris's ask:
+// "workers get their context from the mission"). Given the parent project object and its linked
+// mission (or null), returns a compact prose brief — project title, the mission it serves + phase
+// progress, where the project stands, current focus, and open threads — so an ephemeral sub-worker
+// inherits the history without rehydrating the store or acting as the coordinator. Its TASK stays its
+// own; this is only context. Returns '' when there is no project to describe. Pure: reads its args,
+// mutates nothing, invents nothing.
+export function subworkerBrief(project, mission) {
+    if (!project || typeof project !== 'object') return '';
+    const c = (project.context && typeof project.context === 'object') ? project.context : {};
+    const title = String(project.title || project.name || 'the project').trim();
+    let head = 'the ' + String(project.name || title) + ' project ("' + title + '")';
+    if (mission && mission.title) {
+        head += ', serving the mission "' + String(mission.title).trim() + '"';
+        const ph = Array.isArray(mission.phases) ? mission.phases : [];
+        if (ph.length) head += ' (' + ph.filter(p => p && p.done).length + ' of ' + ph.length + ' phases done)';
+    }
+    const parts = [head + '.'];
+    if (c.summary && String(c.summary).trim()) parts.push('Where it stands: ' + String(c.summary).trim());
+    if (c.currentFocus && String(c.currentFocus).trim()) parts.push('Current focus: ' + String(c.currentFocus).trim() + '.');
+    const ot = Array.isArray(c.openThreads) ? c.openThreads.map(String).map(s => s.trim()).filter(Boolean) : [];
+    if (ot.length) parts.push('Open threads: ' + ot.join('; ') + '.');
+    return parts.join(' ');
+}
+
 // —— Missions (persistent, voice-gated objective tracker). The pure shape + phrase helpers live
 // here so they unit-test without booting the hub; the file I/O, id/timestamp stamping, and the
 // voice state machine stay in jarvis-core.mjs. Closing a mission is a two-step spoken gate
