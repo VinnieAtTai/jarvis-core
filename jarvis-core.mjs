@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -949,16 +949,57 @@ function routeToMission(missionId, text) {
     record({ kind: 'speech', text, to: 'm:' + missionId, missionId, mission: mn.title });
     const proj = projectForMission(loadProjects().projects || [], missionId);
     const uid = proj ? projectWorkerUid(proj.name) : null;
-    if (uid) {
+    if (uid && aliveNow(uid)) {
+        // Live coordinator: hand it the message so it can act + dispatch to its sub-workers.
         busAppend({ from: 'human', to: uid, kind: 'speech', text, missionId }, SPEECH_DEBOUNCE);
         if (roster.sessions[uid] && roster.sessions[uid].needsYou) {
             roster.sessions[uid].needsYou = false;
             saveRoster();
         }
+        return true;
     }
-    // No live coordinator: the message is persisted to the mission thread above; the next
-    // coordinator rehydrates it on boot. (T2 will auto-revive the coordinator right here.)
+    // No LIVE coordinator: either none is bound, or the only match is a dead/ghost session whose
+    // lastSeen is stale (the invisible-coordinator bug — routeToMission used to bus straight to that
+    // corpse and the message vanished). The message is already record()-ed to the durable mission
+    // thread above, so T2 auto-revives a coordinator: it rehydrates GET /project + reads the mission
+    // thread on boot, picking up this very message with no human re-brief.
+    if (proj) reviveMissionCoordinator(proj);
     return true;
+}
+// T2 auto-revive. Bring up a fresh coordinator for a mission's project whose coordinator is dead or
+// missing, so talking to a mission ALWAYS reaches a live brain. Guarded against spawning a swarm when
+// several mission messages land in quick succession OR while a just-spawned coordinator is still
+// booting: the spawned callsign stays in `pendingPins` until it registers, so a coordinator that is
+// booting-but-not-yet-alive is visible even before it appears in the roster; a short cooldown then
+// covers the gap between it clearing pendingPins and its first heartbeat landing. A hub restart wipes
+// this map, but a restart also kills the booting ConPTY child (it is a hub child), so a fresh spawn
+// after a restart is the CORRECT behaviour — not a duplicate.
+const missionCoordinatorSpawns = new Map();   // project name -> { cs, at }
+const COORD_REVIVE_COOLDOWN = 90000;
+function coordinatorBooting(name) {
+    const g = missionCoordinatorSpawns.get(name);
+    if (!g) return false;
+    if (pendingPins.has(g.cs)) return true;                 // spawned, not yet registered
+    return Date.now() - g.at < COORD_REVIVE_COOLDOWN;       // registered/failed, still inside the window
+}
+function reviveMissionCoordinator(proj) {
+    if (coordinatorBooting(proj.name)) return null;         // one is already on the way — don't swarm
+    const cwd = lastProjectCwd(roster.sessions, proj.name);
+    if (!cwd) {
+        // Never had a worker, so we cannot infer the repo; the message is safely queued on the durable
+        // mission thread and the next manually-spawned coordinator picks it up on boot.
+        record({ kind: 'sys', text: 'mission ' + proj.name + ': no live coordinator and no known repo to revive one' });
+        return null;
+    }
+    let cs = null;
+    try { cs = spawnWorker(resolveRepo(cwd), proj.title || proj.name, undefined, null, undefined, proj.name); }
+    catch { cs = null; }
+    if (cs) {
+        missionCoordinatorSpawns.set(proj.name, { cs, at: Date.now() });
+        record({ kind: 'sys', text: 'auto-revived ' + proj.name + ' coordinator (' + cs + ') for an incoming mission message' });
+        enqueueSay('Reviving the ' + proj.name + ' coordinator.', 'jarvis');
+    }
+    return cs;
 }
 function findRepo(spoken) {
     const repos = loadRepos();
@@ -1086,6 +1127,15 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting) {
     }
     if (project) boot += ' You are the ' + project + ' PROJECT worker: your task board IS the ' + project + ' column - use callsign "' + project + '" for every /worklist op (add/start/done/etc), not your own callsign, and speech the human points at ' + project + ' arrives on your poll loop. When you must hand off, /retire with successor:true so a fresh ' + project + ' worker takes over.'
         + ' You are also this project\'s persistent MANAGER: the project owns a durable context store. The moment you register, GET http://127.0.0.1:' + PORT + '/project?name=' + project + ' to rehydrate that context (summary, current focus, open threads, recent-work log, doc links) and RESUME from it - do not start cold. As the project moves, keep it current so the next manager rebuilds from recent work: POST http://127.0.0.1:' + PORT + '/project-context {"name":"' + project + '","summary":"...","currentFocus":"...","openThreads":[...],"log":"one line of what just happened"} (send only the fields that changed; log entries are append-only and capped).';
+    // If this project drives a mission, the human talks to the MISSION (not to you by callsign), so a
+    // message can land on the durable mission thread while no coordinator is live — the very message
+    // that auto-revived you. Tell the coordinator to catch up on that thread the instant it registers;
+    // from then on live mission messages arrive on its poll loop.
+    if (project) {
+        let mlink = null;
+        try { const pr = getProject(project); if (pr && pr.missionId) { const ms = (loadMissions().missions || []).find(x => x.id === pr.missionId); if (ms) mlink = { id: pr.missionId, title: ms.title }; } } catch { }
+        if (mlink) boot += ' This project drives the mission "' + mlink.title + '". The human talks to the MISSION, not to you by callsign, so the moment you register GET http://127.0.0.1:' + PORT + '/mission-chat?missionId=' + mlink.id + ' to read the ongoing mission conversation and treat its most recent messages - including any that arrived while no coordinator was live - as your live prompt: reply there with /say and /send and dispatch sub-workers as needed. New mission messages arrive on your poll loop from then on.';
+    }
     if (meeting && meeting.title) {
         boot += ' You are a MEETING worker for "' + meeting.title + '"' + (meeting.start && meeting.end ? ' (' + meeting.start + ' to ' + meeting.end + ')' : '') + '. Assist Chris live during this call: capture decisions and action items, draft Jira items when he asks, and pull up references.';
         if (meeting.join) boot += ' Meet link: ' + meeting.join + '.';

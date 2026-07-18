@@ -4,7 +4,7 @@
 // what these guard. Run with `npm test` (node --test) — no server boot, no I/O.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { pickProjectWorker } from '../jarvis-text.mjs';
+import { pickProjectWorker, lastProjectCwd } from '../jarvis-text.mjs';
 
 const iso = ms => new Date(ms).toISOString();
 
@@ -60,4 +60,48 @@ test('pickProjectWorker — guards bad inputs', () => {
     assert.equal(pickProjectWorker(null, 'jarvis'), null);
     assert.equal(pickProjectWorker({}, 'jarvis'), null);
     assert.equal(pickProjectWorker({ a: { project: 'jarvis', ended: null } }, ''), null);
+});
+
+// —— lastProjectCwd — the repo an auto-revived (T2) coordinator spawns in. Unlike pickProjectWorker it
+// INCLUDES ended sessions (the coordinator we revive from is by definition dead/retired), so it can
+// still recover the cwd to spawn into. ——
+
+test('lastProjectCwd — the most-recently-seen session (ended included) wins', () => {
+    const s = {
+        old:  { project: 'primeng', ended: iso(5000),  lastSeen: iso(1_000),     cwd: 'd:/old' },
+        last: { project: 'primeng', ended: iso(9_000), lastSeen: iso(9_000_000), cwd: 'd:/code/tms' },
+    };
+    assert.equal(lastProjectCwd(s, 'primeng'), 'd:/code/tms');
+});
+
+test('lastProjectCwd — recovers the cwd of a dead ghost when nothing is live (the revive case)', () => {
+    const s = { ghost: { project: 'primeng', ended: null, lastSeen: iso(1_000), cwd: 'd:/code/tms' } };
+    assert.equal(lastProjectCwd(s, 'primeng'), 'd:/code/tms');
+});
+
+test('lastProjectCwd — only matches the named project', () => {
+    const s = {
+        a: { project: 'other',  ended: null, lastSeen: iso(9_000_000), cwd: 'd:/other' },
+        b: { project: 'jarvis', ended: null, lastSeen: iso(1000),      cwd: 'd:/claude/jarvis-core' },
+    };
+    assert.equal(lastProjectCwd(s, 'jarvis'), 'd:/claude/jarvis-core');
+});
+
+test('lastProjectCwd — null when the project never had a worker (no repo to infer)', () => {
+    const s = { a: { project: 'other', ended: null, lastSeen: iso(2), cwd: 'd:/other' } };
+    assert.equal(lastProjectCwd(s, 'primeng'), null);
+});
+
+test('lastProjectCwd — skips sessions with no cwd, still resolves a usable one', () => {
+    const s = {
+        nocwd: { project: 'primeng', ended: null, lastSeen: iso(9_000_000) },   // freshest but cwd-less
+        has:   { project: 'primeng', ended: iso(1), lastSeen: iso(1000), cwd: 'd:/code/tms' },
+    };
+    assert.equal(lastProjectCwd(s, 'primeng'), 'd:/code/tms');
+});
+
+test('lastProjectCwd — guards bad inputs', () => {
+    assert.equal(lastProjectCwd(null, 'primeng'), null);
+    assert.equal(lastProjectCwd({}, 'primeng'), null);
+    assert.equal(lastProjectCwd({ a: { project: 'primeng', ended: null, cwd: 'd:/x' } }, ''), null);
 });

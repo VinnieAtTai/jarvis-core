@@ -471,6 +471,26 @@ export function pickProjectWorker(sessions, name) {
     return best;
 }
 
+// Resolve a project name to the cwd its coordinator last lived in, so an auto-revived coordinator
+// (T2) spawns in the RIGHT repo even when the previous one is a dead ghost. Unlike pickProjectWorker
+// this deliberately includes ENDED sessions: once a coordinator retires or dies the durable project
+// column stays put but nothing live still carries the cwd, so we fall back to the most-recently-seen
+// session that ever hosted the project (ended or not) and reuse where it worked. Returns null only
+// when the project has never had a worker at all (nothing to infer the repo from). Pure: reads the
+// sessions map, mutates nothing.
+export function lastProjectCwd(sessions, name) {
+    if (!name || !sessions || typeof sessions !== 'object') return null;
+    let best = null, bestSeen = -Infinity;
+    for (const uid in sessions) {
+        const s = sessions[uid];
+        if (!s || s.project !== name || !s.cwd) continue;
+        const t = Date.parse(s.lastSeen);
+        const seen = Number.isFinite(t) ? t : 0;
+        if (seen > bestSeen) { bestSeen = seen; best = String(s.cwd); }
+    }
+    return best;
+}
+
 // Parse a JSON request body, tolerating the single most common worker mistake: a Windows path
 // pasted into `curl -d` with un-escaped backslashes, e.g. {"cwd":"d:\claude\jarvis-core"}. That
 // is invalid JSON (\c, \j, \u<not-4-hex> are not valid escapes), so a strict JSON.parse throws and
