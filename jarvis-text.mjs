@@ -443,3 +443,30 @@ export function projectForMission(projects, missionId) {
     const list = Array.isArray(projects) ? projects : [];
     return list.find(p => p && p.missionId === missionId) || null;
 }
+
+// Resolve a project name to the uid of its ONE live worker. A project (e.g. `jarvis`) is a durable
+// board card hosting a single worker that carries `.project=<name>`; the coordinator role rehydrates
+// across retires, so at any moment 0..1 sessions should legitimately match. Among the non-ended
+// matches we return the MOST-RECENTLY-SEEN one, never merely the first in roster order.
+//
+// Why most-recent-seen and not first: `.ended` is only set on an explicit /retire, so a worker that
+// dies WITHOUT retiring (crash, console kill, machine transfer) lingers in the roster as a non-ended
+// "ghost" forever. Returning the first non-ended match then resolves the project to that corpse, and
+// a freshly-registered live coordinator is invisible/unreachable until someone manually retires the
+// ghost — the invisible-coordinator bug (india shadowed quebec; hotel/juliet before it), and the T2
+// root cause. A live worker heartbeats (poll + the 30s ping) so its lastSeen is always fresher than a
+// frozen ghost's, so max-lastSeen picks the real one automatically with no manual cleanup. A missing
+// or unparseable lastSeen sorts oldest, so a lone match still resolves (never regress to null). Pure:
+// takes the sessions map (roster.sessions), reads it, mutates nothing.
+export function pickProjectWorker(sessions, name) {
+    if (!name || !sessions || typeof sessions !== 'object') return null;
+    let best = null, bestSeen = -Infinity;
+    for (const uid in sessions) {
+        const s = sessions[uid];
+        if (!s || s.ended || s.project !== name) continue;
+        const t = Date.parse(s.lastSeen);
+        const seen = Number.isFinite(t) ? t : 0;
+        if (seen > bestSeen) { bestSeen = seen; best = uid; }
+    }
+    return best;
+}
