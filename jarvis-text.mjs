@@ -470,3 +470,29 @@ export function pickProjectWorker(sessions, name) {
     }
     return best;
 }
+
+// Parse a JSON request body, tolerating the single most common worker mistake: a Windows path
+// pasted into `curl -d` with un-escaped backslashes, e.g. {"cwd":"d:\claude\jarvis-core"}. That
+// is invalid JSON (\c, \j, \u<not-4-hex> are not valid escapes), so a strict JSON.parse throws and
+// readBody swallowed it to {} — which on /register surfaces as the misleading "purpose and cwd are
+// required" even though both were sent (the register-escape bug; nearly every fresh Windows worker
+// hits it on boot).
+//
+// A VALID body parses on the first try and never touches the repair path, so well-formed payloads
+// are left byte-for-byte untouched. Only when the strict parse FAILS do we retry once, treating the
+// body as a raw-pasted path: we double every LONE backslash so it survives as a real path separator.
+// Ordered alternation preserves the sequences that carry JSON structure — an already-escaped pair
+// `\\`, an escaped quote/slash `\"` `\/`, and a `\uXXXX` unicode escape — matching each as a unit so
+// it passes through untouched; everything else (a lone `\`, including `\b \f \n \r \t` which would
+// otherwise mangle common path segments like c:\bin, c:\temp, c:\node into control chars) is doubled.
+// Because repair only runs on already-broken input, we cannot recover a truly-intended \n/\t in a
+// malformed body — but a client that meant those sends valid JSON and never reaches here. Pure; never throws.
+export function parseBodyLenient(data) {
+    if (!data) return {};
+    try { return JSON.parse(data); } catch { }
+    try {
+        const repaired = data.replace(/\\\\|\\u[0-9a-fA-F]{4}|\\["\/]|\\/g, m => (m === '\\' ? '\\\\' : m));
+        return JSON.parse(repaired);
+    } catch { }
+    return {};
+}
