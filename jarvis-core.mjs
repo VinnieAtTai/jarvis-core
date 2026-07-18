@@ -895,7 +895,11 @@ function retireSession(uid, summary, opts = {}) {
 
     let succCs = null;
     if (opts.successor && s.cwd && s.purpose) {
-        try { succCs = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec); }
+        // Carry .parentProject into the successor so a SUB-WORKER that hands off with work remaining
+        // stays nested under its project and re-seeded with the mission STORY — mirroring how the
+        // coordinator path threads s.project. undefined for a plain worker, so its successor is a plain
+        // worker exactly as before.
+        try { succCs = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec, undefined, undefined, undefined, s.parentProject); }
         catch { succCs = null; }
     }
     if (succCs) {
