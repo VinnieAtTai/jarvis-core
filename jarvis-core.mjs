@@ -2131,7 +2131,14 @@ async function handleRequest(req, res) {
     if (key === 'POST /focus') {
         const b = await readBody(req);
         const cs = String(b.callsign || '').toLowerCase();
-        if (cs !== 'jarvis' && !liveUidOf(cs)) return json(res, 404, { error: 'no live session ' + cs });
+        // Focus targets: the solo brain ('jarvis'), any LIVE worker (by NATO callsign), or a durable
+        // PROJECT by name (e.g. 'primeng'). A project card hosts a rehydrating worker, so the console
+        // renders a focus ★ on it and the human expects to focus it — but without the project branch
+        // the ★ posted callsign=<project> and this guard 404'd it as "no live session" (bit Chris
+        // trying to promote the primeng card). Match against the durable project list so a real
+        // project resolves even between its workers; ephemeral NATO boards still require a live uid.
+        const isProject = (loadProjects().projects || []).some(p => p && p.name === cs);
+        if (cs !== 'jarvis' && !liveUidOf(cs) && !isProject) return json(res, 404, { error: 'no live session or project ' + cs });
         const w = loadWork();
         w.focus = cs;
         if (cs !== 'jarvis') ensureBoard(w, cs);
