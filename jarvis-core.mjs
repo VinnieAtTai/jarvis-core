@@ -916,6 +916,20 @@ function retireSession(uid, summary, opts = {}) {
 const SPEECH_DEBOUNCE = Number(process.env.JARVIS_SPEECH_DEBOUNCE || 4000);
 const nagAt = {};
 function routeTo(cs, msg) {
+    // Talking to a PROJECT by name (the focus can be a project — /focus accepts one). If that project
+    // drives a mission, funnel through the mission path: routeToMission ALWAYS reaches a live brain
+    // (busing to a live coordinator, or auto-reviving a dead/ghost one) AND persists to the durable
+    // mission thread the coordinator reads on boot — so addressing a project by name behaves exactly
+    // like the mission tab instead of busing to a corpse and nagging forever (the same dead-coordinator
+    // hole T2 fixed for routeToMission; routeTo recorded to:cs, which a revived coordinator reading
+    // mission-chat would never see). A live NATO callsign (never a project name, so liveUidOf is truthy)
+    // skips this and keeps the normal direct-bus + gone-quiet nag. No-mission projects — including the
+    // 'jarvis' project, which doubles as the solo-brain fallthrough where routeTo MUST return false so
+    // the driver sees the speech — keep the exact prior behaviour.
+    if (!liveUidOf(cs)) {
+        const proj = getProject(cs);
+        if (proj && proj.missionId) return routeToMission(proj.missionId, msg);
+    }
     const uid = liveUidOf(cs) || projectWorkerUid(cs);
     if (!uid) return false;
     busAppend({ from: 'human', to: uid, kind: 'speech', text: msg }, SPEECH_DEBOUNCE);
