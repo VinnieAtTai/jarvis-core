@@ -863,6 +863,14 @@ function retireSession(uid, summary, opts = {}) {
         handoff: s.handoff || null, board,
     }, null, 1));
 
+    // A retiring SUB-WORKER feeds its outcome back to its parent project's durable log (gap G3) so the
+    // coordinator and the next worker rebuild the mission story from finished work with zero bookkeeping.
+    // parentProject/project are mutually exclusive (registerSession enforces it), so this fires only for
+    // a sub-worker; the project-coordinator path below keeps its own "manager retired" append.
+    if (s.parentProject && !s.project && s.summary) {
+        try { appendProjectLog(s.parentProject, cs, 'sub-worker retired: ' + s.summary); } catch { }
+    }
+
     if (s.project) {
         // Project worker: the durable project column stays put; just spawn the successor
         // (which re-attaches to the project on register). No NATO column to delete/transfer.
