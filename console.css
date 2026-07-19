@@ -3,7 +3,7 @@
    #main fills the remaining height; the only scroll regions are the chat log (#left) and the
    board list (#right), each bounded by min-height:0 + its own overflow. No page-level stacking. */
 html,body{height:100%}
-body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;padding:16px;box-sizing:border-box;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;margin:0;padding:16px;box-sizing:border-box;height:100vh;overflow:hidden;display:flex;flex-direction:column}
 #status{flex:none;font-size:22px;font-weight:bold;padding:10px 14px;border-radius:8px;background:#16202c;margin-bottom:10px}
 #status.listening{color:#5dd97c}#status.speaking{color:#5db4d9}#status.muted{color:#d9a05d}#status.paused{color:#d9a05d}#status.error{color:#e06c6c}
 #interim{flex:none;display:flex;align-items:center;gap:10px;color:#7a8a9c;min-height:1.5em;margin-bottom:10px;font-style:italic}
@@ -13,7 +13,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 #main{display:flex;gap:20px;flex:1 1 auto;min-height:0;overflow:hidden}
 #left{flex:3;min-width:0;display:flex;flex-direction:column;min-height:0}
 #bar{display:flex;gap:8px;margin-top:0;align-items:center}
-.btn{background:#16202c;border:1px solid #1f2c3a;color:#7a8a9c;border-radius:6px;padding:2px 10px;font:12px Consolas,monospace;cursor:pointer}
+.btn{background:#16202c;border:1px solid #1f2c3a;color:#7a8a9c;border-radius:6px;padding:2px 10px;font:12px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;cursor:pointer}
 .btn.on{color:#5db4d9;border-color:#5db4d9}
 .btn.wind{color:#e0b050;border-color:#5a4a2a}
 .btn.wind:hover{color:#ffcc5a;border-color:#e0b050;background:#241d12}
@@ -22,20 +22,20 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 #chatpanel{display:flex;flex-direction:column;gap:8px;padding:10px;flex:1;min-height:0;overflow:hidden}
 #chatinput{display:flex;gap:8px;align-items:flex-end}
 #chatinput #typebox{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:8px 12px;font-size:14px;font-family:inherit;line-height:1.35;resize:vertical;max-height:40vh}
-#chatinput #sendto{flex:none;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:7px 8px;font:12px Consolas,monospace;max-width:120px}
+#chatinput #sendto{flex:none;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:7px 8px;font:12px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;max-width:120px}
 #calcard{display:flex;flex-direction:column;gap:8px}
 #calbar{display:flex;gap:8px}
 #addtask{display:flex;gap:8px;align-items:center;padding:8px 10px}
-#addtask #atext{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 10px;font:13px Consolas,monospace}
-#addtask #atcol{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:12px Consolas,monospace;max-width:130px}
+#addtask #atext{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 10px;font:13px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace}
+#addtask #atcol{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:12px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;max-width:130px}
 #rawlog b{color:#5db4d9}
 .row{display:flex}.row.me{justify-content:flex-end}
 .bubble{max-width:70%;padding:7px 11px;border-radius:12px;border-bottom-left-radius:4px;white-space:pre-wrap;word-break:break-word;font-size:13px;background:#1a2533}
 .bubble .mdh{font-weight:700;color:#e6d9b8;margin:3px 0}
 .bubble ul.mdl,.bubble ol.mdl{margin:3px 0;padding-left:20px}
 .bubble ul.mdl li,.bubble ol.mdl li{margin:1px 0}
-.bubble pre.cb{background:#0b1016;border:1px solid #24303f;border-radius:5px;padding:6px 8px;margin:4px 0;overflow-x:auto;white-space:pre;font-family:ui-monospace,Consolas,monospace;font-size:12px}
-.bubble code.ic{background:#0b1016;border:1px solid #24303f;border-radius:3px;padding:1px 4px;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+.bubble pre.cb{background:#0b1016;border:1px solid #24303f;border-radius:5px;padding:6px 8px;margin:4px 0;overflow-x:auto;white-space:pre;font-family:ui-monospace,Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;font-size:12px}
+.bubble code.ic{background:#0b1016;border:1px solid #24303f;border-radius:3px;padding:1px 4px;font-family:ui-monospace,Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;font-size:12px}
 .bubble code.ic.cpy{cursor:pointer}
 .bubble code.ic.cpy:hover::after{content:"\1F4CB";font-size:9px;margin-left:4px;opacity:.7}
 .bubble table.mdt{border-collapse:collapse;margin:4px 0;font-size:12px}
@@ -70,7 +70,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .bubble.pinflash{animation:pinflash 1.4s ease-out}
 @keyframes pinflash{0%{box-shadow:0 0 0 2px #c9b98a}60%{box-shadow:0 0 0 2px #c9b98a}100%{box-shadow:0 0 0 0 rgba(201,185,138,0)}}
 .pinstrip{background:#0d1420;border:1px solid #3a3420;border-radius:6px;margin-bottom:8px;overflow:hidden}
-.pinhead{cursor:pointer;font:bold 10px Consolas,monospace;letter-spacing:.5px;color:#c9b98a;padding:4px 8px;display:flex;align-items:center;gap:5px;user-select:none}
+.pinhead{cursor:pointer;font:bold 10px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;letter-spacing:.5px;color:#c9b98a;padding:4px 8px;display:flex;align-items:center;gap:5px;user-select:none}
 .pinhead:hover{color:#e6d49a}
 .pincaret{font-size:9px}
 .pincount{margin-left:auto;color:#7a8a9c;font-weight:normal}
@@ -92,7 +92,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .wtitle{font-weight:bold;letter-spacing:1px;font-size:12px;margin:8px 0 2px}
 .wtitle.working{color:#e8c35a}.wtitle.queued{color:#7a8a9c}.wtitle.done{color:#5dd97c}
 .witem{padding:3px 0 3px 6px;font-size:13px;border-left:2px solid transparent}
-.tchip{display:inline-block;font:bold 9px Consolas,monospace;letter-spacing:.5px;padding:0 4px;border-radius:3px;margin:0 5px 0 1px;vertical-align:middle;border:1px solid currentColor;cursor:default}
+.tchip{display:inline-block;font:bold 9px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;letter-spacing:.5px;padding:0 4px;border-radius:3px;margin:0 5px 0 1px;vertical-align:middle;border:1px solid currentColor;cursor:default}
 .tchip.bug{color:#e06c6c}.tchip.sec{color:#e0a85d}.tchip.rob{color:#b48ce0}.tchip.fea{color:#5dd97c}.tchip.rev{color:#5db4d9}.tchip.wrk{color:#e8c35a}.tchip.fs{color:#7fc4e0}.tchip.mnt{color:#9bb0c4}.tchip.psh{color:#d9a05d}.tchip.nte{color:#7a8a9c}
 .witem.working{color:#f0e0b0;border-left-color:#e8c35a}
 .witem.queued{color:#9bb0c4}
@@ -105,7 +105,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .needs{color:#fff;background:#a33;border-radius:4px;padding:0 5px;font-weight:bold;letter-spacing:1px}
 .nmlabel{color:#5db4d9;font-weight:bold;font-size:11px;letter-spacing:1px}
 .nmtime{color:#7a8a9c;font-size:11px}
-#caltext{width:100%;height:110px;background:#0d1420;color:#d7e3f0;border:1px solid #1f2c3a;border-radius:6px;font:12px Consolas,monospace;margin:6px 0;box-sizing:border-box}
+#caltext{width:100%;height:110px;background:#0d1420;color:#d7e3f0;border:1px solid #1f2c3a;border-radius:6px;font:12px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;margin:6px 0;box-sizing:border-box}
 .evrow{display:flex;align-items:center;gap:6px}
 .evrow > span:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .evicons{margin-left:auto;white-space:nowrap}
@@ -141,33 +141,33 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .mmsg{font-size:11px;color:#566270;margin-top:6px;font-style:italic}
 .mission .mitem+.mitem{margin-top:11px;padding-top:11px;border-top:1px solid #1f2c3a}
 #stabs{display:flex;gap:5px;flex-wrap:wrap;align-items:center;padding:0 0 8px;border-bottom:1px solid #1f2c3a;margin-bottom:2px}
-.stab{background:#16202c;border:1px solid #1f2c3a;color:#9bb0c4;border-radius:6px;padding:4px 12px;cursor:pointer;font:bold 12px Consolas,monospace;letter-spacing:1px}
+.stab{background:#16202c;border:1px solid #1f2c3a;color:#9bb0c4;border-radius:6px;padding:4px 12px;cursor:pointer;font:bold 12px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;letter-spacing:1px}
 .stab.active{color:#5db4d9;border-color:#5db4d9;background:#0d1420}
 .stab.plus{color:#5dd97c;font-size:15px;font-weight:bold;padding:2px 13px}
 .stab.plus:hover{color:#7dffa0;border-color:#5dd97c}
 #newsessbox{display:flex;gap:8px;margin:6px 0 0;align-items:center}
 .nsmode{display:flex;border:1px solid #1f2c3a;border-radius:6px;overflow:hidden;flex:none}
-.nsmodebtn{padding:6px 10px;font:12px Consolas,monospace;color:#7a8a9c;cursor:pointer;background:#0d1420}
+.nsmodebtn{padding:6px 10px;font:12px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;color:#7a8a9c;cursor:pointer;background:#0d1420}
 .nsmodebtn.on{color:#5db4d9;background:#16202c}
 .schedhead{display:flex;align-items:center;justify-content:space-between;gap:8px}
 .schedfilter{display:flex;border:1px solid #1f2c3a;border-radius:5px;overflow:hidden;flex:none}
-.sfbtn{padding:1px 7px;font:bold 10px Consolas,monospace;letter-spacing:.5px;color:#7a8a9c;cursor:pointer;background:#0d1420}
+.sfbtn{padding:1px 7px;font:bold 10px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;letter-spacing:.5px;color:#7a8a9c;cursor:pointer;background:#0d1420}
 .sfbtn.on{color:#5db4d9;background:#16202c}
 .sfbtn:hover{color:#9bb0c4}
 .schedhacts{display:flex;align-items:center;gap:6px;flex:none}
-.schedact{padding:1px 7px;font:bold 11px Consolas,monospace;color:#7a8a9c;cursor:pointer;border:1px solid #1f2c3a;border-radius:5px;background:#0d1420;white-space:nowrap}
+.schedact{padding:1px 7px;font:bold 11px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;color:#7a8a9c;cursor:pointer;border:1px solid #1f2c3a;border-radius:5px;background:#0d1420;white-space:nowrap}
 .schedact:hover{color:#5db4d9;border-color:#2a3c4e}
 .schedstaleacts{display:flex;gap:8px;margin-top:5px}
-#nsmeeting{max-width:240px;background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:13px Consolas,monospace}
-#nsrepo{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:13px Consolas,monospace}
-#nspurpose{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:8px 12px;font:14px Consolas,monospace}
+#nsmeeting{max-width:240px;background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:13px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace}
+#nsrepo{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:6px 8px;font:13px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace}
+#nspurpose{flex:1;min-width:0;background:#0d1420;border:1px solid #1f2c3a;border-radius:8px;color:#dde6ef;padding:8px 12px;font:14px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace}
 .stab.dead{color:#566270}
-.stabsub{flex-basis:100%;color:#7a8a9c;font:11px Consolas,monospace;letter-spacing:0;margin:3px 2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stabsub{flex-basis:100%;color:#7a8a9c;font:11px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;letter-spacing:0;margin:3px 2px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .stab.needs{color:#fff;background:#a33;border-color:#e06c6c;animation:needpulse 1.4s infinite}
 .stab.mission{color:#c9b98a;border-color:#3a3420}
 .stab.mission.active{color:#e6d49a;border-color:#c9b98a;background:#0d1420}
 .mfilter{display:flex;flex-wrap:wrap;gap:5px;align-items:center;padding:0 2px 8px;margin-bottom:6px;border-bottom:1px solid #1f2c3a}
-.mfchip{font:bold 10px Consolas,monospace;letter-spacing:.5px;color:#7a8a9c;background:#0d1420;border:1px solid #1f2c3a;border-radius:5px;padding:2px 8px;cursor:pointer}
+.mfchip{font:bold 10px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;letter-spacing:.5px;color:#7a8a9c;background:#0d1420;border:1px solid #1f2c3a;border-radius:5px;padding:2px 8px;cursor:pointer}
 .mfchip:hover{color:#c9b98a;border-color:#3a3420}
 .mfchip.on{color:#e6d49a;background:#16202c;border-color:#c9b98a}
 .sbadge{color:#fff;background:#a33;border-radius:8px;padding:0 5px;margin-left:6px;font-size:10px}
@@ -207,7 +207,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .asum{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
 .atitle{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#c3d2df;line-height:16px}
 .aepi{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#6a7a8c;line-height:14px}
-.archfilter{width:100%;box-sizing:border-box;background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:5px 9px;font:12px Consolas,monospace;margin:4px 0 6px}
+.archfilter{width:100%;box-sizing:border-box;background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:5px 9px;font:12px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;margin:4px 0 6px}
 .archfilter:focus{outline:none;border-color:#5db4d9}
 .archempty{color:#7a8a9c;font-size:11px;font-style:italic;padding:4px 2px}
 .holdhead{color:#d9a05d}
@@ -224,7 +224,7 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .ract.del:hover{color:#e06c6c}
 .permreq{background:#2a1a1a;border:1px solid #a33;border-radius:6px;padding:6px 8px;margin:5px 0}
 .permhead{color:#e8a05a;font-size:11px;font-weight:bold}
-.permdetail{color:#d7e3f0;font-size:11px;font-family:Consolas,monospace;word-break:break-all;margin:3px 0;max-height:64px;overflow:auto}
+.permdetail{color:#d7e3f0;font-size:11px;font-family:Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;word-break:break-all;margin:3px 0;max-height:64px;overflow:auto}
 .permbtns{display:flex;gap:6px;margin-top:5px}
 .pbtn{cursor:pointer;font-size:11px;padding:2px 11px;border-radius:5px;border:1px solid #1f2c3a;background:#16202c;color:#9bb0c4;user-select:none}
 .pbtn.ok{color:#5dd97c;border-color:#5dd97c}
@@ -258,13 +258,13 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,monospace;margin:0;
 .cpybtn:hover{opacity:1;background:#1c2a38}
 /* phone alerts (ntfy) control */
 #notifybar{display:flex;gap:6px;align-items:center;margin-top:8px}
-#notifybar input{flex:1;min-width:0;background:#0d1420;border:1px solid #24323f;color:#d7e3f0;border-radius:5px;padding:4px 8px;font:12px Consolas,monospace}
+#notifybar input{flex:1;min-width:0;background:#0d1420;border:1px solid #24323f;color:#d7e3f0;border-radius:5px;padding:4px 8px;font:12px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace}
 .ntlabel{font-size:15px}
 .ntstatus{font-size:11px;color:#7a8a9c;white-space:nowrap}
 .ntstatus.on{color:#5dd97c}
 /* Conversational ASK tab — direct model chat (talks to /ai/*, not the speech bus) */
 #aibar{gap:8px;align-items:center;flex-wrap:wrap;padding:2px 0}
-#aibar select{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:5px 8px;font:12px Consolas,monospace;max-width:220px}
+#aibar select{background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#dde6ef;padding:5px 8px;font:12px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;max-width:220px}
 #aithreads{flex:1;min-width:90px}
 #aichat{flex-direction:column;gap:6px;overflow-y:auto;flex:1;min-height:0;background:#0d1420;border-radius:6px;padding:10px}
 .aispend{margin-left:auto;font-size:12px;color:#7a8a9c;white-space:nowrap;font-variant-numeric:tabular-nums}
