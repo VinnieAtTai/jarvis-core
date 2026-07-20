@@ -25,6 +25,12 @@ If your boot instructions name a pin (e.g. "Register with pin: golf"), include
 `"pin":"golf"` in the register body — the hub pre-assigned you that callsign when it
 spawned you, so claiming it keeps your session, the roster, and the board in sync.
 
+Echo EVERY field your boot line names into the register body, not just the pin. If it says
+`project: jarvis`, add `"project":"jarvis"` (that binds you as the project's coordinator);
+if it says `parentProject: jarvis`, add `"parentProject":"jarvis"` (that nests you as a
+sub-worker under it). Dropping one registers you un-nested — your card won't group under the
+project and your retire summary won't feed back into the project log — so include them.
+
 Both fields are REQUIRED and the purpose matters: it is the description the human sees next
 to your callsign on the board and hears in every announcement, and callsigns alone mean
 nothing to them. Make it specific ("TMS-19966 phase B visual QA", not "coding"). If your
