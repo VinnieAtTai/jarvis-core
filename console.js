@@ -650,6 +650,24 @@ function wedgeIndicator(b) {
         + '. If it stays deaf, restart it from the console.';
     return ' <span class="wedgechip' + (p ? ' hot' : '') + '" title="' + escAttr(tip) + '">DEAF ' + m + 'm</span>';
 }
+// Which mission a board card belongs to, or null.
+//
+// A PROJECT coordinator answers directly: it renders on its project's card and carries that
+// project's projectContext. A SUB-WORKER cannot — it renders on its own NATO card and carries only
+// parentProject (a session is one role or the other, never both), so it has to INHERIT the mission
+// from the project card it hangs under. Without that inheritance a sub-worker matched no mission and
+// never appeared in the rail at all, which is the whole of the "sub-worker cards do not nest" bug:
+// three board cards sat waiting to verify nesting in the browser, but the lookup could never have
+// matched them. Hoisted out of renderMissions so it is unit-testable (test/nesting.test.mjs).
+function missionIdOfCard(b, boards) {
+    if (!b) return null;
+    if (b.projectContext && b.projectContext.missionId) return b.projectContext.missionId;
+    const pp = b.parentProject;
+    if (!pp) return null;
+    const key = String(pp).toLowerCase();
+    const owner = (boards || []).find(x => x && String(x.callsign || '').toLowerCase() === key);
+    return (owner && owner.projectContext && owner.projectContext.missionId) || null;
+}
 // Mission rail: the pinned, always-visible objectives panel (#mission, separate from #work).
 // Phase rows toggle done on click; doc chips open via the document-level data-open listener.
 // There is deliberately NO close control — a mission is closed only by the voice gate.
@@ -657,17 +675,24 @@ function renderMissions(list, boards) {
     if (!missionEl) return;
     if (!list || !list.length) { missionEl.style.display = 'none'; missionEl.innerHTML = ''; return; }
     missionEl.style.display = 'block';
-    // Unified view: nest each live worker session under the mission it belongs to. A card belongs
-    // when card.projectContext.missionId === mission.id. projectContext may be null on plain NATO
-    // workers, so guard with optional chaining. Cards whose missionId matches nothing aren't dropped
-    // here — they still render as their own board card in workEl below.
+    // Unified view: nest each live worker session under the mission it belongs to — the coordinator
+    // via its own projectContext, its sub-workers by inheriting through parentProject (see
+    // missionIdOfCard). Cards matching no mission aren't dropped here; they still render as their own
+    // board card in workEl below, as coordinators do too.
     const _boards = boards || (lastBoard && lastBoard.boards) || [];
-    const workersFor = (mid) => _boards.filter(b => b && b.uid && b.projectContext?.missionId === mid);
+    // Coordinator first, then its indented sub-workers — an indented row rendering ABOVE the card it
+    // hangs under reads as broken, and /board order does not guarantee it.
+    const workersFor = (mid) => _boards.filter(b => b && b.uid && missionIdOfCard(b, _boards) === mid)
+        .sort((a, b) => (a.parentProject ? 1 : 0) - (b.parentProject ? 1 : 0));
     const workerRow = (b) => {
         const cs = String(b.callsign || '').toUpperCase();
         const idle = b.alive === false;
         const doing = b.needsYou ? 'NEEDS YOU' : (b.doing || (idle ? 'quiet' : 'standing by'));
-        return '<div class="mworker" style="display:flex;align-items:baseline;gap:6px;font-size:11px;padding:2px 0;color:' + (idle ? '#6b7a89' : '#9bb0c4') + '">'
+        // A sub-worker is indented under its coordinator so the rail shows the hierarchy rather than
+        // one flat list — the coordinator is the brain, the rest hang off it.
+        const sub = !!(b.parentProject && !(b.projectContext && b.projectContext.missionId));
+        return '<div class="mworker" style="display:flex;align-items:baseline;gap:6px;font-size:11px;padding:2px 0' + (sub ? ' 2px 12px' : '') + ';color:' + (idle ? '#6b7a89' : '#9bb0c4') + '">'
+            + (sub ? '<span style="color:#3d5568;font-size:10px">&#8627;</span>' : '')
             + '<span style="font-weight:bold;color:' + (idle ? '#6b7a89' : '#c9b98a') + ';letter-spacing:.5px">' + esc(cs) + '</span>'
             + activityIndicator(b)
             + '<span style="opacity:.9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(doing) + '</span>'
