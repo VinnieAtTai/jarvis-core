@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, focusHeldByLiveOther, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, focusHeldByLiveOther, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -782,6 +782,26 @@ function eventsFor(uid, cursor) {
     }
     return { cursor: busBase + bus.length, events };
 }
+// How many bused events this session has NOT picked up, measured from the cursor it last polled
+// with. Zero for a session that has never polled — we cannot claim it is ignoring anything until
+// it tells us where it is. Feeds the `pending` count on a wedge flag: a deaf worker with 0 pending
+// is a curiosity, a deaf worker with the human's words queued behind it is an outage.
+function pendingFor(uid) {
+    const s = roster.sessions[uid];
+    if (!s || !Number.isFinite(s.pollCursor)) return 0;
+    let n = 0;
+    for (let i = Math.max(0, s.pollCursor - busBase); i < bus.length; i++) {
+        const e = bus[i];
+        if (e.to === uid || e.to === 'all') n++;
+    }
+    return n;
+}
+// Is this session green-but-deaf? Wraps the pure detector with the two things it cannot know:
+// which session we mean, and what is queued behind it.
+function wedgedNow(uid) {
+    const s = roster.sessions[uid];
+    return s ? wedgeState(s, Date.now(), { pending: pendingFor(uid) }) : null;
+}
 function registerSession(cwd, purpose, pin, project, parentProject) {
     const cs = assignCallsign(pin);
     pendingPins.delete(cs);
@@ -970,7 +990,18 @@ function routeTo(cs, msg) {
             enqueueSay(cs + ' has not checked in for ' + mins + ' minute' + (mins === 1 ? '' : 's') + '. Queueing for it.' + hint, 'jarvis');
         }
     } else {
-        delete nagAt[cs];
+        // Alive by lastSeen, but is anyone actually LISTENING? A wedged session accepts the message
+        // into its queue and never reads it, which reads as being ignored -- the human keeps talking
+        // to a corpse with no idea anything is wrong. Say it out loud, on the same 5-min nag throttle
+        // as gone-quiet, because this is the moment it matters: they just spoke.
+        const wedge = wedgedNow(uid);
+        if (wedge && Date.now() - (nagAt[cs] || 0) > 300000) {
+            nagAt[cs] = Date.now();
+            enqueueSay(cs + ' looks wedged. Its heartbeat is fine but it has not checked its inbox in '
+                + wedge.minutes + ' minute' + (wedge.minutes === 1 ? '' : 's') + ', so it may not hear that. Restart it from the console if it stays quiet.', 'jarvis');
+        } else if (!wedge) {
+            delete nagAt[cs];
+        }
     }
     return true;
 }
@@ -1771,6 +1802,10 @@ async function handleRequest(req, res) {
                 cwd: uid ? (roster.sessions[uid].cwd || '') : '',
                 purpose: uid ? roster.sessions[uid].purpose : '',
                 alive: cs === 'jarvis' ? true : (uid ? aliveNow(uid) : false),
+                // Green but DEAF: heartbeat ticking, poll loop dead. `alive` above cannot see this
+                // (both endpoints feed it), so the card needs its own signal or the session lies
+                // green through the whole outage. { minutes, pending } or null.
+                wedged: (uid && cs !== 'jarvis') ? wedgedNow(uid) : null,
                 context: uid && roster.sessions[uid].ctx !== undefined ? roster.sessions[uid].ctx : null,
                 doing: uid ? roster.sessions[uid].doing || '' : '',
                 watching: uid ? watchingNow(uid) : null,
@@ -2098,7 +2133,12 @@ async function handleRequest(req, res) {
         const s = roster.sessions[uid];
         if (!s) return json(res, 404, { error: 'unknown uid' });
         if (s.ended) return json(res, 410, { error: 'retired' });
-        s.lastSeen = new Date().toISOString();
+        // lastPoll is tracked APART from lastSeen so a dead poll loop stays visible. Both /poll and
+        // /heartbeat bump lastSeen, so lastSeen alone cannot tell a working session from a deaf one
+        // whose background ping is still firing (see wedgeState). pollCursor is what this worker has
+        // consumed -- it's how pendingFor knows how many events it is currently ignoring.
+        s.lastSeen = s.lastPoll = new Date().toISOString();
+        s.pollCursor = cursor;
         saveRosterThrottled();
         const out = eventsFor(uid, cursor);
         if (out.events.length) return json(res, 200, out);
@@ -2121,11 +2161,13 @@ async function handleRequest(req, res) {
         // that never relaunch the event poll loop -- the loop only re-runs on a turn boundary,
         // so one 45-min turn would otherwise let lastSeen go stale and aliveNow() flip false.
         // It does NOT return events and NEVER blocks: bump lastSeen and reply immediately.
+        // It must NOT touch lastPoll -- keeping the two apart is the whole wedge detector: this
+        // endpoint proves a timer is alive, /poll proves the worker's EARS are.
         const uid = u.searchParams.get('uid');
         const s = roster.sessions[uid];
         if (!s) return json(res, 404, { error: 'unknown uid' });
         if (s.ended) return json(res, 410, { error: 'retired' });
-        s.lastSeen = new Date().toISOString();
+        s.lastSeen = s.lastBeat = new Date().toISOString();
         saveRosterThrottled();
         return json(res, 200, { ok: true });
     }

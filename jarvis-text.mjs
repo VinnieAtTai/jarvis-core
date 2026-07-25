@@ -546,6 +546,38 @@ export function focusHeldByLiveOther(focus, sessions, callsigns, newUid, now, st
     return Number.isFinite(t) && (now - t) < staleMs;
 }
 
+// A session's liveness has TWO independent signals, and they can disagree. `/heartbeat` is a dumb
+// background timer; `/poll` is the worker's actual event loop -- its ears. When the poll loop dies
+// but the heartbeat timer keeps ticking, the session looks perfectly green while being completely
+// DEAF. That took PrimeNG down for ~12 minutes on 2026-07-24 (coordinator lima): Chris talked, the
+// hub queued his words against a corpse, and nothing on the board looked wrong. `lastSeen` cannot
+// see it, because BOTH endpoints bump it -- which is why the hub now records lastPoll and lastBeat
+// separately and asks this helper whether they disagree.
+//
+// Returns null when there is nothing to report, else { minutes, pending }: how long the session has
+// gone without polling, and how many events are queued that it has not picked up.
+//
+// Deliberately conservative -- it reports POSSIBLY wedged, and stays silent for:
+//   - an ended session, or one with no fresh heartbeat (the ordinary gone-quiet path already says
+//     that, louder -- this is only for the case that path CANNOT see),
+//   - a poll loop that is merely between cycles (grace defaults to 5min, ~12x the 25s long-poll).
+// A long agent turn does not relaunch the poll loop, so a genuinely busy worker can trip this
+// honestly. That is intended: from the human's side, "busy for 6 minutes with my words queued up"
+// and "wedged" are the same outage. `pending` is what separates them -- 0 means nobody is waiting.
+// `now` injected for deterministic tests. Pure: reads, mutates nothing.
+export function wedgeState(s, now, { graceMs = 300000, staleMs = 120000, pending = 0 } = {}) {
+    if (!s || s.ended) return null;
+    const beat = Date.parse(s.lastBeat);
+    if (!Number.isFinite(beat) || (now - beat) >= staleMs) return null;
+    // Never polled at all? Measure from registration: a worker that came up but never launched its
+    // loop is wedged from birth (a real boot failure), not exempt from the check.
+    const ref = Date.parse(s.lastPoll || s.started);
+    if (!Number.isFinite(ref)) return null;
+    const deaf = now - ref;
+    if (deaf < graceMs) return null;
+    return { minutes: Math.floor(deaf / 60000), pending };
+}
+
 // Parse a JSON request body, tolerating the single most common worker mistake: a Windows path
 // pasted into `curl -d` with un-escaped backslashes, e.g. {"cwd":"d:\claude\jarvis-core"}. That
 // is invalid JSON (\c, \j, \u<not-4-hex> are not valid escapes), so a strict JSON.parse throws and

@@ -617,6 +617,19 @@ function watchIndicator(b) {
     return ' <span class="watchdot" title="actively watching ' + escAttr(b.watching) + '"></span>'
         + '<span class="watchlbl">' + esc(b.watching) + '</span>';
 }
+// Amber DEAF chip: the session's heartbeat is fine, so the card is green, but its poll loop has
+// stopped reading its inbox. Without this the card looks perfectly healthy through the entire
+// outage — which is exactly how the PrimeNG coordinator sat wedged for 12 minutes. The tooltip
+// carries the two numbers that decide what to do: how long it has been deaf, and whether anything
+// is stacked up behind it (queued messages = act now; nothing queued = just note it).
+function wedgeIndicator(b) {
+    if (!b.wedged) return '';
+    const m = b.wedged.minutes, p = b.wedged.pending;
+    const tip = 'possibly WEDGED: heartbeat is alive but no poll in ' + m + ' min'
+        + (p ? ' -- ' + p + ' event' + (p === 1 ? '' : 's') + ' queued and unread' : ' -- nothing queued')
+        + '. If it stays deaf, restart it from the console.';
+    return ' <span class="wedgechip' + (p ? ' hot' : '') + '" title="' + escAttr(tip) + '">DEAF ' + m + 'm</span>';
+}
 // Mission rail: the pinned, always-visible objectives panel (#mission, separate from #work).
 // Phase rows toggle done on click; doc chips open via the document-level data-open listener.
 // There is deliberately NO close control — a mission is closed only by the voice gate.
@@ -837,7 +850,8 @@ function renderBoards(d) {
         const cwdChip = b.cwd ? '<span class="cpybtn pathtok" data-copy="' + b64(b.cwd) + '" title="copy path: ' + escAttr(b.cwd) + '">📋</span>' : '';
         const act = activityIndicator(b);
         const watch = watchIndicator(b);
-        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + act + worker + ctx + watch + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
+        const wedge = wedgeIndicator(b);
+        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + act + worker + ctx + watch + wedge + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
         const purpose = b.purpose ? '<div class="cpurpose">' + esc(b.purpose) + '</div>' : '';
         const doing = (b.needsYou || b.doing) ? '<div class="bdoing">' + (b.needsYou ? '<span class="needs">NEEDS YOU</span> ' : '') + esc(b.doing || '') + '</div>' : '';
         const counts = (working.length || queued.length || review.length || done.length) ? '<div class="ccount">'
