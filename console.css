@@ -17,6 +17,11 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,"Segoe UI Emoji","S
 .btn.on{color:#5db4d9;border-color:#5db4d9}
 .btn.wind{color:#e0b050;border-color:#5a4a2a}
 .btn.wind:hover{color:#ffcc5a;border-color:#e0b050;background:#241d12}
+/* Pane-lock: latched "view pinned" state — amber, distinct from the cyan .on toggles; the held
+   chat pane also gets a matching frame (#chat.locked) so the pinned view is unmistakable. */
+.btn.locked{color:#e6d49a;border-color:#c9b98a;background:#241f12}
+.btn.locked:hover{color:#ffe9a8;border-color:#e6d49a}
+#chat.locked{outline:1px solid #c9b98a;outline-offset:-2px}
 #chat{display:flex;flex-direction:column;gap:6px;overflow-y:auto;flex:1;min-height:0;background:#0d1420;border:none;border-radius:6px;padding:10px}
 #rawlog{display:none;overflow-y:auto;flex:1;min-height:0;background:#0d1420;border:none;border-radius:6px;padding:10px;font-size:12px;color:#9bb0c4}
 #chatpanel{display:flex;flex-direction:column;gap:8px;padding:10px;flex:1;min-height:0;overflow:hidden}

@@ -19,6 +19,13 @@ let lastArchive = null;
 let archFilter = '';
 let lastHold = null;
 let activeTab = 'all';
+// —— Pane-lock (view pin). When 2+ workers are live and posting, the console follows the newest
+// activity: the chat auto-scrolls to the last poster, a retiring session bounces the tab back to
+// "all", and the highlighted board focus drifts as the server refocuses. A latched LOCK freezes
+// all three so Chris can hold one pane (a session/mission chat + the board focus) during live QA.
+// Session-local: a reload starts unlocked. Distinct from `pinned` above, which is the chat's
+// scrolled-to-bottom flag; viewLock is a deliberate, user-latched hold.
+let viewLock = false;
 let nsRepos = [];
 // Per-mission worker filter: when Chris pins one worker inside a mission chat, narrow that chat to
 // just that identity. Keyed by mission tab id ('m:<id>') so each mission remembers its own pin;
@@ -381,7 +388,11 @@ function renderChat() {
     rawEl.innerHTML = chatEvts.slice(-200).reverse().map(e =>
         '<div>[' + fmtHMS(e.ts) + '] <b>' + esc(e.kind === 'sys' ? 'SYS' : (e.who === 'you' ? 'YOU' : String(e.who).toUpperCase())) + '</b> ' + esc(e.text) + '</div>'
     ).join('');
-    if (pinned) chatEl.scrollTop = chatEl.scrollHeight;
+    // Auto-scroll to the newest post — the "follow the last poster" behavior. Suppressed while the
+    // view is locked so another worker posting can't yank Chris's reading position; the "↓ latest"
+    // button stays available (shown below) as a manual catch-up.
+    if (pinned && !viewLock) chatEl.scrollTop = chatEl.scrollHeight;
+    jumpEl.style.display = (viewLock || !pinned) ? 'inline-block' : 'none';
 }
 async function pollChat() {
     try {
@@ -453,11 +464,33 @@ function setExpanded(v) { expanded = v; bexp.className = 'btn' + (v ? ' on' : ''
 function setRaw(v) { rawMode = v; braw.className = 'btn' + (v ? ' on' : ''); chatEl.style.display = v ? 'none' : 'flex'; rawEl.style.display = v ? 'block' : 'none'; }
 chatEl.onscroll = () => {
     pinned = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 40;
-    jumpEl.style.display = pinned ? 'none' : 'inline-block';
+    jumpEl.style.display = (viewLock || !pinned) ? 'inline-block' : 'none';
 };
-jumpEl.onclick = () => { pinned = true; chatEl.scrollTop = chatEl.scrollHeight; jumpEl.style.display = 'none'; };
+jumpEl.onclick = () => { pinned = true; chatEl.scrollTop = chatEl.scrollHeight; jumpEl.style.display = viewLock ? 'inline-block' : 'none'; };
 bexp.onclick = () => setExpanded(!expanded);
 braw.onclick = () => setRaw(!rawMode);
+// —— Pane-lock button. Latches the current view (active chat tab + board focus) so the console
+// stops auto-following the last poster: while locked the chat won't auto-scroll to new posts, a
+// retiring session won't bounce the tab back to "all" (see renderTabs), and the highlighted focus
+// is frozen at what it was when locked (see renderBoards). Clear amber "LOCKED" state + a framed
+// chat pane; unlock resumes normal follow and snaps to the newest. Session-local (reload = unlocked).
+const lockBtn = document.getElementById('lockview');
+function renderLock() {
+    lockBtn.className = 'btn' + (viewLock ? ' locked' : '');
+    lockBtn.innerHTML = viewLock ? '🔒 LOCKED' : '🔓 LOCK';
+    lockBtn.title = viewLock
+        ? 'View pinned — holding this pane and the board focus, not following new posters. Click to unlock.'
+        : 'Pin this view — hold this pane and the board focus so the console stops auto-following the last poster. Click to lock.';
+    chatEl.classList.toggle('locked', viewLock);
+}
+lockBtn.onclick = () => {
+    viewLock = !viewLock;
+    if (viewLock && lastBoard) focusCS = lastBoard.focus;   // freeze the focus highlight where it is now
+    if (!viewLock) pinned = true;                           // unlock -> resume following, snap to latest
+    renderLock();
+    if (lastBoard) renderBoards(lastBoard); else renderChat();
+};
+renderLock();
 document.getElementById('bcal').onclick = () => {
     const box = document.getElementById('calbox');
     box.style.display = box.style.display === 'none' ? 'block' : 'none';
@@ -677,7 +710,7 @@ function spinUpMorning() {
         .catch(() => uiToast('Spin-up request failed.', 'error'));
 }
 function renderBoards(d) {
-    focusCS = d.focus;
+    if (!viewLock) focusCS = d.focus;   // locked -> hold the highlighted focus, don't adopt the server's
     lastBoard = d;
     populateAddTaskCols(d);
     renderMissions(d.missions || [], d.boards || []);
@@ -770,7 +803,7 @@ function renderBoards(d) {
         const queued = b.queued || [], done = b.done || [], working = b.working || [], review = b.review || [];
         const cs = b.callsign;
         const dead = b.alive === false && cs !== 'jarvis';
-        const focused = cs === d.focus;
+        const focused = cs === (viewLock ? focusCS : d.focus);   // frozen focus while locked
         let btns = '';
         const holdBtn = '<span class="cbtn" data-act="hold" data-cs="' + esc(cs) + '" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="park on hold (resume later — distinct from closing)">💤</span>';
         if (dead) {
@@ -1476,7 +1509,7 @@ function renderTabs() {
     for (const e of chatEvts) { const w = e.who; if (!w || _skip.has(w) || _liveSet.has(w)) continue; _deadLast[w] = e.ts || _deadLast[w]; }
     const deadTabs = Object.keys(_deadLast).sort((a, b) => Date.parse(_deadLast[b] || 0) - Date.parse(_deadLast[a] || 0)).slice(0, 4);
     const ids = base.concat(missionTabs.map(m => m.id)).concat(sessions.map(b => b.callsign)).concat(deadTabs);
-    if (!ids.includes(activeTab)) activeTab = 'all';
+    if (!ids.includes(activeTab) && !viewLock) activeTab = 'all';   // locked -> hold the pinned tab, don't bounce to "all"
     let html = base.map(id => '<span class="stab' + (id === activeTab ? ' active' : '') + '" data-tab="' + id + '">' + id.toUpperCase() + '</span>').join('');
     // One tab per mission — the single chat for that whole project (mission color token #c9b98a).
     html += missionTabs.map(m => '<span class="stab mission' + (m.id === activeTab ? ' active' : '') + '" data-tab="' + escAttr(m.id) + '" title="' + escAttr(m.title + ' — all workers on this mission') + '">' + esc(m.label.toUpperCase()) + '</span>').join('');

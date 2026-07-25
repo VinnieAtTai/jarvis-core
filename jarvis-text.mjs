@@ -516,6 +516,36 @@ export function lastProjectCwd(sessions, name) {
     return best;
 }
 
+// Resolve which session currently HOLDS console focus. Focus is one of: the solo brain 'jarvis'
+// (holds no session), a live NATO callsign, or a project name hosting a coordinator. Returns the
+// holder's uid, or null when focus is idle/on jarvis/unresolvable. `callsigns` maps a NATO callsign
+// to [newest..oldest uid] (roster.callsigns); `sessions` is roster.sessions. Pure: reads, mutates
+// nothing.
+export function focusHolderUid(focus, sessions, callsigns) {
+    if (!focus || focus === 'jarvis' || !sessions || typeof sessions !== 'object') return null;
+    const l = callsigns && callsigns[focus];
+    if (l && l.length) {                          // focus is a NATO callsign -> its newest session
+        const s = sessions[l[0]];
+        return (s && !s.ended) ? l[0] : null;
+    }
+    return pickProjectWorker(sessions, focus);    // else treat focus as a project name
+}
+
+// Would a newly-registered session (newUid) STEAL console focus from the human's live conversation
+// with a DIFFERENT worker? True only when focus is currently held by ANOTHER session that is not
+// ended and was seen within `staleMs`. So: re-grabbing your own focus is never a steal (uid ===
+// newUid -> false), and a gone-quiet/dead holder never blocks a legitimate grab (stale -> false).
+// This is the guard that stops a successor/sub-worker register from yanking the human off a
+// coordinator mid-walkthrough. `now` + `staleMs` injected for deterministic tests. Pure.
+export function focusHeldByLiveOther(focus, sessions, callsigns, newUid, now, staleMs = 120000) {
+    const uid = focusHolderUid(focus, sessions, callsigns);
+    if (!uid || uid === newUid) return false;
+    const s = sessions[uid];
+    if (!s || s.ended) return false;
+    const t = Date.parse(s.lastSeen);
+    return Number.isFinite(t) && (now - t) < staleMs;
+}
+
 // Parse a JSON request body, tolerating the single most common worker mistake: a Windows path
 // pasted into `curl -d` with un-escaped backslashes, e.g. {"cwd":"d:\claude\jarvis-core"}. That
 // is invalid JSON (\c, \j, \u<not-4-hex> are not valid escapes), so a strict JSON.parse throws and

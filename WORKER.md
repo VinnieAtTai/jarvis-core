@@ -88,6 +88,16 @@ dead for the whole turn. The ping prevents that; the poll loop stays your inbox.
 - Default channel: `POST /send {"from":"<uid>","to":"human","text":"..."}` — silent text in
   the console chat. The human reads much faster than they can listen; findings, options,
   status, code, paths, anything longer than one sentence goes here.
+- **Write in Markdown, sparingly — it is the house style.** The console renders it, so lead
+  with the answer and keep it short. Add structure only where it earns its place: a couple of
+  **bold** keywords (not half the message — bolding everything bolds nothing), a short bullet
+  list, a table or fenced code block when it genuinely helps (use `\n` in the JSON for line
+  breaks). Restraint over decoration; taste, not a wall of chrome. Text channels only —
+  `/say` is spoken aloud, so keep it plain (no markup).
+- **ASCII only in `curl` bodies.** You post via `curl.exe` on Windows, whose codepage mangles
+  non-ASCII bytes into tofu (the U+FFFD replacement glyph). So no smart quotes, em/en dashes,
+  section signs, arrows, or emoji in `/send`, `/say`, or `/worklist` text -- use `-`, `--`,
+  `->`, and straight quotes instead.
 - Speak ONLY headlines: `POST /say {"from":"<uid>","text":"..."}` — one short, super high
   level sentence ("Build is green." / "Found the timeout cause, details in chat."). Never
   read details, lists, or numbers aloud.
@@ -111,7 +121,15 @@ curl.exe -s -X POST http://127.0.0.1:8124/worklist -H "content-type: application
 ```
 
 `op` is one of `add` (to queued), `start` (queued -> working), `done` (working -> done),
-`drop`, `clear-done`, `move` (with `"to":"<callsign>"`). Matching is by substring.
+`ready` (back to queued — your undo for a `start` that grabbed the wrong card, or for
+un-finishing something), `review` (-> review, for work that is done but awaits the human's
+eyeball), `top` (bump a card to the head of whatever list it is already in), `drop`,
+`clear-done`, and `move` (with `"to":"<callsign>"`).
+
+Matching is by SUBSTRING and the first hit wins, so pass enough of the text to be unique —
+a short needle can quietly move a card you did not mean to touch. If that happens, `ready`
+it back and retry with a longer one. A needle that matches nothing returns 404 `no task
+matching <text>`, so a silent no-op means you matched something else.
 
 **Prefix task text with a category tag** so the board renders a colored chip (Chris likes the
 context-at-a-glance): start the text with one of `BUG: SECURITY: ROBUST: FEATURE: REVIEW:

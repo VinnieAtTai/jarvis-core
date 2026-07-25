@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, focusHeldByLiveOther, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -624,7 +624,7 @@ function anthropicKey() {
 }
 // Short JARVIS persona for the tab — deliberately NOT the worker system prompt; this is a direct
 // chat with no tools. Kept terse so it stays cheap on every turn.
-const AI_SYSTEM = "You are JARVIS, Chris's terse, capable AI copilot, answering inside his command console. This is a direct chat — you have no tools and cannot run code or read files here. Lead with the conclusion, then only the reasoning that earns its place. Be concrete and brief; spell things out only when it genuinely helps. If you don't know or can't tell from the conversation, say so plainly.";
+const AI_SYSTEM = "You are JARVIS, Chris's terse, capable AI copilot, answering inside his command console. This is a direct chat — you have no tools and cannot run code or read files here. Lead with the conclusion, then only the reasoning that earns its place. Be concrete and brief; spell things out only when it genuinely helps. The console renders Markdown — use it: bold key terms, bullet lists, tables, and fenced code blocks so replies stay scannable. If you don't know or can't tell from the conversation, say so plainly.";
 // One non-streaming Anthropic call. Opus gets adaptive thinking + effort (per CONVERSATIONAL-TAB.md
 // and the claude-api skill); Sonnet/Haiku go plain (effort/adaptive 400s on Haiku). Returns the
 // joined text blocks (thinking blocks come back empty-text by default and are skipped) + usage.
@@ -807,7 +807,14 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
     // in the register response so it resumes from minute one without a second round-trip.
     if (proj) { try { ensureProject(proj, purpose); setProjectManager(proj, uid); } catch { } }
     let focusedNote = '';
-    if (proj) { w.focus = proj; focusedNote = ' Focused on ' + proj + '.'; }
+    // Don't STEAL focus from the human's live conversation with a DIFFERENT worker. A project
+    // worker (successor or fresh) binds to its column regardless, but must not yank the human's
+    // voice onto itself while a different live session already holds focus — e.g. a coordinator
+    // mid-walkthrough. Grab focus only when it's idle: on 'jarvis', a dead/stale target, or this
+    // very session. (The human can always say a callsign to switch back.) Decision is a pure,
+    // unit-tested helper in jarvis-text.mjs (test/focus.test.mjs).
+    const focusHeldByOther = focusHeldByLiveOther(w.focus, roster.sessions, roster.callsigns, uid, Date.now());
+    if (proj && !focusHeldByOther) { w.focus = proj; focusedNote = ' Focused on ' + proj + '.'; }
     else if (liveCallsigns().length === 1) { w.focus = cs; focusedNote = ' Focused on it.'; }
     saveWork(w);
     const reborn = roster.callsigns[cs].length > 1;
@@ -1709,14 +1716,18 @@ function handleUtterance(rawText, typed) {
 }
 
 function json(res, code, obj) {
-    res.writeHead(code, { 'content-type': 'application/json' });
+    res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify(obj));
 }
 function readBody(req) {
     return new Promise((resolve) => {
-        let data = '';
-        req.on('data', c => { data += c; if (data.length > 30e6) req.destroy(); });
-        req.on('end', () => resolve(parseBodyLenient(data)));
+        // Collect raw Buffers and decode ONCE at the end. `data += chunk` decodes each chunk
+        // independently, so a multibyte UTF-8 char split across a chunk boundary would corrupt
+        // into U+FFFD (the tofu bug); Buffer.concat then toString('utf8') decodes the whole body.
+        const chunks = [];
+        let len = 0;
+        req.on('data', c => { chunks.push(c); len += c.length; if (len > 30e6) req.destroy(); });
+        req.on('end', () => resolve(parseBodyLenient(Buffer.concat(chunks).toString('utf8'))));
     });
 }
 
