@@ -182,8 +182,18 @@ function inlineMd(line) {
 // richText walks lines into blocks: ```fenced code```, # / ## / ### headings, - / * bullet lists,
 // 1. / 1) numbered lists, blank-line spacers, and plain paragraphs (consecutive lines joined by
 // <br>). Block runs are consumed greedily so a list/code block stays one element.
+// A worker that double-escapes its JSON body sends the two characters backslash+n instead of a real
+// newline, so its whole message lands as one blob with visible \n markers and no structure at all
+// (seen from kilo on PS-1995). Rewrite ONLY when the text has no real newlines but does carry
+// literal ones -- that combination is unambiguous double-escaping. A message that already has real
+// line breaks is left alone, because there a \n is far more likely to be genuine content (a regex,
+// a code sample) than a mistake.
+function fixEscapedBreaks(s) {
+    if (s.includes('\n') || !/\\[nt]/.test(s)) return s;
+    return s.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+}
 function richText(raw) {
-    const lines = String(raw == null ? '' : raw).split('\n');
+    const lines = fixEscapedBreaks(String(raw == null ? '' : raw)).split('\n');
     const isFence = (l) => /^\s*```/.test(l);
     const isHead = (l) => /^#{1,3}\s+\S/.test(l);
     const isUl = (l) => /^\s*[-*]\s+\S/.test(l);
@@ -191,14 +201,24 @@ function richText(raw) {
     const isTableSep = (l) => /-/.test(l) && /^\s*\|?[-:\s|]+\|?\s*$/.test(l);
     const isTableTop = (n) => lines[n].includes('|') && n + 1 < lines.length && isTableSep(lines[n + 1]);
     const splitRow = (l) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim());
-    const isBlock = (l) => isFence(l) || isHead(l) || isUl(l) || isOl(l);
+    // A fence only OPENS a code block if a closing fence exists after it; a stray trailing ``` is
+    // just text. Precomputed rather than scanning ahead per line, and consulted by blockAt so the
+    // paragraph branch below still consumes an unclosed fence -- otherwise it would match neither a
+    // block nor a paragraph, `i` would never advance, and the console would hang on that message.
+    const lastFence = lines.reduce((acc, l, n) => (isFence(l) ? n : acc), -1);
+    const opensFence = (n) => isFence(lines[n]) && n < lastFence;
+    const blockAt = (n) => opensFence(n) || isHead(lines[n]) || isUl(lines[n]) || isOl(lines[n]);
     let html = '', i = 0;
     while (i < lines.length) {
         const line = lines[i];
-        if (isFence(line)) {
+        // An UNCLOSED fence used to swallow the entire rest of the message into one code block, so a
+        // single stray ``` blanked the formatting of everything after it. Only treat a fence as a
+        // code block when its closer actually exists; otherwise fall through and render the line as
+        // ordinary text.
+        if (opensFence(i)) {
             const buf = []; i++;
             while (i < lines.length && !isFence(lines[i])) { buf.push(esc(lines[i])); i++; }
-            i++;   // consume the closing fence if present
+            i++;   // consume the closing fence
             html += '<pre class="cb">' + buf.join('\n') + '</pre>';
         } else if (isTableTop(i)) {
             const header = splitRow(line);
@@ -222,7 +242,7 @@ function richText(raw) {
             html += '<div class="mdsp"></div>'; i++;
         } else {
             const buf = [];
-            while (i < lines.length && lines[i].trim() !== '' && !isBlock(lines[i]) && !isTableTop(i)) { buf.push(inlineMd(lines[i])); i++; }
+            while (i < lines.length && lines[i].trim() !== '' && !blockAt(i) && !isTableTop(i)) { buf.push(inlineMd(lines[i])); i++; }
             html += buf.join('<br>');
         }
     }
