@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, focusHolderUid, focusHeldByLiveOther, nextFocusKey, resolveBinding, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, matchRepo, focusHolderUid, focusHeldByLiveOther, nextFocusKey, resolveBinding, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -365,11 +365,15 @@ function loadRepos() {
 // handoff) are imported from jarvis-text.mjs. Durable handoff records are stored under handoffKey
 // so a successor on the same JOB — not merely the same cwd — finds them.
 // Resolve a registered repo by cwd, falling back to an ad-hoc repo (same logic /spawn used).
+// The match is cwdKey-based, and that is load-bearing rather than cosmetic: repos.json is written
+// by hand/console with forward slashes (d:/claude/jarvis-core) while a session's cwd is the Windows
+// path it actually booted in (d:\claude\jarvis-core). A case-only comparison missed every backslash
+// caller — so a spawned worker in a CONFIGURED repo silently fell through to `adhoc`, losing
+// repo.permissionMode and repo.tier. Concretely: Chris configured jarvis as bypassPermissions and
+// still got woken to approve routine commits, because the successor spawn path passes s.cwd
+// (backslashes) and the lookup missed. d:\code\tms never matched the broker repo either.
 function resolveRepo(cwd) {
-    const repos = loadRepos();
-    const repo = Object.entries(repos).map(([k, v]) => ({ key: k, ...v }))
-        .find(r => String(r.cwd).toLowerCase() === String(cwd).toLowerCase());
-    return repo || { key: 'adhoc', cwd };
+    return matchRepo(loadRepos(), cwd) || { key: 'adhoc', cwd };
 }
 function loadSchedule() {
     if (existsSync(SCHEDULE)) {

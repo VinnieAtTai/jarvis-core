@@ -523,6 +523,24 @@ function newestProjectSession(sessions, name) {
     return best;
 }
 
+// Resolve a configured repo (repos.json) by working directory. Pure: the caller supplies the store.
+//
+// Matching goes through cwdKey, which is the whole point. repos.json holds hand-written forward-slash
+// paths (d:/claude/jarvis-core); a session's cwd is the Windows path it booted in
+// (d:\claude\jarvis-core). The old case-insensitive string compare missed every backslash caller, so
+// a worker spawned in a CONFIGURED repo fell through to `adhoc` and silently lost that repo's
+// permissionMode and tier -- which is why Chris kept being woken to approve routine commits in a repo
+// he had marked bypassPermissions. Returns the repo row with its key attached, or null.
+export function matchRepo(repos, cwd) {
+    const key = cwdKey(cwd);
+    if (!key || !repos || typeof repos !== 'object') return null;
+    for (const k of Object.keys(repos)) {
+        const r = repos[k];
+        if (r && typeof r === 'object' && cwdKey(r.cwd) === key) return { key: k, ...r };
+    }
+    return null;
+}
+
 // #39 AUTO-BIND. Which project OWNS a working directory -- the backstop that stops the recurring
 // "standalone card outside the mission" fragmentation Chris kept hitting.
 //
