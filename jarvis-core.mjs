@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, focusHolderUid, focusHeldByLiveOther, nextFocusKey, resolveBinding, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, focusHolderUid, focusHeldByLiveOther, nextFocusKey, resolveBinding, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -841,7 +841,26 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
     // A SUB-WORKER carries .parentProject (its ephemeral card nests under the project) — kept DISTINCT
     // from .project so pickProjectWorker (which matches .project only) can never resolve it as the
     // coordinator. A session is one or the other, never both: a .project coordinator ignores parentProject.
-    const { project: proj, parentProject: pproj } = resolveBinding(project, parentProject, takePendingBind(cs));
+    let { project: proj, parentProject: pproj } = resolveBinding(project, parentProject, takePendingBind(cs));
+    // #39 AUTO-BIND ON REGISTER: the backstop for everything resolveBinding cannot see. The stash
+    // above carries the hub's INTENT when the hub did the spawning; when there is no intent to
+    // stash — a session Chris started by hand in a repo, or the auto-successor of a standalone —
+    // infer the binding from repo IDENTITY so the session still lands on the project's card instead
+    // of minting an orphan column beside the mission. Explicit flags (or the stash) always win: this
+    // only fires when both are absent. Coordinator if the project has no live one, else nested as a
+    // sub-worker — the same live test routeToMission uses, so binding and routing never disagree.
+    let autoBound = '';
+    if (!proj && !pproj && cwd) {
+        try {
+            const owner = projectOwningCwd(loadProjects(), roster.sessions, cwd);
+            if (owner) {
+                const mgr = projectWorkerUid(owner.name);          // the new session is not in the roster yet, so this cannot self-match
+                if (mgr && aliveNow(mgr)) { pproj = owner.name; autoBound = 'sub-worker'; }
+                else { proj = owner.name; autoBound = 'coordinator'; }
+                if (owner.ambiguous > 1) record({ kind: 'sys', text: 'auto-bind: ' + owner.ambiguous + ' active missions claim ' + cwdKey(cwd) + '; picked ' + owner.name + ' (most recent)' });
+            }
+        } catch { }   // an unreadable project store must never block a register
+    }
     roster.callsigns[cs] = [uid, ...(roster.callsigns[cs] || [])];
     roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier, ...(proj ? { project: proj } : {}), ...(pproj ? { parentProject: pproj } : {}) };
     if (roster.awayUntil && Date.now() < roster.awayUntil) roster.sessions[uid].trustUntil = roster.awayUntil;
@@ -876,6 +895,10 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
         record({ kind: 'sys', text: 'registered ' + uid + ' as ' + cs + ': ' + (purpose || '') });
         enqueueSay((reborn ? cs + ' is now ' : 'New session. ' + cs + ' is ') + (purpose || 'unnamed work') + '.' + focusedNote, 'jarvis');
     }
+    // Say so when a binding was INFERRED rather than asked for: it is the difference between "the
+    // board looks odd" and "the board looks odd because the repo captured this session", which is
+    // exactly the diagnosis that cost several sessions before.
+    if (autoBound) record({ kind: 'sys', text: 'auto-bound ' + cs + ' to ' + (proj || pproj) + ' as ' + autoBound + ' (inferred from cwd ' + cwdKey(cwd) + ')' });
     const out = { uid, callsign: cs };
     // Tell a fresh session if a predecessor on this SAME JOB (cwd + purpose) left a handoff —
     // covers the manual "kill the terminal and start over" path that never goes through

@@ -504,6 +504,13 @@ export function pickProjectWorker(sessions, name) {
 // when the project has never had a worker at all (nothing to infer the repo from). Pure: reads the
 // sessions map, mutates nothing.
 export function lastProjectCwd(sessions, name) {
+    const hit = newestProjectSession(sessions, name);
+    return hit ? hit.cwd : null;
+}
+// The scan behind lastProjectCwd, keeping the timestamp too: projectOwningCwd needs BOTH the repo a
+// project last lived in and how recently, to break a tie when two projects claim one repo. One
+// source of truth so "which repo is this project's" can never disagree between the two callers.
+function newestProjectSession(sessions, name) {
     if (!name || !sessions || typeof sessions !== 'object') return null;
     let best = null, bestSeen = -Infinity;
     for (const uid in sessions) {
@@ -511,9 +518,46 @@ export function lastProjectCwd(sessions, name) {
         if (!s || s.project !== name || !s.cwd) continue;
         const t = Date.parse(s.lastSeen);
         const seen = Number.isFinite(t) ? t : 0;
-        if (seen > bestSeen) { bestSeen = seen; best = String(s.cwd); }
+        if (seen > bestSeen) { bestSeen = seen; best = { cwd: String(s.cwd), seen }; }
     }
     return best;
+}
+
+// #39 AUTO-BIND. Which project OWNS a working directory -- the backstop that stops the recurring
+// "standalone card outside the mission" fragmentation Chris kept hitting.
+//
+// A session that boots in a repo already owning an active mission-backed project, but registers
+// with no `project`/`parentProject` (a hand-started session, or the auto-successor of a standalone,
+// which has no spawn intent to stash), used to get its own orphan NATO column. Two-plus cards for
+// one mission and the hub cannot tell which is the brain. resolveBinding fixes that only when the
+// hub SPAWNED the worker and knew the intent; this infers it from repo identity instead, so it
+// catches the paths the stash cannot see.
+//
+// Gated on missionId deliberately: only mission-backed projects auto-capture sessions, so an
+// incidental repo that once hosted a plain worker never starts swallowing unrelated ones. That gate
+// is also why a jarvis-core session stays its own `jarvis` card -- the jarvis project has no
+// mission. Projects carry no repo field today, so the repo is INFERRED from their sessions
+// (newestProjectSession); an explicit project.repo would remove the inference but needs a store
+// migration, so it stays a follow-up.
+//
+// Returns null, or {name, ambiguous} -- ambiguous is how many active mission-backed projects claim
+// this repo (1 is the clean case). More than one is real, not hypothetical: d:/code/tms is claimed
+// by both `primeng` and `mycarrierpackets`. Most-recent-session wins, and the caller logs the
+// collision rather than silently guessing. Pure: reads, mutates nothing.
+export function projectOwningCwd(projects, sessions, cwd) {
+    const key = cwdKey(cwd);
+    if (!key) return null;
+    const list = Array.isArray(projects) ? projects : (projects && Array.isArray(projects.projects) ? projects.projects : null);
+    if (!list) return null;
+    let best = null, bestSeen = -Infinity, matches = 0;
+    for (const p of list) {
+        if (!p || !p.name || p.status !== 'active' || !p.missionId) continue;
+        const hit = newestProjectSession(sessions, p.name);
+        if (!hit || cwdKey(hit.cwd) !== key) continue;
+        matches++;
+        if (hit.seen > bestSeen) { bestSeen = hit.seen; best = String(p.name); }
+    }
+    return best ? { name: best, ambiguous: matches } : null;
 }
 
 // Resolve which session currently HOLDS console focus. Focus is one of: the solo brain 'jarvis'
