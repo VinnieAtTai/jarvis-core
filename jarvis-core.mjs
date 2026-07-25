@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, focusHolderUid, focusHeldByLiveOther, nextFocusKey, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, focusHolderUid, focusHeldByLiveOther, nextFocusKey, resolveBinding, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -719,6 +719,24 @@ function assignCallsign(pin) {
     free.sort((a, b) => Date.parse(roster.sessions[roster.callsigns[a][0]].ended || 0) - Date.parse(roster.sessions[roster.callsigns[b][0]].ended || 0));
     return free[0];
 }
+// What the SPAWNER bound a callsign to, held until that worker registers. The boot prompt already
+// tells it to echo project/parentProject back, but workers drop the field -- and a dropped field
+// silently mints an orphan standalone card instead of nesting under the project, which is the
+// recurring board fragmentation Chris keeps hitting. Stashing the intent here makes nesting
+// deterministic instead of dependent on the worker following instructions. Mirrors pendingTier.
+//
+// TTL-swept, and deliberately the SAME window as the pendingPins reservation: once a pin expires
+// the callsign can be handed to an unrelated session, so a bind that outlived its pin must never
+// still be sitting there waiting to attach itself to that stranger.
+const pendingBind = new Map();
+const BIND_TTL = 300000;
+function takePendingBind(cs) {
+    const now = Date.now();
+    for (const [k, v] of pendingBind) if (now - v.ts > BIND_TTL) pendingBind.delete(k);
+    const b = pendingBind.get(cs);
+    pendingBind.delete(cs);
+    return b || null;
+}
 function enqueueSay(text, from) {
     const label = from || 'jarvis';
     const focus = loadWork().focus;
@@ -818,11 +836,12 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
     tier = tier === 'trusted' ? 'trusted' : 'guarded';
     const uid = 's_' + String(roster.nextUid++).padStart(4, '0');
     const now = new Date().toISOString();
-    const proj = project ? String(project).toLowerCase().trim() : null;
+    // Fall back to the binding the spawner stashed for this callsign when the worker did not echo it
+    // back — an omitted field used to mean an orphan standalone card. What the worker sends still wins.
     // A SUB-WORKER carries .parentProject (its ephemeral card nests under the project) — kept DISTINCT
     // from .project so pickProjectWorker (which matches .project only) can never resolve it as the
     // coordinator. A session is one or the other, never both: a .project coordinator ignores parentProject.
-    const pproj = (!proj && parentProject) ? String(parentProject).toLowerCase().trim() : null;
+    const { project: proj, parentProject: pproj } = resolveBinding(project, parentProject, takePendingBind(cs));
     roster.callsigns[cs] = [uid, ...(roster.callsigns[cs] || [])];
     roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier, ...(proj ? { project: proj } : {}), ...(pproj ? { parentProject: pproj } : {}) };
     if (roster.awayUntil && Date.now() < roster.awayUntil) roster.sessions[uid].trustUntil = roster.awayUntil;
@@ -1197,6 +1216,10 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
     // A sub-worker registers with parentProject (never project) so it nests under the project without
     // ever resolving as its coordinator; a worker is one role or the other, never both.
     const subOf = (!project && parentProject) ? String(parentProject).toLowerCase().trim() : null;
+    // Record the binding we are about to ASK for, so registerSession can apply it even if the worker
+    // never echoes it back. The boot prompt below is a request; this is the guarantee.
+    const boundTo = project ? String(project).toLowerCase().trim() : null;
+    if (boundTo || subOf) pendingBind.set(cs, { project: boundTo, parentProject: subOf, ts: Date.now() });
     let boot = 'You are a JARVIS worker session. Fetch http://127.0.0.1:' + PORT + '/protocol with a plain GET request and follow it exactly. Register with pin: ' + cs + ' and purpose: ' + safePurpose + (project ? ' and project: ' + project : '') + (subOf ? ' and parentProject: ' + subOf : '') + '.';
     if (handoff) {
         // Stash the handoff under this callsign (plain letters -> safe in the .cmd, no %-encoding)

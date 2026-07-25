@@ -546,6 +546,27 @@ export function focusHeldByLiveOther(focus, sessions, callsigns, newUid, now, st
     return Number.isFinite(t) && (now - t) < staleMs;
 }
 
+// Decide what a registering session is BOUND to: a project (it coordinates that project's card),
+// a parentProject (it nests under one as a sub-worker), or neither (a standalone card).
+//
+// Two sources disagree in practice. The worker sends what its boot prompt told it to echo -- and
+// workers drop the field, which used to silently mint an orphan standalone card instead of nesting.
+// `bind` is what the spawner stashed when it created the callsign, i.e. what the hub actually
+// intended. Precedence: an explicit field from the worker beats the stash (it may know better --
+// it could have been re-tasked), and project beats parentProject, because a session is one role or
+// the other and a coordinator ignores parentProject entirely.
+//
+// Returns { project, parentProject }, lowercased and trimmed, each null when absent. Pure.
+export function resolveBinding(project, parentProject, bind) {
+    const norm = v => {
+        const s = v ? String(v).toLowerCase().trim() : '';
+        return s || null;
+    };
+    const b = bind || {};
+    const proj = norm(project) || norm(b.project);
+    return { project: proj, parentProject: proj ? null : (norm(parentProject) || norm(b.parentProject)) };
+}
+
 // Where console focus should land when the focused board goes away (a retire, a /forget). Returns
 // a BOARD KEY -- the thing that actually has a card -- never a raw callsign that has none.
 //
