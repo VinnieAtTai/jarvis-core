@@ -546,6 +546,24 @@ export function focusHeldByLiveOther(focus, sessions, callsigns, newUid, now, st
     return Number.isFinite(t) && (now - t) < staleMs;
 }
 
+// Where console focus should land when the focused board goes away (a retire, a /forget). Returns
+// a BOARD KEY -- the thing that actually has a card -- never a raw callsign that has none.
+//
+// That distinction is the bug this fixes. A project-bound worker renders on its PROJECT's card; its
+// own NATO callsign has no card at all. The old repair grabbed the first live NATO callsign it
+// could find, so forgetting one dead card could focus 'charlie' -- a jarvis-project worker -- which
+// both minted a phantom standalone charlie card and yanked focus off wherever the human was.
+//
+// `live` is [{callsign, project}] for alive sessions in preference order; `exclude` is the board key
+// being torn down. Falls back to the solo brain. Pure: reads, mutates nothing.
+export function nextFocusKey(live, exclude = null) {
+    for (const c of live || []) {
+        const key = c && (c.project || c.callsign);
+        if (key && key !== exclude) return key;
+    }
+    return 'jarvis';
+}
+
 // A session's liveness has TWO independent signals, and they can disagree. `/heartbeat` is a dumb
 // background timer; `/poll` is the worker's actual event loop -- its ears. When the poll loop dies
 // but the heartbeat timer keeps ticking, the session looks perfectly green while being completely

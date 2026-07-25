@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, focusHeldByLiveOther, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, focusHolderUid, focusHeldByLiveOther, nextFocusKey, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -671,6 +671,14 @@ function projectWorkerUid(name) {
 function liveCallsigns() {
     return NATO.filter(cs => liveUidOf(cs));
 }
+// Live sessions as BOARD CANDIDATES -- {callsign, project} -- for focus repair. A project-bound
+// worker must be offered as its project (the thing with a card), never as its raw NATO callsign,
+// or focusing it mints a phantom standalone card. Feeds the pure nextFocusKey.
+function liveBoardCandidates() {
+    return liveCallsigns()
+        .filter(cs => aliveNow(liveUidOf(cs)))
+        .map(cs => ({ callsign: cs, project: (roster.sessions[liveUidOf(cs)] || {}).project || null }));
+}
 function aliveNow(uid) {
     const s = roster.sessions[uid];
     return !!(s && s.lastSeen && Date.now() - Date.parse(s.lastSeen) < 120000);
@@ -834,8 +842,12 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
     // very session. (The human can always say a callsign to switch back.) Decision is a pure,
     // unit-tested helper in jarvis-text.mjs (test/focus.test.mjs).
     const focusHeldByOther = focusHeldByLiveOther(w.focus, roster.sessions, roster.callsigns, uid, Date.now());
-    if (proj && !focusHeldByOther) { w.focus = proj; focusedNote = ' Focused on ' + proj + '.'; }
-    else if (liveCallsigns().length === 1) { w.focus = cs; focusedNote = ' Focused on it.'; }
+    // Note the shape: a project worker either takes its PROJECT card or takes nothing. It must never
+    // fall through to the solo-worker branch below, which would focus its raw NATO callsign — that
+    // both mints a phantom standalone card and defeats the guard we just applied.
+    if (proj) {
+        if (!focusHeldByOther) { w.focus = proj; focusedNote = ' Focused on ' + proj + '.'; }
+    } else if (liveCallsigns().length === 1) { w.focus = cs; focusedNote = ' Focused on it.'; }
     saveWork(w);
     const reborn = roster.callsigns[cs].length > 1;
     if (proj) {
@@ -948,7 +960,7 @@ function retireSession(uid, summary, opts = {}) {
         return true;
     }
     delete w.sessions[cs];
-    if (w.focus === cs) w.focus = liveCallsigns().find(c => aliveNow(liveUidOf(c))) || 'jarvis';   // never strand focus on a dead board
+    if (w.focus === cs) w.focus = nextFocusKey(liveBoardCandidates(), cs);   // never strand focus on a dead board
     saveWork(w);
     saveRoster();
     record({ kind: 'sys', text: cs + ' retired (' + uid + ')' });
@@ -985,8 +997,8 @@ function routeTo(cs, msg) {
         if (Date.now() - (nagAt[cs] || 0) > 300000) {
             nagAt[cs] = Date.now();
             const mins = Math.max(1, Math.round((Date.now() - Date.parse(roster.sessions[uid].lastSeen)) / 60000));
-            const other = liveCallsigns().find(c => c !== cs && aliveNow(liveUidOf(c)));
-            const hint = other ? ' Say focus on ' + other + ' to switch.' : '';
+            const other = nextFocusKey(liveBoardCandidates(), cs);
+            const hint = other !== 'jarvis' ? ' Say focus on ' + other + ' to switch.' : '';
             enqueueSay(cs + ' has not checked in for ' + mins + ' minute' + (mins === 1 ? '' : 's') + '. Queueing for it.' + hint, 'jarvis');
         }
     } else {
@@ -2403,9 +2415,12 @@ async function handleRequest(req, res) {
         if (uid) retireSession(uid, String(b.summary || '').trim() || 'Closed from console.');
         const w = loadWork();
         delete w.sessions[cs];
-        const fUid = w.focus !== 'jarvis' ? liveUidOf(w.focus) : null;
+        // Resolve the focus HOLDER properly: liveUidOf only understands NATO callsigns, so when focus
+        // sat on a project it always came back empty and this "repair" dragged the human off a
+        // perfectly live coordinator just because some unrelated dead card was forgotten.
+        const fUid = w.focus !== 'jarvis' ? focusHolderUid(w.focus, roster.sessions, roster.callsigns) : null;
         if (w.focus === cs || (w.focus !== 'jarvis' && (!fUid || !aliveNow(fUid)))) {
-            w.focus = liveCallsigns().find(c => aliveNow(liveUidOf(c))) || 'jarvis';
+            w.focus = nextFocusKey(liveBoardCandidates(), cs);
         }
         saveWork(w);
         record({ kind: 'sys', text: 'removed ' + cs + ' from board' });
