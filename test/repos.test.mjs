@@ -10,7 +10,7 @@
 // Run with `npm test` (node --test) -- no server boot, no I/O.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { matchRepo } from '../jarvis-text.mjs';
+import { matchRepo, repoRow } from '../jarvis-text.mjs';
 
 // The live repos.json shape at the time of the fix.
 const REPOS = {
@@ -72,4 +72,79 @@ test('matchRepo -- a missing or malformed store returns null, never throws', () 
     // A half-written row must not take down a register or a spawn.
     assert.equal(matchRepo({ bad: null, worse: 'string', empty: {} }, 'd:/code/tms'), null);
     assert.equal(matchRepo({ bad: null, ok: { cwd: 'd:/code/tms' } }, String.raw`D:\Code\TMS`).key, 'ok');
+});
+
+// --- repoRow: writing a repos.json row through POST /repos -------------------------------------
+// Found 2026-07-27 while probing whether a757af9 had deployed. The probe was "does a jarvis-core
+// session read tier == trusted"; it read `guarded`, which looks exactly like a failed deploy. The
+// actual cause: the jarvis row has NO tier field, and there was no way to give it one -- POST /repos
+// never wrote tier, and hand-editing repos.json is forbidden (the hub is the only writer).
+
+test('repoRow -- THE BUG: tier is settable at all, and only `trusted` counts', () => {
+    // resolveRepo(cwd).tier feeds registerSession (session trust) and spawnWorker (effTier). Before
+    // this, the field was live-read but unwritable through the API.
+    const r = repoRow(REPOS.jarvis, { tier: 'trusted' });
+    assert.equal(r.tier, 'trusted');
+    assert.equal(r.permissionMode, 'bypassPermissions', 'the merge must not drop what it did not touch');
+    // Guarded IS the absence of the field, and a typo must never persist as config.
+    assert.equal('tier' in repoRow(r, { tier: 'guarded' }), false);
+    assert.equal('tier' in repoRow(r, { tier: 'trused' }), false);
+    assert.equal('tier' in repoRow(r, { tier: '' }), false);
+});
+
+test('repoRow -- THE OTHER BUG: a partial update keeps the fields it omits', () => {
+    // Pre-fix the row was rebuilt from the body, so re-registering a repo to change one thing
+    // silently erased the rest -- the same "config present in the file, dropped in transit" class of
+    // bug as the slash mismatch above.
+    const withTier = { ...REPOS.jarvis, tier: 'trusted', model: 'opus' };
+    const r = repoRow(withTier, { name: 'jarvis', defaultPurpose: 'jarvis hub work' });
+    assert.deepEqual(r, {
+        cwd: 'd:/claude/jarvis-core',
+        defaultPurpose: 'jarvis hub work',
+        permissionMode: 'bypassPermissions',
+        tier: 'trusted',
+        model: 'opus',
+    });
+});
+
+test('repoRow -- an empty value CLEARS an optional field, so bypass can be revoked', () => {
+    const start = { ...REPOS.jarvis, tier: 'trusted', model: 'opus' };
+    const off = repoRow(start, { permissionMode: '', model: null });
+    assert.equal('permissionMode' in off, false, 'a repo must be removable from bypassPermissions');
+    assert.equal('model' in off, false);
+    assert.equal(off.tier, 'trusted', 'clearing one field must not clear the others');
+    // Omitting a field is NOT clearing it -- that distinction is the whole point of the merge.
+    assert.equal(repoRow(start, {}).permissionMode, 'bypassPermissions');
+});
+
+test('repoRow -- creating a brand new row from nothing', () => {
+    assert.deepEqual(repoRow(undefined, { cwd: 'd:/code/other', tier: 'trusted' }), {
+        cwd: 'd:/code/other', defaultPurpose: '', tier: 'trusted',
+    });
+    // defaultPurpose is always present so the console never renders `undefined`.
+    assert.deepEqual(repoRow(null, { cwd: 'd:/code/other' }), { cwd: 'd:/code/other', defaultPurpose: '' });
+});
+
+test('repoRow -- pure: never mutates the row it was handed', () => {
+    const prev = { ...REPOS.jarvis, tier: 'trusted' };
+    const before = JSON.stringify(prev);
+    repoRow(prev, { tier: 'guarded', permissionMode: '', cwd: 'd:/elsewhere' });
+    assert.equal(JSON.stringify(prev), before);
+});
+
+test('repoRow -- a malformed body cannot corrupt or wipe an existing row', () => {
+    const prev = { ...REPOS.jarvis, tier: 'trusted' };
+    for (const bad of [null, undefined, 'string', 42]) {
+        assert.deepEqual(repoRow(prev, bad), prev, String(bad));
+    }
+    // A non-string defaultPurpose is ignored rather than stringified into the board.
+    assert.equal(repoRow(prev, { defaultPurpose: { oops: 1 } }).defaultPurpose, 'jarvis hub development');
+});
+
+test('repoRow -- the round trip a session actually makes: set tier, then resolve it back', () => {
+    // The end-to-end point of the fix: POST /repos {name, tier} -> the row -> matchRepo -> the tier a
+    // register reads. Pre-fix this chain had no way to produce anything but guarded.
+    const repos = { ...REPOS, jarvis: repoRow(REPOS.jarvis, { tier: 'trusted' }) };
+    assert.equal(matchRepo(repos, String.raw`d:\claude\jarvis-core`).tier, 'trusted');
+    assert.equal(matchRepo(repos, String.raw`d:\code\tms`).tier, undefined, 'other repos stay guarded');
 });

@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, matchRepo, focusHolderUid, focusHeldByLiveOther, nextFocusKey, resolveBinding, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, resolveBinding, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -2638,13 +2638,17 @@ async function handleRequest(req, res) {
     if (key === 'POST /repos') {
         const b = await readBody(req);
         const name = String(b.name || '').toLowerCase().replace(/[^a-z0-9-]/g, '');
-        if (!name || !b.cwd || !existsSync(b.cwd)) return json(res, 400, { error: 'need name and an existing cwd' });
         const repos = loadRepos();
-        repos[name] = { cwd: b.cwd, defaultPurpose: b.defaultPurpose || '', ...(b.permissionMode ? { permissionMode: b.permissionMode } : {}), ...(b.model ? { model: b.model } : {}) };
+        const prev = repos[name];
+        // cwd is required to CREATE a repo; an existing one can be amended (e.g. set tier) without
+        // re-sending it, which is the point of the merge -- see repoRow.
+        if (!name || (!prev && !b.cwd)) return json(res, 400, { error: 'need name and an existing cwd' });
+        if (b.cwd && !existsSync(b.cwd)) return json(res, 400, { error: 'need name and an existing cwd' });
+        repos[name] = repoRow(prev, b);
         writeFileSync(REPOS, JSON.stringify(repos, null, 1));
-        record({ kind: 'sys', text: 'repo registered: ' + name + ' -> ' + b.cwd });
-        enqueueSay('Repo ' + name + ' registered.', 'jarvis');
-        return json(res, 200, { ok: true });
+        record({ kind: 'sys', text: 'repo ' + (prev ? 'updated' : 'registered') + ': ' + name + ' -> ' + repos[name].cwd + (repos[name].tier === 'trusted' ? ' (trusted)' : '') });
+        enqueueSay('Repo ' + name + ' ' + (prev ? 'updated' : 'registered') + '.', 'jarvis');
+        return json(res, 200, { ok: true, name, ...repos[name] });
     }
     if (key === 'POST /voices') {
         const b = await readBody(req);

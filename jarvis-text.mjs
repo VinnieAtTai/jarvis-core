@@ -541,6 +541,38 @@ export function matchRepo(repos, cwd) {
     return null;
 }
 
+// Build the repos.json row for POST /repos. Pure: merge the posted fields over the row already there.
+//
+// Two defects this closes, both found on 2026-07-27 while probing whether a757af9 had shipped:
+// (1) `tier` was UNSETTABLE. resolveRepo(cwd).tier is live-read in two places -- registerSession (the
+//     session's trust tier) and spawnWorker (effTier) -- but the endpoint never wrote it, so the only
+//     way in was hand-editing repos.json under JARVIS_DATA, which no session is allowed to do. The
+//     symptom that led here: a jarvis-core session reads tier `guarded` no matter what, because the
+//     row has no tier field at all, which reads exactly like a failed deploy.
+// (2) the row was REBUILT from the body, so a partial re-register silently ERASED whatever it omitted
+//     -- a hand-written tier, a model, the defaultPurpose. Same class of bug as the slash mismatch:
+//     the config is right there in the file and gets dropped in transit.
+// Merging matches the /project-context convention -- send only the fields that changed. Passing an
+// empty value for an optional field CLEARS it, so a repo can be taken back off bypassPermissions.
+export function repoRow(prev, body) {
+    const b = body && typeof body === 'object' ? body : {};
+    const row = { ...(prev && typeof prev === 'object' ? prev : {}) };
+    if (b.cwd) row.cwd = String(b.cwd);
+    if (typeof b.defaultPurpose === 'string') row.defaultPurpose = b.defaultPurpose;
+    for (const f of ['permissionMode', 'model']) {
+        if (b[f] === undefined) continue;
+        if (b[f]) row[f] = String(b[f]); else delete row[f];
+    }
+    // `trusted` is the only tier that grants anything; guarded IS the absence of the field, so never
+    // store a typo as a tier -- a misspelled 'trused' that persisted would read as deliberate config.
+    if (b.tier !== undefined) {
+        if (String(b.tier) === 'trusted') row.tier = 'trusted'; else delete row.tier;
+    }
+    row.cwd = row.cwd || '';
+    row.defaultPurpose = row.defaultPurpose || '';
+    return row;
+}
+
 // #39 AUTO-BIND. Which project OWNS a working directory -- the backstop that stops the recurring
 // "standalone card outside the mission" fragmentation Chris kept hitting.
 //
