@@ -7,7 +7,9 @@
         "check": "node --check jarvis-core.mjs && node --check console.js",
         "test": "node --test",
         "test:survival": "set JARVIS_INTEGRATION=1&& node --test test/survival.test.mjs",
-        "test:revive": "set JARVIS_INTEGRATION=1&& node --test test/revive.test.mjs"
+        "test:revive": "set JARVIS_INTEGRATION=1&& node --test test/revive.test.mjs",
+        "test:subworker": "set JARVIS_INTEGRATION=1&& node --test test/subworker.test.mjs",
+        "test:integration": "set JARVIS_INTEGRATION=1&& node --test"
     },
     "dependencies": {
         "node-pty": "^1.1.0",
