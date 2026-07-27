@@ -6,7 +6,8 @@
         "start": "node jarvis-core.mjs",
         "check": "node --check jarvis-core.mjs && node --check console.js",
         "test": "node --test",
-        "test:survival": "set JARVIS_INTEGRATION=1&& node --test test/survival.test.mjs"
+        "test:survival": "set JARVIS_INTEGRATION=1&& node --test test/survival.test.mjs",
+        "test:revive": "set JARVIS_INTEGRATION=1&& node --test test/revive.test.mjs"
     },
     "dependencies": {
         "node-pty": "^1.1.0",
