@@ -23,7 +23,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
@@ -169,12 +169,20 @@ let uid = null;
         const retiredRow = async (cs) => (await get('/roster')).retired.find(r => r.callsign === cs) || null;
         const transcript = () => { try { return readFileSync(join(DATA, 'transcript.jsonl'), 'utf8'); } catch { return ''; } };
 
+        // Teardown has to be thorough in a way most teardowns do not, because the thing under test is
+        // a process that deliberately survives having its parent tree-killed. A missed host is not a
+        // stray child that dies with the runner -- it is an orphan holding a ConPTY forever, and the
+        // only record of its pid is in a scratch directory this block is about to delete. So sweep
+        // every pidfile actually present rather than guessing which callsign the scratch hub issued.
         t.after(() => {
             for (const h of hubs) { if (h.pid && nodeAlive(h.pid)) treeKill(h.pid, 'hub'); }
             try {
-                for (const f of ['worker-tango.pid', 'worker-alpha.pid']) {
-                    const fp = join(DATA, f);
-                    if (existsSync(fp)) { const r = JSON.parse(readFileSync(fp, 'utf8')); if (r.hostPid && nodeAlive(r.hostPid)) treeKill(r.hostPid, 'leftover host'); }
+                for (const f of readdirSync(DATA)) {
+                    if (!/^worker-.+\.pid$/i.test(f)) continue;
+                    try {
+                        const r = JSON.parse(readFileSync(join(DATA, f), 'utf8'));
+                        if (r.hostPid && nodeAlive(r.hostPid)) treeKill(r.hostPid, 'leftover worker host from ' + f);
+                    } catch { }
                 }
             } catch { }
             try { rmSync(root, { recursive: true, force: true }); } catch { }
