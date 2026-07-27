@@ -1378,12 +1378,23 @@ function teardownWorktree(s, cs) {
             }
         }
         if (!repoCwd) { record({ kind: 'sys', text: 'worktree for ' + cs + ' has no home repo to remove it from; KEPT at ' + wtPath }); return 'kept'; }
-        const removed = gitOut(repoCwd, ['worktree', 'remove', wtPath, '--force'], WT_TIMEOUT) !== null;
+        const ok = gitOut(repoCwd, ['worktree', 'remove', wtPath, '--force'], WT_TIMEOUT) !== null;
         gitOut(repoCwd, ['worktree', 'prune'], WT_TIMEOUT);
-        record({ kind: 'sys', text: removed
-            ? 'worktree for ' + cs + ' removed; branch ' + branch + ' kept for merge'
-            : 'worktree remove FAILED for ' + cs + ' at ' + wtPath + '; branch ' + branch + ' kept' });
-        return removed ? 'removed' : 'kept';
+        // git's exit code is not proof the directory is gone. Measured 2026-07-27 in a throwaway
+        // repo: with a node_modules JUNCTION inside the worktree (what a worker needs to run a hub
+        // from one at all), `worktree remove --force` exits 0, drops the entry from `worktree list`
+        // and deletes every real file -- then leaves the directory, junction included, on disk. And
+        // because git has already forgotten the worktree, the `prune` above cannot finish the job,
+        // so it is stranded for good. It does NOT follow the junction; the real node_modules is
+        // safe. The damage is purely that we logged a removal that did not happen. Ask the
+        // filesystem, which is the thing the claim is actually about.
+        const gone = !existsSync(wtPath);
+        record({ kind: 'sys', text: !ok
+            ? 'worktree remove FAILED for ' + cs + ' at ' + wtPath + '; branch ' + branch + ' kept'
+            : gone
+                ? 'worktree for ' + cs + ' removed; branch ' + branch + ' kept for merge'
+                : 'git reported removing ' + cs + ' worktree but ' + wtPath + ' is STILL THERE (a junction or open handle inside blocks it, and git has already forgotten the worktree so prune cannot help); branch ' + branch + ' kept' });
+        return ok && gone ? 'removed' : 'kept';
     } catch (e) {
         try { record({ kind: 'sys', text: 'worktree teardown errored for ' + cs + ' (' + (e && e.message) + '); ' + wtPath + ' left in place' }); } catch { }
         return 'kept';

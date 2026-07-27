@@ -134,3 +134,53 @@ console), so it lands cleanly on its own. Suggested phasing:
 
 Composes with [auto-bind on register](AUTO-BIND-ON-REGISTER.md): auto-bind gets sessions onto the
 right project; worktree isolation keeps their file work from colliding once they are there.
+
+## Gotcha: a worktree has no `node_modules`, and the failure is silent
+
+If you are a worker in an isolated worktree and you start a hub there, read this first. It cost
+alpha three runs on 2026-07-27.
+
+A `git worktree` is a checkout, not a copy of the working directory — `node_modules/` is
+untracked, so it does not come along. `node-pty` therefore does not resolve, `getPty()` returns
+null, and `spawnWorkerConsoleless` falls back to opening **visible wt tabs**. The hub still boots
+and still spawns workers, so nothing looks wrong. Worse, `node --test` uses only builtins and stays
+green, so you get *tests passing while the console-less path under test was never entered* — a run
+that proves nothing while reporting success.
+
+Two defences are in place, and neither removes the need to fix your worktree:
+
+- The hub **says it out loud** once, at the first spawn: `jarvis-core.mjs` (see `getPty()`) records
+  "node-pty did not resolve from &lt;dir&gt; — console-less spawning is OFF and workers will open
+  visible wt tabs". It no longer degrades quietly.
+- The shared rig **refuses to run**: `test-support/scratch-hub.mjs` resolves the main checkout's
+  `node_modules` through `git rev-parse --git-common-dir` and throws a pre-flight error if
+  `node-pty` still will not load, so a worktree run cannot go green while testing nothing.
+
+**For tests and for anything driving the shared rig, do nothing** — `resolveNodeModules()` already
+walks to the main checkout through `--git-common-dir`, no junction required. The problem below only
+arises if you run a hub *directly* from a worktree (`npm start`, `node jarvis-core.mjs`), because
+`getPty()` resolves `node-pty` relative to the hub's own directory.
+
+For that case, junction the main checkout's modules in. Junctions (`/J`, or PowerShell's
+`New-Item -ItemType Junction`) are instant, cost no disk, cannot drift from the version the main
+checkout tests against, and do not require administrator rights:
+
+```
+git -C . rev-parse --path-format=absolute --git-common-dir     REM -> D:\claude\jarvis-core\.git
+cmd /c mklink /J node_modules "D:\claude\jarvis-core\node_modules"
+```
+
+**Then delete the junction before you retire.** This was measured on 2026-07-27, in a throwaway
+repo, because the first draft of this section asserted the opposite from reasoning alone:
+
+- `git worktree remove --force` **does not follow the junction** — a canary file in the real
+  `node_modules` survived untouched. So the dangerous outcome does not happen.
+- But it **does not clean up either, while reporting that it did**. It exits `0`, drops the
+  worktree from `git worktree list`, deletes every real file — and leaves the directory on disk
+  with the junction still in it. Because git has already forgotten the worktree, `git worktree
+  prune` will not finish the job. The directory is stranded permanently.
+- Deleting the junction first and then removing gives `exit 0` with the directory actually gone.
+
+Note the shape of that second point: an exit code that says success while the work did not happen.
+`teardownWorktree` trusts exactly that exit code, so it records "worktree removed" for a directory
+that is still there.
