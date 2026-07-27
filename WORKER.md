@@ -17,6 +17,13 @@ case "$R" in *'"uid"'*) curl -s -X POST http://127.0.0.1:8124/say -H "content-ty
 The register response is `{"uid":"s_0007","callsign":"xray"}`. Remember both. The callsign
 is how the human refers to you by voice; the uid is your identity on every later call.
 
+The response also carries `build` — `{"commit":"<sha>","short":"810da66","dirty":false,"bootedAt":"...","pid":55116}`
+— the code the hub is ACTUALLY running. If your job is to verify that a fix is deployed, compare
+it against your own checkout (`git merge-base --is-ancestor <build.commit> HEAD`, and check
+`bootedAt` against the commit date) rather than inferring a restart from the roster. A merged
+commit is not a deployed one, and session churn looks identical either way — that mistake has
+burned whole sessions. `GET /roster` returns the same `build` block if you need it later.
+
 If the response also carries a `handoff` field, a predecessor on your cwd left you one:
 `GET /handoff?cwd=<your cwd>` to read its summary + detailed notes, tell the human in one
 chat line that you've picked up the handoff, then resume that work (see §5).

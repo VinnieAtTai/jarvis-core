@@ -8,10 +8,32 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees, reconcileRoster } from './jarvis-text.mjs';
+import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
 import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+// What code is actually RUNNING, resolved once at load and stated out loud.
+//
+// Five sessions in a row have now reasoned about a deploy from the wrong evidence. The roster,
+// the archive epitaphs and the session churn all look the SAME whether the hub bounced or not,
+// so "the fixes are merged" kept getting read as "the fixes are live" — and on 2026-07-27 four
+// commits sat undeployed for three hours while a whole verify plan was aimed at code the hub had
+// never loaded. Nothing in the old surface could have caught that: the only honest observable
+// was the hub process's creation time, which no session thought to check.
+//
+// So the hub publishes its own identity — the commit it was started from, whether that tree was
+// dirty, and when THIS process booted — on /roster and in every /register response. A worker
+// asking "is my fix live?" now compares SHAs against its own checkout
+// (`git merge-base --is-ancestor <build.commit> HEAD`) instead of inferring a restart from
+// session churn. Resolved at load, never refreshed: a running process does not change build, and
+// re-reading git would make it lie the moment someone commits under a live hub.
+const BUILD = (() => {
+    const git = (...a) => execFileSync('git', ['-C', HERE, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    let rev = null, status = null;
+    try { rev = git('rev-parse', 'HEAD'); } catch { }
+    try { status = git('status', '--porcelain'); } catch { }
+    return buildIdentity({ rev, status, bootedAt: new Date().toISOString(), pid: process.pid });
+})();
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
 // in the source tree can't wipe live sessions/worklist/transcript/bus/schedule/archive/attachments.
 // Override with JARVIS_DATA; falls back to the repo dir only if LOCALAPPDATA is unset (non-Windows).
@@ -934,7 +956,9 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
     // board looks odd" and "the board looks odd because the repo captured this session", which is
     // exactly the diagnosis that cost several sessions before.
     if (autoBound) record({ kind: 'sys', text: 'auto-bound ' + cs + ' to ' + (proj || pproj) + ' as ' + autoBound + ' (inferred from cwd ' + cwdKey(cwd) + ')' });
-    const out = { uid, callsign: cs };
+    // Hand every worker the running build. This is the cheapest place to kill the "merged means
+    // deployed" error for good: a session learns what code it is talking to before it does any work.
+    const out = { uid, callsign: cs, build: BUILD };
     // Tell a fresh session if a predecessor on this SAME JOB (cwd + purpose) left a handoff —
     // covers the manual "kill the terminal and start over" path that never goes through
     // spawnWorker. Scoping by purpose stops a new worker inheriting a different job's notes when
@@ -2461,7 +2485,7 @@ async function handleRequest(req, res) {
             .sort((a, b) => Date.parse(b[1].ended) - Date.parse(a[1].ended))
             .slice(0, 20)
             .map(([uid, s]) => ({ uid, callsign: s.callsign, purpose: s.purpose, summary: s.summary || null, ended: s.ended }));
-        return json(res, 200, { focus: loadWork().focus, live, retired });
+        return json(res, 200, { focus: loadWork().focus, build: BUILD, live, retired });
     }
     if (key === 'GET /archive') {
         // Retired-session history from archive/*.json. ?uid=<uid> returns one full entry
@@ -3447,8 +3471,14 @@ async function main() {
         }
     };
 
-    record({ kind: 'sys', text: 'jarvis core started' + (NO_UI ? ' (no ui)' : '') });
+    // The build goes in the TRANSCRIPT, not just stdout: stdout belongs to a detached process
+    // nobody reads, while the transcript is what a session greps when it asks "did the hub
+    // actually bounce, and onto what?". This line is the timestamped answer to both.
+    const treeNote = BUILD.dirty === true ? ' (dirty tree)' : BUILD.dirty === null ? ' (tree state unknown)' : '';
+    const buildNote = BUILD.short ? ' @ ' + BUILD.short + treeNote : ' @ unknown build';
+    record({ kind: 'sys', text: 'jarvis core started' + (NO_UI ? ' (no ui)' : '') + buildNote + ' pid ' + process.pid });
     console.log('JARVIS CORE READY.');
+    console.log(`  build      -> ${BUILD.short || 'unknown'}${treeNote}  pid ${process.pid}`);
     console.log(`  data dir   -> ${DATA}`);
     console.log(`  transcript -> ${TRANSCRIPT}`);
     console.log(`  console    -> ${ORIGIN}`);

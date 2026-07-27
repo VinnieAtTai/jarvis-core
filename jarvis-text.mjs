@@ -991,3 +991,24 @@ export function orphanWorktrees(dirs, sessions, now, opts = {}) {
     }
     return (dirs || []).filter(d => d && !live.has(wtSlashes(d).toLowerCase()));
 }
+
+// The running build, normalized from raw git output. Pure so it can be tested; the hub supplies
+// `rev` (git rev-parse HEAD) and `status` (git status --porcelain), either of which may be null
+// when git is absent or the source tree is not a checkout at all.
+//
+// Why this exists: a merged commit and a deployed one are different facts, and every observable
+// the hub had -- roster, epitaphs, session churn -- read the same either way. On 2026-07-27 four
+// commits sat unloaded for three hours while sessions verified against them. `dirty` matters as
+// much as the sha: a hub started from an uncommitted tree is running code that no sha describes,
+// so an ancestry check against HEAD would quietly lie.
+export function buildIdentity({ rev, status, bootedAt, pid } = {}) {
+    const commit = /^[0-9a-f]{40}$/i.test(String(rev || '').trim()) ? String(rev).trim().toLowerCase() : null;
+    return {
+        commit,
+        short: commit ? commit.slice(0, 7) : null,
+        // Unknown status is NOT clean. A hub that could not read git cannot promise its tree matched.
+        dirty: status == null ? null : String(status).trim().length > 0,
+        bootedAt: bootedAt || null,
+        pid: Number.isFinite(pid) ? pid : null,
+    };
+}

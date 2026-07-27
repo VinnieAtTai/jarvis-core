@@ -7,7 +7,7 @@
 // is practical to exercise by hand, which is why they live out here rather than inside the hub.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { reconcileRoster, orphanWorktrees } from '../jarvis-text.mjs';
+import { reconcileRoster, orphanWorktrees, buildIdentity } from '../jarvis-text.mjs';
 
 const NOW = Date.parse('2026-07-27T15:00:00.000Z');
 const ago = (ms) => new Date(NOW - ms).toISOString();
@@ -102,4 +102,52 @@ test('orphanWorktrees -- an empty or absent claim list changes nothing', () => {
     const dirs = ['d:/code/.jarvis-wt/tms-mike'];
     assert.deepEqual(orphanWorktrees(dirs, {}, NOW, { claimed: [] }), dirs);
     assert.deepEqual(orphanWorktrees(dirs, {}, NOW, {}), dirs);
+});
+
+// ---- what code is actually running -----------------------------------------------------------
+// The failure these guard against is not a crash, it is a confident wrong answer. On 2026-07-27 a
+// session read the roster, saw workers retire and successors spawn, concluded the hub had bounced,
+// and verified four fixes against a hub that had never loaded them. buildIdentity is the observable
+// that makes that mistake impossible to repeat, so its edge cases matter more than its happy path.
+test('buildIdentity -- reports the commit the hub was started from, short form included', () => {
+    const b = buildIdentity({
+        rev: '810da66b9285bb987bdfbf2b1c1c13058ab24552\n',
+        status: '',
+        bootedAt: '2026-07-27T14:54:16.000Z',
+        pid: 55116,
+    });
+    assert.equal(b.commit, '810da66b9285bb987bdfbf2b1c1c13058ab24552');
+    assert.equal(b.short, '810da66');
+    assert.equal(b.dirty, false);
+    assert.equal(b.bootedAt, '2026-07-27T14:54:16.000Z');
+    assert.equal(b.pid, 55116);
+});
+
+test('buildIdentity -- an uncommitted tree is flagged, because no sha describes what is running', () => {
+    const b = buildIdentity({ rev: 'a'.repeat(40), status: ' M jarvis-core.mjs\n?? scratch.mjs\n' });
+    assert.equal(b.dirty, true);
+});
+
+// Unknown must not read as clean. A hub that could not run git cannot promise its tree matched the
+// sha, and a caller doing `merge-base --is-ancestor` on a false-clean build gets a confident lie --
+// the exact shape of the bug this whole block exists to prevent.
+test('buildIdentity -- unreadable git status is null, never a silent false', () => {
+    assert.equal(buildIdentity({ rev: 'b'.repeat(40), status: null }).dirty, null);
+    assert.equal(buildIdentity({ rev: 'b'.repeat(40) }).dirty, null);
+});
+
+// Anything that is not a full sha is no identity at all. Rejecting it beats publishing 'HEAD' or a
+// git error string as though it were a commit a worker could look up.
+test('buildIdentity -- refuses junk rather than publishing an unusable commit', () => {
+    for (const rev of [null, undefined, '', 'HEAD', 'fatal: not a git repository', '810da66', 'z'.repeat(40)]) {
+        const b = buildIdentity({ rev });
+        assert.equal(b.commit, null, 'rev ' + JSON.stringify(rev) + ' should not become a commit');
+        assert.equal(b.short, null);
+    }
+});
+
+test('buildIdentity -- a missing pid is null, not NaN, so it survives JSON', () => {
+    const b = buildIdentity({ rev: 'c'.repeat(40), status: '', pid: undefined });
+    assert.equal(b.pid, null);
+    assert.equal(JSON.parse(JSON.stringify(b)).pid, null);
 });

@@ -1021,7 +1021,12 @@ workEl.onclick = (e) => {
     else if (act === 'continue') post('/spawn', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
     else if (act === 'spawnjarvis') post('/spawn', { cwd: 'd:/claude/jarvis-core', purpose: 'JARVIS punchlist', project: 'jarvis' });
     else if (act === 'rebuild') { uiConfirm('Rebuild JARVIS now? Restarts the hub with the latest jarvis-core code. Live sessions ride it out. Heads-up: this resets the in-memory token gauge.', { ok: 'Rebuild', danger: true }).then(ok => { if (ok) post('/restart', {}); }); }
-    else if (act === 'restart') post('/retire', { uid: t.getAttribute('data-uid'), summary: 'Restarted from console.', successor: true });
+    // "Worker relaunched", not "Restarted from console." — the old wording was the ONLY source of
+    // that string in the codebase, yet it reads exactly like a hub restart, and a session reading
+    // the roster months later cannot tell which happened. On 2026-07-27 two clicks of this button
+    // were diagnosed as a hub that had retired everyone and failed to relaunch, and the phantom bug
+    // was handed forward. The hub's own restart leaves 'Lost when the hub restarted'; this leaves this.
+    else if (act === 'restart') post('/retire', { uid: t.getAttribute('data-uid'), summary: 'Worker relaunched from console (hub untouched).', successor: true });
     else if (act === 'hold') post('/hold', { uid: t.getAttribute('data-uid') || undefined, callsign: t.getAttribute('data-cs'), cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
     else if (act === 'voicemute') post('/voicemute', { uid: t.getAttribute('data-uid') || undefined, callsign: t.getAttribute('data-cs'), on: t.getAttribute('data-on') === '1' });
     else if (act === 'continueall' && lastBoard) lastBoard.boards.filter(b => b.alive === false && b.callsign !== 'jarvis' && b.cwd && b.purpose).forEach(b => post('/spawn', { cwd: b.cwd, purpose: b.purpose }));
@@ -1406,7 +1411,11 @@ function renderArchive(d) {
             const hf = a.hasHandoff ? '<span style="color:#5db4d9" title="left handoff notes">&#9678;</span>' : '';
             const title = a.purpose || a.summary || '(untitled session)';
             const sm = (a.summary || '').trim().toLowerCase();
-            const isStub = sm === 'closed from console.' || sm === 'restarted from console.' || sm === 'closed from console' || sm === 'restarted from console';
+            // Stub epitaphs say nothing about the WORK, so they are hidden rather than shown as a
+            // summary. The old 'restarted from console' spellings stay listed: they are already
+            // written into archived sessions and would start rendering as real summaries otherwise.
+            const isStub = sm === 'closed from console.' || sm === 'restarted from console.' || sm === 'closed from console' || sm === 'restarted from console'
+                || sm === 'worker relaunched from console (hub untouched).';
             const epi = (a.summary && a.summary !== a.purpose && !isStub) ? '<span class="aepi">' + esc(a.summary) + '</span>' : '';
             const tip = (a.summary && !isStub) ? a.summary : (a.purpose || '');
             const acwd = a.cwd ? '<span class="cpybtn pathtok" data-copy="' + b64(a.cwd) + '" title="copy path: ' + escAttr(a.cwd) + '">📋</span>' : '';
