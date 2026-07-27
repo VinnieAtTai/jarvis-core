@@ -22,7 +22,7 @@
 // Use from a session that wants a real hub to poke by hand:
 //     node test-support/scratch-hub.mjs --hold 180
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
@@ -146,6 +146,42 @@ let uid = null;
 })();
 `;
 
+// Collect scratch dirs abandoned by an earlier run, killing any worker host they still record.
+//
+// dispose() covers every graceful path, but these rigs are precisely the thing people Ctrl-C or
+// taskkill mid-run -- I stranded two of them myself getting the CLI right -- and a hard kill skips
+// cleanup entirely. The directory alone is harmless litter; a worker host recorded inside it is not,
+// because it was spawned outside every process tree on purpose and will outlive everything.
+//
+// The age threshold is what makes this safe to run unconditionally: a concurrently running rig is
+// seconds or minutes old, so an hour's grace cannot touch one. Deliberately never throws -- failing
+// to tidy up someone else's mess must not fail the caller's test.
+export function sweepAbandonedScratch(olderThanMs = 3600000) {
+    let killed = 0, removed = 0;
+    let entries = [];
+    try { entries = readdirSync(tmpdir()); } catch { return { killed, removed }; }
+    for (const name of entries) {
+        if (!/^jarvis-scratch-/.test(name)) continue;
+        const dir = join(tmpdir(), name);
+        try {
+            if (Date.now() - statSync(dir).mtimeMs < olderThanMs) continue;
+            const data = join(dir, 'data');
+            if (existsSync(data)) {
+                for (const f of readdirSync(data)) {
+                    if (!/^worker-.+\.pid$/i.test(f)) continue;
+                    try {
+                        const r = JSON.parse(readFileSync(join(data, f), 'utf8'));
+                        if (r.hostPid && treeKill(r.hostPid, 'abandoned scratch host')) killed++;
+                    } catch { }
+                }
+            }
+            rmSync(dir, { recursive: true, force: true });
+            removed++;
+        } catch { }
+    }
+    return { killed, removed };
+}
+
 /**
  * Boot-ready scratch hub. Nothing is started until you call start().
  *
@@ -155,6 +191,7 @@ let uid = null;
  */
 export async function createScratchHub(opts = {}) {
     const nodeModules = resolveNodeModules();
+    sweepAbandonedScratch(opts.sweepOlderThanMs);
     const root = mkdtempSync(join(tmpdir(), 'jarvis-scratch-'));
     const DATA = join(root, 'data'), BIN = join(root, 'bin'), REPO = join(root, 'repo'), LAD = join(root, 'localappdata');
     for (const d of [DATA, BIN, REPO, LAD]) mkdirSync(d, { recursive: true });
@@ -299,14 +336,24 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const holdSec = holdArg > -1 ? Number(process.argv[holdArg + 1]) || 120 : 120;
     assertConsolelessPossible();
     const hub = await createScratchHub();
-    // Tear down on the way out however we leave, so a hand-driven rig cannot strand an orphaned host.
+    // Tear down however we leave, so a hand-driven rig cannot strand an orphaned host.
     for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { hub.dispose(); process.exit(0); });
     process.on('exit', () => hub.dispose());
-    await hub.start('scratch hub');
-    console.log('scratch hub  -> ' + hub.origin);
-    console.log('  data dir   -> ' + hub.DATA);
-    console.log('  spawn cwd  -> ' + hub.REPO + '   (claude is a stub; workers register and poll, nothing else)');
-    console.log('  holding ' + holdSec + 's, then tearing down. Ctrl-C also tears down.');
-    await sleep(holdSec * 1000);
-    console.log('tearing down.');
+    try {
+        await hub.start('scratch hub');
+        console.log('scratch hub  -> ' + hub.origin);
+        console.log('  data dir   -> ' + hub.DATA);
+        console.log('  spawn cwd  -> ' + hub.REPO + '   (claude is a stub; workers register and poll, nothing else)');
+        console.log('  holding ' + holdSec + 's, then tearing down. Ctrl-C also tears down.');
+        await sleep(holdSec * 1000);
+    } finally {
+        // Dispose EXPLICITLY and exit, rather than falling off the end and trusting the 'exit' handler
+        // above. Node keeps the event loop alive while a spawned child with piped stdio is running, so
+        // the hub we started is itself the reason 'exit' would never fire -- the first cut of this CLI
+        // printed "tearing down", then hung with two hubs still up. The handler stays as the backstop
+        // for the paths that do not come through here (a signal, a throw before start resolves).
+        console.log('tearing down.');
+        hub.dispose();
+        process.exit(0);
+    }
 }
