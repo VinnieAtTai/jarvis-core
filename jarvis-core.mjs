@@ -31,7 +31,16 @@ const BUILD = (() => {
     const git = (...a) => execFileSync('git', ['-C', HERE, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
     let rev = null, status = null;
     try { rev = git('rev-parse', 'HEAD'); } catch { }
-    try { status = git('status', '--porcelain'); } catch { }
+    // Deliberately NOT `git status --porcelain`. That answer is driven by cached file stats, and on
+    // 2026-07-27 it kept reporting ` M jarvis-text.mjs` for a file whose content was provably
+    // identical to HEAD — worktree, index and HEAD blobs all 3632e27, `git diff HEAD` clean, and a
+    // `git add` that staged nothing. The hub booted on it and published `dirty: true`, which is the
+    // very failure c059932 exists to prevent wearing the other face: instead of believing a stale
+    // build is fresh, the next session believes a clean one is modified and hunts for a diff that
+    // was never there. `git diff` compares CONTENT, so it cannot invent a modification; the second
+    // call keeps the untracked half `status` was also covering. If either throws, status stays null
+    // and buildIdentity renders dirty:null — unknown, never a silent false.
+    try { status = git('diff', '--name-only', 'HEAD') + git('ls-files', '--others', '--exclude-standard'); } catch { }
     return buildIdentity({ rev, status, bootedAt: new Date().toISOString(), pid: process.pid });
 })();
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
