@@ -679,6 +679,37 @@ export function nextFocusKey(live, exclude = null) {
     return 'jarvis';
 }
 
+// Which BOARD a callsign's work belongs on: the PROJECT key for a project-bound session, else the
+// callsign itself. The companion to nextFocusKey above -- that one picks a board key, this one
+// converts a callsign into one.
+//
+// The invariant is already stated twice in this codebase (nextFocusKey's comment, and the
+// project-worker comment in jarvis-core): a project-bound worker renders on its PROJECT's card and
+// its own NATO callsign has no card at all. registerSession honours it -- ensureBoard(w, proj || cs)
+// -- but three other sites did not, and called ensureBoard on whatever callsign they were handed. So
+// a coordinator that posted /worklist as ITSELF instead of as its project MINTED A SECOND BOARD.
+// Chris hit it on 2026-07-27: primeng and juliet sat on screen as two separate trackers for one
+// session, showing the same pending permission prompt twice, the 154-card backlog on one and two
+// stray cards on the other. Focusing the NATO callsign of a bound worker had the same effect.
+// Same class as the phantom-card focus bug (3696440): a raw NATO callsign used where a board key was
+// needed.
+//
+// `sessions` is roster.sessions; `callsigns` maps a callsign to its uids, newest first. Only
+// `project` binds -- a `parentProject` SUB-worker legitimately owns its own card (that is what it
+// nests under the coordinator), so it maps to itself. A retired session does not bind either: a dead
+// coordinator's callsign resolves to the callsign, so cleanup paths can still find its own card.
+// Pure: reads, mutates nothing.
+export function boardKeyFor(cs, sessions, callsigns) {
+    const key = cs ? String(cs).toLowerCase().trim() : '';
+    if (!key || key === 'jarvis') return key;
+    const list = callsigns && callsigns[key];
+    const uid = Array.isArray(list) && list.length ? list[0] : null;
+    const s = uid && sessions ? sessions[uid] : null;
+    if (!s || s.ended) return key;
+    const proj = s.project ? String(s.project).toLowerCase().trim() : '';
+    return proj || key;
+}
+
 // A session's liveness has TWO independent signals, and they can disagree. `/heartbeat` is a dumb
 // background timer; `/poll` is the worker's actual event loop -- its ears. When the poll loop dies
 // but the heartbeat timer keeps ticking, the session looks perfectly green while being completely

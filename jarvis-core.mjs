@@ -9,7 +9,7 @@ import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
 import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees } from './jarvis-text.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, resolveBinding, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -667,6 +667,11 @@ function liveUidOf(cs) {
     const s = roster.sessions[l[0]];
     return s && !s.ended ? l[0] : null;
 }
+// The board a callsign's work belongs on -- the project column for a bound coordinator, else the
+// callsign. Use this ANY time a callsign is about to reach ensureBoard or w.focus; passing the raw
+// callsign is what minted a second board for one session (see boardKeyFor). Note it is NOT a
+// substitute for the callsign when looking a SESSION up: roster lookups still need the NATO name.
+const boardKey = cs => boardKeyFor(cs, roster.sessions, roster.callsigns);
 // A project (e.g. 'jarvis') is a durable board card that can host ONE live worker. The worker
 // is a normal session (own uid + NATO callsign for the perm-hook) but carries .project, which
 // binds its board + routing to the project card instead of giving it its own separate card.
@@ -1647,10 +1652,14 @@ function handleUtterance(rawText, typed) {
         const cs = csFrom(m[1]);
         if (cs) {
             const w = loadWork();
-            w.focus = cs;
-            if (cs !== 'jarvis') ensureBoard(w, cs);
+            // "focus on juliet" has to land on the primeng CARD, not mint a juliet board. The spoken
+            // reply still names the worker and reads its purpose off the NATO callsign -- boardKey is
+            // for the board, never for a roster lookup.
+            const fk = boardKey(cs);
+            w.focus = fk;
+            if (fk !== 'jarvis') ensureBoard(w, fk);
             saveWork(w);
-            record({ kind: 'sys', text: 'focus: ' + cs });
+            record({ kind: 'sys', text: 'focus: ' + fk + (fk !== cs ? ' (' + cs + ' is its worker)' : '') });
             if (cs === 'jarvis') enqueueSay('Focused on me.', 'jarvis');
             else enqueueSay('Focused on ' + cs + ', ' + roster.sessions[liveUidOf(cs)].purpose + '.', 'jarvis');
         } else enqueueSay('No live session called ' + m[1] + '.', 'jarvis');
@@ -2525,11 +2534,14 @@ async function handleRequest(req, res) {
         const isProject = (loadProjects().projects || []).some(p => p && p.name === cs);
         if (cs !== 'jarvis' && !liveUidOf(cs) && !isProject) return json(res, 404, { error: 'no live session or project ' + cs });
         const w = loadWork();
-        w.focus = cs;
-        if (cs !== 'jarvis') ensureBoard(w, cs);
+        // Focusing a bound coordinator by its NATO callsign must land on the PROJECT card -- that is
+        // the card it renders on. Pointing focus at the callsign put it on a board with no card.
+        const fk = boardKey(cs);
+        w.focus = fk;
+        if (fk !== 'jarvis') ensureBoard(w, fk);
         saveWork(w);
-        record({ kind: 'sys', text: 'focus: ' + cs });
-        return json(res, 200, { ok: true });
+        record({ kind: 'sys', text: 'focus: ' + fk + (fk !== cs ? ' (' + cs + ' is its worker)' : '') });
+        return json(res, 200, { ok: true, focus: fk });
     }
     if (key === 'POST /spawn') {
         const b = await readBody(req);
@@ -2653,7 +2665,10 @@ async function handleRequest(req, res) {
     if (key === 'POST /worklist') {
         const b = await readBody(req);
         const w = loadWork();
-        const cs = (b.callsign && (w.sessions[b.callsign] || liveUidOf(String(b.callsign).toLowerCase()) || b.callsign === 'jarvis')) ? String(b.callsign).toLowerCase() : w.focus;
+        // A bound coordinator posting as ITSELF ('juliet') belongs on its project column ('primeng').
+        // Without boardKey this ensureBoard minted a second board and Chris got two trackers for one
+        // session. Resolve AFTER the guard so an existing NATO board still validates.
+        const cs = boardKey((b.callsign && (w.sessions[b.callsign] || liveUidOf(String(b.callsign).toLowerCase()) || b.callsign === 'jarvis')) ? String(b.callsign).toLowerCase() : w.focus);
         const board = ensureBoard(w, cs);
         const needle = String(b.text || '').trim();
         let task = needle || undefined;
