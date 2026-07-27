@@ -1388,6 +1388,29 @@ function liveWorkerHosts() {
     }
     return out;
 }
+// A worker's launch config carries its whole boot prompt, and pty-host.mjs deletes it the moment it
+// has been read — so a config still sitting on disk means the host died before parsing it, and no
+// pidfile was ever written to give liveWorkerHosts a way to notice. Left alone they accumulate
+// forever, each one a stale copy of a brief.
+//
+// Only files older than the grace window are collected, which sidesteps the one race here: a config
+// written by the previous hub in the instant before it died, whose host is still on its way up.
+function collectDeadWorkerConfigs(hosts) {
+    let files = [];
+    try { files = readdirSync(DATA); } catch { return 0; }
+    let n = 0;
+    for (const f of files) {
+        const m = /^worker-(.+)\.json$/i.exec(f);
+        if (!m || (hosts && hosts.has(m[1]))) continue;
+        const p = join(DATA, f);
+        try {
+            if (Date.now() - statSync(p).mtimeMs < READOPT_GRACE_MS) continue;
+            unlinkSync(p); n++;
+        } catch { }
+    }
+    if (n) record({ kind: 'sys', text: 'boot reconcile: collected ' + n + ' unread worker launch config(s)' });
+    return n;
+}
 // A ghost is a roster row with no process behind it — what the old design produced on EVERY
 // restart, and what Chris sees as /roster reporting five live sessions when two processes exist.
 // Two grades of evidence, because being wrong either way is expensive:
@@ -1474,6 +1497,14 @@ function reconcileWorkersOnBoot() {
             const n = buryGhosts(reconcileRoster(roster.sessions, new Set(late.keys()), Date.now(), {}).ghosts,
                 'Gone by the time the hub came back');
             if (n) saveRoster();
+            // Say it. This pass looks like the rare one -- in steady state it only ever catches a wt
+            // tab or a hand-started session that failed to check in -- but on the FIRST boot after
+            // this change lands it catches the entire pre-existing roster at once, because rows
+            // written by an older hub carry no `launch` and so cannot be judged until now. Silence
+            // there means Chris watches the roster empty itself a minute and a half after boot with
+            // nothing said, which reads exactly like the bug he asked us to fix.
+            if (n) enqueueSay('Roster reconciled. Cleared ' + n + (n === 1 ? ' session that never came back.' : ' sessions that never came back.'), 'jarvis');
+            collectDeadWorkerConfigs(late);
             sweepWorktrees(late);
         } catch { }        // a reconcile failure must never take the hub down
     }, READOPT_GRACE_MS);
@@ -1540,7 +1571,20 @@ const CONSOLELESS = process.env.JARVIS_CONSOLELESS !== '0';
 const requireCjs = createRequire(import.meta.url);
 let ptyMod = null, ptyTried = false;
 function getPty() {
-    if (!ptyTried) { ptyTried = true; try { ptyMod = requireCjs('node-pty'); } catch { ptyMod = null; } }
+    if (!ptyTried) {
+        ptyTried = true;
+        try { ptyMod = requireCjs('node-pty'); } catch { ptyMod = null; }
+        // SAY IT OUT LOUD, once. Without node-pty every spawn silently takes the wt-tab path: real
+        // terminal windows appear, a window-combine can now kill a worker, and nothing about the
+        // roster or the board looks any different. That silence cost alpha three verification runs
+        // on 2026-07-27 -- it ran the hub from a git WORKTREE, which has no node_modules of its own,
+        // so the whole restart-survival mechanism was never entered while the tests stayed green.
+        if (!ptyMod && CONSOLELESS) {
+            record({ kind: 'sys', text: 'node-pty did not resolve from ' + HERE + ' -- console-less spawning is OFF and workers will open visible wt tabs. '
+                + 'Running from a git worktree? A worktree has no node_modules: set NODE_PATH to the main checkout\'s node_modules, or npm install here.' });
+            enqueueSay('Heads up: console-less spawning is unavailable, so workers will open terminal windows.', 'jarvis');
+        }
+    }
     return ptyMod;
 }
 const workerPidfile = (cs) => join(DATA, 'worker-' + cs + '.pid');
@@ -1564,6 +1608,14 @@ function spawnWorkerConsoleless(cs, repo, boot, model, hookSettings, meta) {
     // decision has to be made synchronously, and the host resolves the module from the same
     // node_modules this process does.
     if (!getPty()) return false;
+    // Both the pidfile and the log are keyed by CALLSIGN, so reusing a name whose host is somehow
+    // still running would overwrite the only record of that host's pid — leaving a process nothing
+    // can ever kill, still holding a claude session and still claiming a worktree. Retire clears the
+    // pidfile, so in the ordinary case there is nothing here and this costs one failed stat. The
+    // case it covers is a host whose claude never registered (wedged on a prompt, say): its pin
+    // reservation expires after five minutes and the callsign becomes issuable again while the
+    // process lives on. Taking the name means taking the handle, so take the process too.
+    try { killWorkerHost(cs); } catch { }
     const args = [];
     if (repo.permissionMode) args.push('--permission-mode', repo.permissionMode);
     const md = model || repo.model;
