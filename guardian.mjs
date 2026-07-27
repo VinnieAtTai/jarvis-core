@@ -41,6 +41,18 @@ function pidAlive(pid) {
     if (existsSync(STOP)) { log('STOP appeared during recheck — leaving it'); return; }
     // Genuinely down >15s. Any supervisor that exists is not doing its job — kill it so a fresh one
     // does not bow out to its still-held singleton lock, then relaunch clean.
+    //
+    // The /T is deliberate and it is now SAFE, which it was not before. It used to walk into every
+    // console-less worker (they were node-pty children of the hub), so a single guardian firing
+    // wiped the fleet — and it fired eight times in the week to 2026-07-27. Workers now run in
+    // pty-host processes launched through orphan-spawn.mjs, which leaves them parented to a dead pid
+    // and therefore outside this tree entirely; the orphaning is what protects them, not the shape
+    // of this command.
+    //
+    // Do NOT narrow this to the supervisor and hub pids alone. /T is what reaps the hub's GENUINE
+    // children, and stt.mjs spawns the local whisper.cpp server as one of them, bound to a fixed
+    // port. Strand it and the next hub's local STT fails to bind. The invariant to protect is
+    // upstream of here: anything that must outlive the hub is spawned via orphan-spawn.mjs.
     let note = '';
     try {
         if (existsSync(LOCK)) {

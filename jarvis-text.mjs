@@ -924,19 +924,65 @@ export function shouldIsolate(spec) {
     return !/\b(research|read[\s-]?only|readonly|investigate|audit|triage|watch|monitor|explore|browse)\b/i.test(String(s.purpose || ''));
 }
 
-// Which directories under WT_ROOT belong to nobody. A hub restart kills every console-less worker
-// (their ptys are hub children) but leaves its worktree on disk, so boot has to collect them —
-// otherwise the disk fills with dead checkouts and, worse, a recycled callsign trips over its own
-// leftover directory and silently loses isolation.
+// Sort every unended roster row into "still running" and "corpse", given the set of callsigns that
+// have a live worker host process behind them. This is the thing that stops /roster reporting five
+// live sessions when two processes exist.
 //
-// A worktree is an orphan when no UNENDED session claims it with a heartbeat inside `staleMs`. That
-// freshness test is what protects the one worker that can legitimately outlive the hub (a wt-tab
-// worker, JARVIS_CONSOLELESS=0): it is still beating, so its worktree is left alone. Removal is the
-// caller's job and it commits any WIP to the branch first — nothing is ever swept away unsaved.
+// The evidence is deliberately graded, because being wrong is expensive in both directions: bury a
+// live worker and its board and worktree go with it; spare a dead one and the ghost keeps taking
+// focus, keeps being routed messages nobody reads, and keeps its cards on the board forever.
+//   live      — a host pid is running for that callsign. Deterministic, nothing to argue with.
+//   provable  — `launch:'pty'` and no host. A console-less worker's host writes its pidfile before
+//               it starts claude, so no pidfile means no process. Dead, immediately, no window.
+//   suspected — no host and no `launch:'pty'`: a wt tab, or a session started by hand. Both
+//               legitimately outlive the hub and never had a pidfile, so the only evidence left is
+//               the heartbeat — which is exactly the evidence that is worthless right after a
+//               restart, when every survivor's lastSeen is frozen at pre-restart. Hence
+//               `provableOnly`: the caller runs once at boot with it set, then again after a grace
+//               window with it clear, by which time a survivor has polled and looks warm.
+export function reconcileRoster(sessions, liveHosts, now, opts = {}) {
+    const o = opts && typeof opts === 'object' ? opts : {};
+    const staleMs = Number.isFinite(o.staleMs) ? o.staleMs : 120000;
+    const hosts = liveHosts instanceof Set ? liveHosts : new Set(liveHosts || []);
+    const out = { readopt: [], ghosts: [] };
+    for (const uid of Object.keys(sessions || {})) {
+        const s = sessions[uid];
+        if (!s || s.ended) continue;
+        const cs = s.callsign;
+        if (hosts.has(cs)) { out.readopt.push({ uid, cs }); continue; }
+        const provable = s.launch === 'pty';
+        const seen = Date.parse(s.lastSeen);
+        const warm = Number.isFinite(seen) && (now - seen) < staleMs;
+        if (provable || (!o.provableOnly && !warm)) out.ghosts.push({ uid, cs, provable });
+    }
+    return out;
+}
+
+// Which directories under WT_ROOT belong to nobody. A worker that dies leaves its worktree on disk
+// with no session to ever clean it up, so something has to collect them — otherwise the disk fills
+// with dead checkouts and, worse, a recycled callsign trips over its own leftover directory and
+// silently loses isolation.
+//
+// This used to say "a hub restart kills every console-less worker, so boot has to collect them".
+// That was true and is not any more: workers now run in their own pty-host process and outlive the
+// hub deliberately. Sweeping on that old assumption deletes a LIVE worker's working directory and
+// its uncommitted work with it, so the assumption is worth naming as dead rather than leaving the
+// next reader to infer it.
+//
+// Two ways a directory is claimed, in order of how much they are worth trusting:
+//   opts.claimed — paths the caller can PROVE are in use, from a live host pid or a worktree cut
+//                  for a worker that has not registered yet. Deterministic; outranks everything.
+//   heartbeat    — an unended session whose lastSeen is inside `staleMs`. The only signal available
+//                  for a worker the caller holds no pid for (a wt tab, or one Chris started by
+//                  hand), but note it is useless immediately after a restart, when every survivor's
+//                  lastSeen is frozen at whatever it was before the hub went down. A caller running
+//                  at boot must give survivors time to check in before trusting this.
+// Removal is the caller's job and it commits any WIP to the branch first — nothing is swept unsaved.
 export function orphanWorktrees(dirs, sessions, now, opts = {}) {
     const o = opts && typeof opts === 'object' ? opts : {};
     const staleMs = Number.isFinite(o.staleMs) ? o.staleMs : 120000;
     const live = new Set();
+    for (const p of (o.claimed || [])) if (p) live.add(wtSlashes(p).toLowerCase());
     for (const uid in (sessions || {})) {
         const s = sessions[uid];
         if (!s || s.ended || !s.worktree) continue;

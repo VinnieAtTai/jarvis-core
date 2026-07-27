@@ -19,3 +19,6 @@ anthropic-key.txt
 ai-threads.json
 ai-spend.json
 stt/
+worker-*.pid
+worker-*.log
+worker-*.json

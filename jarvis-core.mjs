@@ -8,7 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees } from './jarvis-text.mjs';
+import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees, reconcileRoster } from './jarvis-text.mjs';
 import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -890,7 +890,13 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
         } catch { }   // an unreadable project store must never block a register
     }
     roster.callsigns[cs] = [uid, ...(roster.callsigns[cs] || [])];
-    roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier, ...(proj ? { project: proj } : {}), ...(pproj ? { parentProject: pproj } : {}), ...(wt ? { worktree: wt.path, branch: wt.branch, base: wt.base } : {}) };
+    // How this worker was launched, recorded because after a hub restart it is the difference
+    // between a corpse and a survivor. A console-less worker's host writes its pidfile before it
+    // ever starts claude, so the file being here means this session is one — and the absence of one
+    // means a wt tab or a session Chris started by hand, both of which outlive the hub on their own
+    // and must be given a grace window rather than buried on sight.
+    const launch = existsSync(workerPidfile(cs)) ? 'pty' : 'wt';
+    roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier, launch, ...(proj ? { project: proj } : {}), ...(pproj ? { parentProject: pproj } : {}), ...(wt ? { worktree: wt.path, branch: wt.branch, base: wt.base } : {}) };
     if (wt) record({ kind: 'sys', text: cs + ' is isolated on ' + wt.branch + ' (worktree ' + wt.path + ', repo ' + cwdKey(cwd) + ')' });
     if (roster.awayUntil && Date.now() < roster.awayUntil) roster.sessions[uid].trustUntil = roster.awayUntil;
     saveRoster();
@@ -949,12 +955,13 @@ function retireSession(uid, summary, opts = {}) {
     if (summary) s.summary = summary;
     const cs = s.callsign;
     try { unlinkSync(join(DATA, 'spawn-' + cs + '.cmd')); } catch { } // its launch script is done with
-    // A console-less worker runs in a ConPTY the hub owns; with no window to close, its idle
-    // claude process would otherwise linger as a hub child forever after retire. Kill it here so
-    // retiring actually reclaims the process. A successor (if any) is a separate pty under a new
+    // A console-less worker runs in a ConPTY owned by its own pty-host process; with no window to
+    // close, its idle claude process would otherwise linger forever after retire — and now that
+    // the host deliberately outlives the hub, "forever" really is forever. Kill it here so
+    // retiring actually reclaims the process. A successor (if any) is a separate host under a new
     // callsign, so this never touches the replacement. Falls through harmlessly for wt-tab workers
-    // (not in the map). onExit prunes the map; the delete is belt-and-suspenders.
-    try { const wp = workerPtys.get(cs); if (wp) { wp.kill(); workerPtys.delete(cs); } } catch { }
+    // (no pidfile).
+    try { killWorkerHost(cs); } catch { }
     // Worktree teardown, AFTER the pty is dead so nothing is still writing into the tree: commit any
     // in-flight WIP to the worker's branch, drop the directory, keep the branch (it is the
     // deliverable). The successor spawned below inherits that branch and continues on it.
@@ -1023,7 +1030,7 @@ function retireSession(uid, summary, opts = {}) {
         saveWork(w);
         saveRoster();
         record({ kind: 'sys', text: cs + ' (' + s.project + ' worker) retired (' + uid + ')' + (psucc ? ' -> successor ' + psucc : '') });
-        enqueueSay(psucc ? s.project + ' worker handed off.' : (held ? s.project + ' worker retired; ' + (held.callsign || 'another session') + ' still has it.' : s.project + ' worker retired; the card is idle.'), 'jarvis');
+        if (!opts.quiet) enqueueSay(psucc ? s.project + ' worker handed off.' : (held ? s.project + ' worker retired; ' + (held.callsign || 'another session') + ' still has it.' : s.project + ' worker retired; the card is idle.'), 'jarvis');
         busAppend({ from: 'jarvis', to: uid, kind: 'retired', text: 'retired' });
         return true;
     }
@@ -1065,7 +1072,9 @@ function retireSession(uid, summary, opts = {}) {
     saveWork(w);
     saveRoster();
     record({ kind: 'sys', text: cs + ' retired (' + uid + ')' });
-    enqueueSay(opts.spoken || (cs + ' retired.' + (summary ? ' ' + summary : '')), 'jarvis');
+    // opts.quiet: boot reconciliation can bury a whole fleet at once, and one spoken line per corpse
+    // would be a minute of Chris being read a casualty list. The caller speaks a single summary.
+    if (!opts.quiet) enqueueSay(opts.spoken || (cs + ' retired.' + (summary ? ' ' + summary : '')), 'jarvis');
     busAppend({ from: 'jarvis', to: uid, kind: 'retired', text: 'retired' });
     return true;
 }
@@ -1356,11 +1365,131 @@ function teardownWorktree(s, cs) {
         return 'kept';
     }
 }
-// Boot sweep. Console-less workers are hub children, so a restart kills every one of them and leaves
-// its worktree on disk with no session to ever clean it up. Collect those: prune each repo's stale
-// administrative entries, then tear down any directory under a WT_ROOT that no live session claims
-// (WIP committed to its branch first — the sweep loses nothing).
-function sweepWorktrees() {
+// ---- restart resilience -------------------------------------------------------------------
+// Everything down to sweepWorktrees exists because a console-less worker now OUTLIVES the hub.
+// Three things that used to be true by construction have to be re-established by hand on the way
+// back up: which workers are still running, which roster rows are corpses, and which spawns were
+// still in flight when the hub went down.
+
+// Every worker host with a live process behind it, keyed by callsign. A pidfile whose host is gone
+// is deleted on sight: it is a lie, and an uncollected one would spare a dead worker's worktree
+// from the sweep forever.
+function liveWorkerHosts() {
+    const out = new Map();
+    let files = [];
+    try { files = readdirSync(DATA); } catch { return out; }
+    for (const f of files) {
+        const m = /^worker-(.+)\.pid$/i.exec(f);
+        if (!m) continue;
+        let rec = null;
+        try { rec = JSON.parse(readFileSync(join(DATA, f), 'utf8')); } catch { }
+        if (rec && rec.hostPid && hostAlive(rec.hostPid)) out.set(rec.cs || m[1], rec);
+        else { try { unlinkSync(join(DATA, f)); } catch { } }
+    }
+    return out;
+}
+// A ghost is a roster row with no process behind it — what the old design produced on EVERY
+// restart, and what Chris sees as /roster reporting five live sessions when two processes exist.
+// Two grades of evidence, because being wrong either way is expensive:
+//   provable  — launched console-less (`launch:'pty'`) and no live host. Dead, full stop.
+//   suspected — no host, but it might be a wt-tab worker (JARVIS_CONSOLELESS=0) or a session Chris
+//               started by hand; both legitimately outlive the hub and never had a pidfile.
+// lastSeen cannot settle the suspected case at boot, because it is frozen at whatever it was
+// before the restart: a survivor of a slow restart reads cold, a corpse of a fast one reads warm.
+// So suspected rows get a grace window to prove themselves by polling, and are judged after it.
+// The classification itself is pure and lives in jarvis-text (reconcileRoster) with its own tests —
+// it is the part of this that is easy to get subtly wrong and impossible to exercise by hand.
+const READOPT_GRACE_MS = Number(process.env.JARVIS_READOPT_GRACE_MS || 90000);
+function buryGhosts(ghosts, why) {
+    if (!ghosts.length) return 0;
+    for (const g of ghosts) {
+        // The ordinary retire path, deliberately: it commits the worktree WIP to the branch, archives
+        // the session, and files the full board under the cwd+purpose handoff key so the next worker
+        // on that job inherits it. NEVER with a successor — one guardian firing can produce a fleet of
+        // these at once, and spawning off corpses is exactly how a swarm gets minted.
+        try { retireSession(g.uid, why, { successor: false, quiet: true }); } catch { }
+    }
+    record({ kind: 'sys', text: 'boot reconcile: buried ' + ghosts.length + ' ghost session(s) - ' + ghosts.map(g => g.cs).join(', ') });
+    return ghosts.length;
+}
+// Spawn-in-flight state lives in module-global Maps that a restart wipes. That was harmless while a
+// restart also killed the booting ConPTY -- respawning afterwards was then the CORRECT behaviour,
+// because nothing was coming up any more. This change kills that premise: the booting worker now
+// survives, registers a minute later, and finds its callsign reissued or its project already
+// coordinated. Rebuild from the pidfiles, the only record that outlived the hub.
+//
+// MUST run after the burial: the "already registered" test reads `ended`, and until the corpses are
+// buried every one of them still reads unended.
+function restoreBootingState(hosts) {
+    const registered = new Set();
+    for (const uid in roster.sessions) {
+        const s = roster.sessions[uid];
+        if (s && !s.ended && s.callsign) registered.add(s.callsign);
+    }
+    let n = 0;
+    for (const [cs, rec] of hosts) {
+        if (registered.has(cs)) continue;      // it came up already; a bind for it now is a phantom
+        const parsed = Date.parse(rec.spawnedAt);
+        // The real spawn time, not boot time, so staleness measures how long the worker has actually
+        // been failing to come up rather than resetting its clock on every restart.
+        const at = Number.isFinite(parsed) ? parsed : Date.now();
+        pendingPins.set(cs, at);               // stops assignCallsign reissuing a name that is in use
+        if (rec.project || rec.parentProject) pendingBind.set(cs, { project: rec.project || null, parentProject: rec.parentProject || null, ts: at });
+        // Without this the worker registers with no worktree on its session row, and the sweep then
+        // sees an unclaimed directory and tears it down underneath a live worker.
+        if (rec.worktree && rec.worktree.path) pendingWorktree.set(cs, { ...rec.worktree, ts: at });
+        n++;
+    }
+    if (n) record({ kind: 'sys', text: 'boot reconcile: ' + n + ' worker(s) still booting; spawn state restored' });
+    return n;
+}
+// The seam yankee's coordinator-uniqueness predicate takes as a parameter. pendingBind is the
+// container on purpose: it already carries {project,parentProject,ts} for every spawn site, and
+// takePendingBind deletes on register, which is what makes membership mean "booting" rather than
+// "bound". Handing over the map itself keeps one source of truth, so the predicate cannot drift
+// from this restore the way boardKeyFor and nextFocusKey drifted apart in 14f3ad4.
+function bootingCoordinators() {
+    return pendingBind;
+}
+// Boot orchestration. The ORDER is load-bearing; see the note on restoreBootingState.
+function reconcileWorkersOnBoot() {
+    const hosts = liveWorkerHosts();
+    const first = reconcileRoster(roster.sessions, new Set(hosts.keys()), Date.now(), { provableOnly: true });
+    if (first.readopt.length) {
+        // Re-adopting is mostly just declining to treat them as dead. Stamp `launch` while we are
+        // here so rows written by an older hub (which never recorded it) are provable next restart.
+        for (const r of first.readopt) { const s = roster.sessions[r.uid]; if (s) s.launch = 'pty'; }
+        record({ kind: 'sys', text: 'boot reconcile: re-adopted ' + first.readopt.length + ' live worker(s) - ' + first.readopt.map(r => r.cs).join(', ') });
+    }
+    const buried = buryGhosts(first.ghosts, 'Lost when the hub restarted');
+    restoreBootingState(hosts);
+    saveRoster();
+    if (buried) enqueueSay('Back up. ' + buried + (buried === 1 ? ' session did not survive the restart.' : ' sessions did not survive the restart.'), 'jarvis');
+    // The suspected rows and the worktree sweep both wait out the grace window: a wt-tab survivor
+    // deserves the chance to poll before it is judged, and the sweep must not run while any live
+    // worker's claim on its directory is still unproven.
+    setTimeout(() => {
+        try {
+            const late = liveWorkerHosts();
+            const n = buryGhosts(reconcileRoster(roster.sessions, new Set(late.keys()), Date.now(), {}).ghosts,
+                'Gone by the time the hub came back');
+            if (n) saveRoster();
+            sweepWorktrees(late);
+        } catch { }        // a reconcile failure must never take the hub down
+    }, READOPT_GRACE_MS);
+}
+// Worktree sweep. A worktree whose owner is gone has to be collected, or the disk fills with dead
+// checkouts and a recycled callsign trips over its own leftover directory and silently loses
+// isolation. Prune each repo's stale administrative entries, then tear down any directory under a
+// WT_ROOT that nothing claims (WIP committed to its branch first — the sweep loses nothing).
+//
+// This used to run at boot on the assumption that a restart had killed every console-less worker,
+// so every worktree it found was by definition abandoned. That assumption is now FALSE and the
+// consequence is not cosmetic: run it unchanged and it deletes the working directory out from
+// under a live worker, taking uncommitted work with it. Hence `hosts` — a live host pid is a
+// deterministic claim on a directory — and hence the caller deferring this until after the
+// re-adoption grace window. Do not call it at boot again.
+function sweepWorktrees(hosts) {
     if (!WT_ISOLATE) return;
     try {
         const repos = loadRepos();
@@ -1374,7 +1503,13 @@ function sweepWorktrees() {
         }
         const dirs = [];
         for (const root of roots.values()) dirs.push(...wtDirs(root));
-        const orphans = orphanWorktrees(dirs, roster.sessions, Date.now());
+        // Two claims that outrank the heartbeat test inside orphanWorktrees: a live host pid (the
+        // worker is provably running, whatever its lastSeen says) and a pending worktree (cut for a
+        // worker that has not registered yet, so no session row mentions it at all).
+        const claimed = [];
+        for (const rec of (hosts || new Map()).values()) if (rec && rec.worktree && rec.worktree.path) claimed.push(rec.worktree.path);
+        for (const v of pendingWorktree.values()) if (v && v.path) claimed.push(v.path);
+        const orphans = orphanWorktrees(dirs, roster.sessions, Date.now(), { claimed });
         for (const p of orphans) {
             // A worktree's .git is a FILE pointing at the parent repo. No .git at all means this is
             // some other directory that wandered into WT_ROOT — never touch it.
@@ -1382,7 +1517,7 @@ function sweepWorktrees() {
             const owner = Object.values(roster.sessions).find(x => x && x.worktree && cwdKey(x.worktree) === cwdKey(p));
             const common = gitOut(p, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
             const repoCwd = (owner && owner.cwd) || (common ? dirname(common.replace(/\\/g, '/').replace(/\/+$/, '')) : '');
-            teardownWorktree({ worktree: p, cwd: repoCwd, branch: (owner && owner.branch) || gitOut(p, ['rev-parse', '--abbrev-ref', 'HEAD']) || '?', purpose: 'orphaned by a hub restart' },
+            teardownWorktree({ worktree: p, cwd: repoCwd, branch: (owner && owner.branch) || gitOut(p, ['rev-parse', '--abbrev-ref', 'HEAD']) || '?', purpose: 'left behind by a dead session' },
                 (owner && owner.callsign) || 'a dead session');
         }
         if (orphans.length) record({ kind: 'sys', text: 'boot sweep: collected ' + orphans.length + ' orphaned worktree' + (orphans.length === 1 ? '' : 's') });
@@ -1391,36 +1526,92 @@ function sweepWorktrees() {
 // Console-less worker spawning. A worker's only channel to Chris is this hub (board/chat/perm
 // cards over HTTP), so its terminal window is pure crash-exposure: combining DOS/console windows
 // tears that console down and kills the worker. node-pty runs claude inside an invisible ConPTY
-// the hub owns (a real pseudo-TTY, so claude runs its normal persistent interactive session) with
-// NO window for a combine to reach. Default ON; set JARVIS_CONSOLELESS=0 to fall back to wt tabs.
-// Tradeoff: a ConPTY worker is a child of the hub, so it dies if the hub does (wt workers don't) —
-// acceptable now that the hub itself is console-less and crash-surviving.
+// (a real pseudo-TTY, so claude runs its normal persistent interactive session) with NO window
+// for a combine to reach. Default ON; set JARVIS_CONSOLELESS=0 to fall back to wt tabs.
+//
+// The ConPTY used to be owned by the hub itself, which quietly made the hub's lifetime the
+// fleet's lifetime — a restart, a crash, or one guardian.mjs `taskkill /F /T` on the supervisor
+// killed every worker, while the console's Restart tooltip went on promising "live sessions
+// survive". Now each worker gets its own pty-host.mjs process, launched THROUGH orphan-spawn.mjs
+// so it is not a descendant of the supervisor and /T cannot walk to it. The hub keeps no handle:
+// the host's pidfile in JARVIS_DATA is the handle, which is the whole point, because a pid on
+// disk is the only kind of handle that survives the hub restarting.
 const CONSOLELESS = process.env.JARVIS_CONSOLELESS !== '0';
 const requireCjs = createRequire(import.meta.url);
-const workerPtys = new Map();
 let ptyMod = null, ptyTried = false;
 function getPty() {
     if (!ptyTried) { ptyTried = true; try { ptyMod = requireCjs('node-pty'); } catch { ptyMod = null; } }
     return ptyMod;
 }
-function spawnWorkerConsoleless(cs, repo, boot, model, hookSettings) {
-    const pty = getPty();
-    if (!pty) return false;
+const workerPidfile = (cs) => join(DATA, 'worker-' + cs + '.pid');
+function readWorkerPidfile(cs) {
+    try { const r = JSON.parse(readFileSync(workerPidfile(cs), 'utf8')); return (r && r.hostPid) ? r : null; }
+    catch { return null; }
+}
+// Liveness of a recorded host pid. `process.kill(pid,0)` alone would be fooled by PID reuse — and
+// a false "alive" is the expensive direction here, since it would leave a ghost session on the
+// roster and spare a dead worker's worktree from the sweep forever. So confirm the pid is still a
+// node process, the same tasklist check guardian.mjs uses (wmic is gone on Win11 26200; the
+// replacement is Get-CimInstance, but tasklist is cheaper and already the house pattern).
+function hostAlive(pid) {
+    if (!pid) return false;
+    try { process.kill(pid, 0); } catch (e) { if (e.code !== 'EPERM') return false; }
+    try { return /node\.exe/i.test(execFileSync('tasklist', ['/FI', 'PID eq ' + pid, '/NH'], { encoding: 'utf8', timeout: 8000 })); }
+    catch { return false; }
+}
+function spawnWorkerConsoleless(cs, repo, boot, model, hookSettings, meta) {
+    // Probe node-pty HERE even though the host is what actually uses it: the wt-tab fallback
+    // decision has to be made synchronously, and the host resolves the module from the same
+    // node_modules this process does.
+    if (!getPty()) return false;
     const args = [];
     if (repo.permissionMode) args.push('--permission-mode', repo.permissionMode);
     const md = model || repo.model;
     if (md) args.push('--model', md);
     if (hookSettings) args.push('--settings', hookSettings);
     args.push(boot);
-    const log = join(DATA, 'worker-' + cs + '.log');
-    try { writeFileSync(log, ''); } catch { }
-    const proc = pty.spawn(resolveClaude(), args, {
-        name: 'xterm-color', cols: 140, rows: 40, cwd: repo.cwd,
-        env: { ...process.env, JARVIS_CALLSIGN: cs, JARVIS_PORT: String(PORT) },
-    });
-    proc.onData((d) => { try { appendFileSync(log, d); } catch { } });
-    proc.onExit(() => { workerPtys.delete(cs); });
-    workerPtys.set(cs, proc);
+    const cfgPath = join(DATA, 'worker-' + cs + '.json');
+    // The boot prompt travels as a JSON FILE, never as argv. It is a paragraph of quotes,
+    // semicolons and URLs, and launch config has been silently lost in transit twice already
+    // (a757af9, 2273b18) — adding a process hop on a command line would have widened exactly
+    // that blast radius. pty-host.mjs deletes the file the moment it has read it.
+    //
+    // `meta` is what re-adoption needs after a restart and cannot recover from anywhere else:
+    // the binding (so pendingBind can be restored for a worker still booting) and the worktree
+    // (so the sweep knows the directory is claimed, and so registerSession can still hand the
+    // session its branch). Both live only in hub memory today and a restart wipes them.
+    try {
+        writeFileSync(cfgPath, JSON.stringify({
+            cs,
+            claude: resolveClaude(),
+            args,
+            cwd: repo.cwd,
+            env: { JARVIS_CALLSIGN: cs, JARVIS_PORT: String(PORT) },
+            log: join(DATA, 'worker-' + cs + '.log'),
+            pidfile: workerPidfile(cs),
+            spawnedAt: new Date().toISOString(),
+            project: (meta && meta.project) || null,
+            parentProject: (meta && meta.parentProject) || null,
+            worktree: (meta && meta.worktree) || null,
+        }, null, 1));
+    } catch { return false; }
+    try {
+        const child = spawn(process.execPath, [join(HERE, 'orphan-spawn.mjs'), join(HERE, 'pty-host.mjs'), cfgPath],
+            { cwd: HERE, detached: true, windowsHide: true, stdio: 'ignore' });
+        child.unref();
+    } catch { try { unlinkSync(cfgPath); } catch { } return false; }
+    return true;
+}
+// Retire's end of the deal. The hub no longer holds a pty handle to kill, so it kills the
+// recorded host pid instead. /T is correct and tightly scoped here in a way it never was on the
+// supervisor: claude genuinely is this host's own child, and nothing else is under that pid.
+function killWorkerHost(cs) {
+    const rec = readWorkerPidfile(cs);
+    try { unlinkSync(workerPidfile(cs)); } catch { }
+    try { unlinkSync(join(DATA, 'worker-' + cs + '.json')); } catch { }   // never-read config, if the host died early
+    if (!rec || !hostAlive(rec.hostPid)) return false;
+    try { execFileSync('taskkill', ['/F', '/T', '/PID', String(rec.hostPid)], { stdio: 'ignore', timeout: 10000 }); }
+    catch { return false; }
     return true;
 }
 function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, parentProject, inheritBranch) {
@@ -1492,7 +1683,11 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
     if (wt) boot += ' You are in a DEDICATED git worktree at ' + wt.path + ' on branch ' + wt.branch + ' (forked from ' + wt.base + '). Commit freely here: you cannot see or touch other worktrees or Chris\'s own checkout, so nothing you do can collide with his work. Do NOT switch branches and do not go looking for the main checkout. On retire, commit everything - your branch is how your work merges back.';
     boot += ' Permissions: read-only and routine build commands (git status/diff/log, npm run lint, node --check, ls/cat/grep/rg, dotnet build/test) run WITHOUT asking the human; only risky or out-of-repo actions prompt. Favor those pre-approved commands, batch shell calls, and self-verify (run the lint gate yourself) instead of asking. If you fan out subagents, keep them to the same safe command set so they do not each trigger a prompt.' + (effTier ? ' You are a TRUSTED session: your non-risky actions are auto-approved — work autonomously and only surface genuine decisions.' : '');
     const hookSettings = repo.permissionMode === 'bypassPermissions' ? null : join(DATA, 'perm-settings.json');
-    if (CONSOLELESS && spawnWorkerConsoleless(cs, runRepo, boot, model, hookSettings)) {
+    const hostMeta = {
+        project: boundTo, parentProject: subOf,
+        worktree: wt ? { path: wt.path, branch: wt.branch, base: wt.base, repoCwd: repo.cwd, repoKey: repo.key } : null,
+    };
+    if (CONSOLELESS && spawnWorkerConsoleless(cs, runRepo, boot, model, hookSettings, hostMeta)) {
         record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + runRepo.cwd + ' (' + repo.key + ')' + (wt ? ' [worktree ' + wt.branch + ']' : '') + ' [console-less]' });
         return cs;
     }
@@ -3142,9 +3337,12 @@ async function main() {
         process.exit(e && e.code === 'EADDRINUSE' ? 3 : 1);
     });
 
-    // Collect worktrees whose worker died with the last hub (console-less workers are hub children).
+    // Re-adopt the workers that outlived the last hub, bury the ones that did not, and restore the
+    // spawn state that was in flight when it went down. This also owns the worktree sweep, which it
+    // defers until survivors have had a chance to check in — calling sweepWorktrees() here directly
+    // would delete live workers' directories, which is precisely what it used to do.
     // After the listen, so a slow git call on a big repo never delays the port coming up.
-    sweepWorktrees();
+    reconcileWorkersOnBoot();
 
     let consolePage = null;
     let context = null;

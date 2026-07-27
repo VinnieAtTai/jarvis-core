@@ -187,20 +187,33 @@ test('shouldIsolate -- read-only wording opts out, and the list is deliberately 
 const T0 = Date.parse('2026-07-27T12:00:00Z');
 const ago = (ms) => new Date(T0 - ms).toISOString();
 
-test('orphanWorktrees -- THE CASE IT EXISTS FOR: a hub restart orphans every console-less worktree', () => {
-    // Console-less workers are hub children: they die with the hub, but their checkouts do not.
-    // Nothing is beating after a restart, so everything under WT_ROOT is collectable.
-    const dirs = ['d:/code/.jarvis-wt/broker-hotel', 'd:/code/.jarvis-wt/broker-india'];
+test('orphanWorktrees -- THE CASE IT EXISTS FOR: after a restart, only the DEAD worker\'s tree is collected', () => {
+    // This test used to assert the opposite -- that a restart orphans EVERY console-less worktree,
+    // because workers were hub children and all died with it. Workers now outlive the hub (they run
+    // in their own pty-host process), so that premise is dead, and the honest successor of the
+    // assertion is this one: a survivor's tree is off limits and only the corpse's is collectable.
+    //
+    // Inverted rather than softened or deleted on purpose. Both worker rows below look equally cold
+    // -- lastSeen is frozen at whatever it was before the hub went down, so it cannot tell them
+    // apart -- and the ONLY thing separating them is the caller's proof of a live host. Weaken this
+    // and the sweep quietly goes back to deleting the files a live worker is editing right now.
+    const alive = 'd:/code/.jarvis-wt/broker-hotel';
+    const dead = 'd:/code/.jarvis-wt/broker-india';
     const sessions = {
-        s_1: { worktree: dirs[0], ended: null, lastSeen: ago(3600000) },
-        s_2: { worktree: dirs[1], ended: null, lastSeen: ago(90 * 60000) },
+        s_1: { worktree: alive, ended: null, lastSeen: ago(3600000) },
+        s_2: { worktree: dead, ended: null, lastSeen: ago(90 * 60000) },
     };
-    assert.deepEqual(orphanWorktrees(dirs, sessions, T0), dirs);
+    assert.deepEqual(orphanWorktrees([alive, dead], sessions, T0, { claimed: [alive] }), [dead]);
+    // And with nothing claimed -- every worker really did die -- the old expectation still holds.
+    assert.deepEqual(orphanWorktrees([alive, dead], sessions, T0), [alive, dead]);
 });
 
-test('orphanWorktrees -- a LIVE worker keeps its worktree (the wt-tab worker that outlived the hub)', () => {
+test('orphanWorktrees -- a beating worker keeps its worktree, without the caller proving anything', () => {
     const mine = 'd:/code/.jarvis-wt/broker-hotel';
     const dead = 'd:/code/.jarvis-wt/broker-india';
+    // The heartbeat path, which is the fallback for any worker the caller holds no pid for -- a wt
+    // tab, or a session Chris started by hand. It is trustworthy in steady state and worthless
+    // immediately after a restart; the test above covers that second case.
     const sessions = {
         s_1: { worktree: mine, ended: null, lastSeen: ago(10000) },        // beating
         s_2: { worktree: dead, ended: null, lastSeen: ago(600000) },       // stale
