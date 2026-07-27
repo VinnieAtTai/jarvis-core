@@ -9,7 +9,7 @@ import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
 import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees } from './jarvis-text.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // Runtime state lives OUTSIDE the repo by default (%LOCALAPPDATA%\jarvis) so a `git clean -x`
@@ -514,11 +514,17 @@ function appendProjectLog(name, from, note) {
     return true;
 }
 // Bind/unbind the manager session on a project (set on register, cleared/reassigned on retire).
-function setProjectManager(name, uid) {
+//
+// `expectUid` makes the write CONDITIONAL on the slot still holding that uid — compare-and-set. Retire
+// uses it to release its own claim without stomping somebody else's: a ghost coordinator being retired
+// while a fresh one has already registered would otherwise null the LIVE one's managerUid, leaving the
+// project with a coordinator nothing records as its manager. Omit it for an unconditional claim.
+function setProjectManager(name, uid, expectUid) {
     const n = String(name || '').toLowerCase().trim();
     const store = loadProjects();
     const p = store.projects.find(x => x.name === n);
     if (!p) return false;
+    if (expectUid && p.managerUid && p.managerUid !== expectUid) return false;
     p.managerUid = uid || null;
     p.updatedAt = new Date().toISOString();
     saveProjects(store);
@@ -747,6 +753,11 @@ function takePendingBind(cs) {
     pendingBind.delete(cs);
     return b || null;
 }
+// Does this project already have a coordinator -- one live, or one spawned and still booting? Wraps
+// the pure predicate with the two things it cannot know: the roster, and the pending-bind stash.
+// EVERY site that is about to spawn a coordinator asks this first; a project gets exactly one.
+// (Same wrapper shape as boardKey / wedgedNow: the decision is pure and unit-tested, the state is here.)
+const coordinatorHeld = name => coordinatorSlotHolder(roster.sessions, pendingBind, name, Date.now());
 function enqueueSay(text, from) {
     const label = from || 'jarvis';
     const focus = loadWork().focus;
@@ -977,21 +988,42 @@ function retireSession(uid, summary, opts = {}) {
     if (s.project) {
         // Project worker: the durable project column stays put; just spawn the successor
         // (which re-attaches to the project on register). No NATO column to delete/transfer.
+        //
+        // ...unless somebody ALREADY holds the coordinator slot. This path used to spawn
+        // unconditionally, which is how retiring a GHOST primeng coordinator at 15:05:26 on 2026-07-27
+        // minted whiskey while victor — auto-revived 43s earlier by a mission message — was already
+        // coordinating the same project. `s.ended` is stamped at the top of this function, so the
+        // predicate can never see the retiring session itself as the holder.
         let psucc = null;
-        if (opts.successor && s.cwd && s.purpose) {
+        const held = opts.successor && s.cwd && s.purpose ? coordinatorHeld(s.project) : null;
+        if (opts.successor && s.cwd && s.purpose && !held) {
             try { psucc = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec, undefined, s.project, undefined, undefined, s.branch); } catch { psucc = null; }
+        } else if (held) {
+            const who = held.callsign || held.uid;
+            record({ kind: 'sys', text: 'no successor for ' + s.project + ': ' + who + ' is already ' + (held.kind === 'live' ? 'coordinating it' : 'booting as its coordinator') + '; the project card keeps the unfinished work' });
+            // Point the incumbent at the handoff we just filed. Without this those notes are silently
+            // orphaned: roster.handoffs is keyed by handoffKey(cwd, purpose), and an auto-revived
+            // coordinator's purpose is the project TITLE, so it can never match the predecessor's key
+            // and the register-time handoff hint never fires for it. Only a LIVE holder can be sent
+            // anything — a booting one has not registered, and it reads the project log on boot anyway.
+            if (held.kind === 'live' && (rec.summary || rec.notes)) {
+                busAppend({ from: 'jarvis', to: held.uid, kind: 'msg', text: cs + ' retired off ' + s.project + ' and you already hold the coordinator slot, so no successor was spawned. Its handoff: GET /handoff?cwd=' + encodeURIComponent(s.cwd || '') + '&purpose=' + encodeURIComponent(s.purpose || '') + (rec.summary ? ' -- summary: ' + rec.summary : '') });
+            }
         }
         // Feed the retiring manager's summary into the durable project log so the successor
         // rebuilds context from recent work, and release the manager slot — the successor re-claims
-        // it when it registers (it hasn't yet; spawnWorker only launches the ConPTY).
+        // it when it registers (it hasn't yet; spawnWorker only launches the ConPTY). The release is
+        // CONDITIONAL on the slot still pointing at us: a ghost being retired while a fresh
+        // coordinator has already registered would otherwise blank the LIVE one's claim, which is the
+        // same one-slot-two-coordinators bug seen from the other end.
         try {
             if (s.summary) appendProjectLog(s.project, cs, 'manager retired: ' + s.summary);
-            setProjectManager(s.project, null);
+            setProjectManager(s.project, null, uid);
         } catch { }
         saveWork(w);
         saveRoster();
         record({ kind: 'sys', text: cs + ' (' + s.project + ' worker) retired (' + uid + ')' + (psucc ? ' -> successor ' + psucc : '') });
-        enqueueSay(psucc ? s.project + ' worker handed off.' : s.project + ' worker retired; the card is idle.', 'jarvis');
+        enqueueSay(psucc ? s.project + ' worker handed off.' : (held ? s.project + ' worker retired; ' + (held.callsign || 'another session') + ' still has it.' : s.project + ' worker retired; the card is idle.'), 'jarvis');
         busAppend({ from: 'jarvis', to: uid, kind: 'retired', text: 'retired' });
         return true;
     }
@@ -1116,23 +1148,18 @@ function routeToMission(missionId, text) {
     return true;
 }
 // T2 auto-revive. Bring up a fresh coordinator for a mission's project whose coordinator is dead or
-// missing, so talking to a mission ALWAYS reaches a live brain. Guarded against spawning a swarm when
-// several mission messages land in quick succession OR while a just-spawned coordinator is still
-// booting: the spawned callsign stays in `pendingPins` until it registers, so a coordinator that is
-// booting-but-not-yet-alive is visible even before it appears in the roster; a short cooldown then
-// covers the gap between it clearing pendingPins and its first heartbeat landing. A hub restart wipes
-// this map, but a restart also kills the booting ConPTY child (it is a hub child), so a fresh spawn
-// after a restart is the CORRECT behaviour — not a duplicate.
-const missionCoordinatorSpawns = new Map();   // project name -> { cs, at }
-const COORD_REVIVE_COOLDOWN = 90000;
-function coordinatorBooting(name) {
-    const g = missionCoordinatorSpawns.get(name);
-    if (!g) return false;
-    if (pendingPins.has(g.cs)) return true;                 // spawned, not yet registered
-    return Date.now() - g.at < COORD_REVIVE_COOLDOWN;       // registered/failed, still inside the window
-}
+// missing, so talking to a mission ALWAYS reaches a live brain — without ever making a SECOND one.
+//
+// This used to guard on its own `missionCoordinatorSpawns` map plus a 90s cooldown. Both are gone on
+// purpose, not by accident: that map only ever knew about the spawns THIS path had made, so it was
+// blind to the other site that spawns coordinators (the retire auto-successor), and on 2026-07-27 the
+// two raced primeng into victor + whiskey 43s apart. coordinatorHeld reads pendingBind instead, which
+// spawnWorker writes for EVERY spawn whatever the call site — the property the revive-only map could
+// never have. The cooldown is subsumed too: registerSession stamps lastSeen at register, so the LIVE
+// half of the predicate takes over from the BOOTING half with no gap between them to cover.
 function reviveMissionCoordinator(proj) {
-    if (coordinatorBooting(proj.name)) return null;         // one is already on the way — don't swarm
+    const held = coordinatorHeld(proj.name);
+    if (held) return null;                                  // one is already live or on the way — don't swarm
     const cwd = lastProjectCwd(roster.sessions, proj.name);
     if (!cwd) {
         // Never had a worker, so we cannot infer the repo; the message is safely queued on the durable
@@ -1144,7 +1171,8 @@ function reviveMissionCoordinator(proj) {
     try { cs = spawnWorker(resolveRepo(cwd), proj.title || proj.name, undefined, null, undefined, proj.name); }
     catch { cs = null; }
     if (cs) {
-        missionCoordinatorSpawns.set(proj.name, { cs, at: Date.now() });
+        // No bookkeeping to do here: spawnWorker already put this callsign in pendingBind bound to
+        // proj.name, which IS the "a coordinator is booting" record every spawn site now reads.
         record({ kind: 'sys', text: 'auto-revived ' + proj.name + ' coordinator (' + cs + ') for an incoming mission message' });
         enqueueSay('Reviving the ' + proj.name + ' coordinator.', 'jarvis');
     }

@@ -496,6 +496,62 @@ export function pickProjectWorker(sessions, name) {
     return best;
 }
 
+// Who holds a project's COORDINATOR SLOT right now -- live, or spawned and still booting. THE one
+// predicate every coordinator-spawn site consults before launching one, because a project gets
+// exactly one coordinator and the spawn sites could not previously see each other.
+//
+// The bug, 2026-07-27 post-restart: primeng ended up with two coordinators 43 seconds apart. `victor`
+// (s_0347, 15:04:43) came from reviveMissionCoordinator -- its purpose is the project TITLE, that
+// path's signature -- and `whiskey` (s_0349, 15:05:26) came from the retire auto-successor path,
+// carrying the retiring coordinator's own purpose line AND its handoff. Both registered
+// project:primeng, both were handed the same handoff, and Chris had two brains answering for one
+// board. Cause: revive guarded on `missionCoordinatorSpawns`, a map of the spawns IT had made, and
+// the successor path guarded on nothing at all -- so a ghost coordinator being retired at the moment
+// a mission message revives that same project races into two, and would have recurred every restart.
+//
+// Held means either of:
+//   - LIVE: pickProjectWorker's answer (freshest non-ended session carrying .project === name) seen
+//     inside `staleMs`. Reusing pickProjectWorker is deliberate: spawning and routing must never
+//     disagree about who a project's coordinator is. A RETIRED coordinator never counts -- cleanup
+//     has to keep being able to target the corpse -- and a `.parentProject` sub-worker never counts,
+//     since it is nested UNDER the project, not running it.
+//   - BOOTING: a spawn whose stashed binding is `project === name` that has not registered yet.
+//
+// `booting` is the pending-bind stash, taken as a PARAMETER and read as an iterable of
+// `[callsign, {project, parentProject, ts}]` entries (a Map satisfies that as-is). It is never read
+// from a module global here, and that is load-bearing rather than stylistic: live-spawn state and
+// state a restarted hub restores from pidfiles must arrive through the SAME door, or this is right
+// for one and wrong for the other. Entries older than `staleMs` are ignored so a spawn that never
+// came up cannot wedge the slot shut forever; an entry with no parseable `ts` is treated as fresh,
+// because a coordinator delayed by one window is a smaller failure than two coordinators.
+//
+// Returns { kind:'live', uid, callsign } | { kind:'booting', callsign } | null -- the kind matters to
+// callers, not just the boolean: what you tell the human differs, and only a LIVE holder can be sent
+// anything. `now`/`staleMs` injected for deterministic tests. Pure: reads, mutates nothing.
+export function coordinatorSlotHolder(sessions, booting, name, now, staleMs = 120000) {
+    const n = name ? String(name).toLowerCase().trim() : '';
+    if (!n) return null;
+    const uid = pickProjectWorker(sessions, n);
+    if (uid) {
+        const s = sessions[uid] || {};
+        const t = Date.parse(s.lastSeen);
+        if (Number.isFinite(t) && (now - t) < staleMs) return { kind: 'live', uid, callsign: s.callsign || null };
+    }
+    // A half-written or wrong-shaped stash must degrade to "nobody is booting", never throw: this runs
+    // on the retire path, and a throw here would strand a session mid-retire.
+    if (!booting || typeof booting[Symbol.iterator] !== 'function') return null;
+    for (const e of booting) {
+        if (!Array.isArray(e)) continue;
+        const [cs, b] = e;
+        if (!b || typeof b !== 'object') continue;
+        if (!b.project || String(b.project).toLowerCase().trim() !== n) continue;
+        const ts = typeof b.ts === 'number' ? b.ts : Date.parse(b.ts);   // epoch ms today; an ISO string from a restore also works
+        if (Number.isFinite(ts) && (now - ts) >= staleMs) continue;
+        return { kind: 'booting', callsign: cs ? String(cs) : null };
+    }
+    return null;
+}
+
 // Resolve a project name to the cwd its coordinator last lived in, so an auto-revived coordinator
 // (T2) spawns in the RIGHT repo even when the previous one is a dead ghost. Unlike pickProjectWorker
 // this deliberately includes ENDED sessions: once a coordinator retires or dies the durable project
