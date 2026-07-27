@@ -2363,8 +2363,19 @@ async function handleRequest(req, res) {
                 // For a project card (e.g. 'jarvis') the bound worker keeps its own NATO callsign
                 // — surface it so the human can see WHICH session is driving jarvis right now.
                 worker: (uid && roster.sessions[uid] && roster.sessions[uid].callsign && roster.sessions[uid].callsign !== cs) ? roster.sessions[uid].callsign : null,
-                cwd: uid ? (roster.sessions[uid].cwd || '') : '',
-                purpose: uid ? roster.sessions[uid].purpose : '',
+                // A PROJECT card with no live session still has to be restartable, and that is the
+                // only moment the console's continue button matters at all. `uid` goes null once
+                // every session bound to the project has been buried, so these shipped empty, the
+                // button posted cwd:'' and /spawn answered 400 "need cwd and purpose" — a control
+                // that worked only while it was useless. Chris hit it trying to restart primeng
+                // after the 22:00 reconcile swept its last four sessions.
+                //
+                // Retired sessions keep their cwd on purpose (it is how a project remembers which
+                // repo it lives in), so fall back to the SAME lookup reviveMissionCoordinator uses.
+                // One source of truth means the console and the hub can never disagree about where
+                // a project lives. A plain NATO card has no project row and keeps the old blank.
+                cwd: uid ? (roster.sessions[uid].cwd || '') : (projById[cs] ? (lastProjectCwd(roster.sessions, cs) || '') : ''),
+                purpose: uid ? roster.sessions[uid].purpose : (projById[cs] ? (projById[cs].title || cs) : ''),
                 alive: cs === 'jarvis' ? true : (uid ? aliveNow(uid) : false),
                 // Green but DEAF: heartbeat ticking, poll loop dead. `alive` above cannot see this
                 // (both endpoints feed it), so the card needs its own signal or the session lies

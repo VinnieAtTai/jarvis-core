@@ -865,7 +865,13 @@ function renderBoards(d) {
         let btns = '';
         const holdBtn = '<span class="cbtn" data-act="hold" data-cs="' + esc(cs) + '" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="park on hold (resume later — distinct from closing)">💤</span>';
         if (dead) {
-            btns += '<span class="cbtn" data-act="continue" data-cwd="' + escAttr(b.cwd || '') + '" data-purpose="' + escAttr(b.purpose || '') + '" title="continue: launch a fresh worker for this job">🚀</span>';
+            // Only offer the launch when there is actually something to launch WITH — the archive
+            // list has guarded this way all along, the live board did not, and an unguarded button
+            // is how a dead project card came to post cwd:'' and collect a 400. data-project binds
+            // the new session as the project's coordinator explicitly rather than letting register
+            // infer it from the repo: d:/code/tms is claimed by both primeng and mycarrierpackets,
+            // so inference there is a coin toss.
+            if (b.cwd && b.purpose) btns += '<span class="cbtn" data-act="continue" data-cwd="' + escAttr(b.cwd) + '" data-purpose="' + escAttr(b.purpose) + '" data-project="' + escAttr(b.projectContext ? cs : '') + '" title="continue: launch a fresh worker for this job">🚀</span>';
             btns += holdBtn;
             btns += '<span class="cbtn" data-act="close" data-cs="' + esc(cs) + '" title="remove from board">✕</span>';
         } else if (cs !== 'jarvis') {
@@ -1018,7 +1024,7 @@ workEl.onclick = (e) => {
     const act = t.getAttribute('data-act');
     if (act === 'focus') post('/focus', { callsign: t.getAttribute('data-cs') });
     else if (act === 'close') post('/forget', { callsign: t.getAttribute('data-cs') });
-    else if (act === 'continue') post('/spawn', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose') });
+    else if (act === 'continue') post('/spawn', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose'), project: t.getAttribute('data-project') || undefined });
     else if (act === 'spawnjarvis') post('/spawn', { cwd: 'd:/claude/jarvis-core', purpose: 'JARVIS punchlist', project: 'jarvis' });
     else if (act === 'rebuild') { uiConfirm('Rebuild JARVIS now? Restarts the hub with the latest jarvis-core code. Live sessions ride it out. Heads-up: this resets the in-memory token gauge.', { ok: 'Rebuild', danger: true }).then(ok => { if (ok) post('/restart', {}); }); }
     // "Worker relaunched", not "Restarted from console." — the old wording was the ONLY source of
