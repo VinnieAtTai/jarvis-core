@@ -8,6 +8,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
+import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees } from './jarvis-text.mjs';
 import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, resolveBinding, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -835,6 +836,13 @@ function wedgedNow(uid) {
 function registerSession(cwd, purpose, pin, project, parentProject) {
     const cs = assignCallsign(pin);
     pendingPins.delete(cs);
+    // An ISOLATED worker registers with the cwd it booted in — its worktree — which is a path no
+    // configured repo matches. Left alone that quietly breaks four things that all key off cwd:
+    // the trust tier and permissionMode resolved just below, the per-job handoff key, auto-bind's
+    // repo-identity match, and resolveRepo on the successor spawn. So the session records the REPO
+    // as its cwd (what it is working on) and carries the worktree beside it (where it is working).
+    const wt = takePendingWorktree(cs);
+    if (wt && wt.repoCwd) cwd = wt.repoCwd;
     let tier = pendingTier.get(cs); pendingTier.delete(cs);
     if (!tier) { try { tier = resolveRepo(cwd).tier; } catch { } }
     tier = tier === 'trusted' ? 'trusted' : 'guarded';
@@ -866,7 +874,8 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
         } catch { }   // an unreadable project store must never block a register
     }
     roster.callsigns[cs] = [uid, ...(roster.callsigns[cs] || [])];
-    roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier, ...(proj ? { project: proj } : {}), ...(pproj ? { parentProject: pproj } : {}) };
+    roster.sessions[uid] = { callsign: cs, cwd: cwd || '', purpose: purpose || cs, started: now, ended: null, lastSeen: now, tier, ...(proj ? { project: proj } : {}), ...(pproj ? { parentProject: pproj } : {}), ...(wt ? { worktree: wt.path, branch: wt.branch, base: wt.base } : {}) };
+    if (wt) record({ kind: 'sys', text: cs + ' is isolated on ' + wt.branch + ' (worktree ' + wt.path + ', repo ' + cwdKey(cwd) + ')' });
     if (roster.awayUntil && Date.now() < roster.awayUntil) roster.sessions[uid].trustUntil = roster.awayUntil;
     saveRoster();
     const w = loadWork();
@@ -930,6 +939,10 @@ function retireSession(uid, summary, opts = {}) {
     // callsign, so this never touches the replacement. Falls through harmlessly for wt-tab workers
     // (not in the map). onExit prunes the map; the delete is belt-and-suspenders.
     try { const wp = workerPtys.get(cs); if (wp) { wp.kill(); workerPtys.delete(cs); } } catch { }
+    // Worktree teardown, AFTER the pty is dead so nothing is still writing into the tree: commit any
+    // in-flight WIP to the worker's branch, drop the directory, keep the branch (it is the
+    // deliverable). The successor spawned below inherits that branch and continues on it.
+    teardownWorktree(s, cs);
     const w = loadWork();
     const board = w.sessions[cs] || { working: [], queued: [], done: [], review: [] };
     // The handoff record: one-line summary + detailed notes + the FULL board snapshot (all lanes).
@@ -961,7 +974,7 @@ function retireSession(uid, summary, opts = {}) {
         // (which re-attaches to the project on register). No NATO column to delete/transfer.
         let psucc = null;
         if (opts.successor && s.cwd && s.purpose) {
-            try { psucc = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec, undefined, s.project); } catch { psucc = null; }
+            try { psucc = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec, undefined, s.project, undefined, undefined, s.branch); } catch { psucc = null; }
         }
         // Feed the retiring manager's summary into the durable project log so the successor
         // rebuilds context from recent work, and release the manager slot — the successor re-claims
@@ -984,7 +997,12 @@ function retireSession(uid, summary, opts = {}) {
         // stays nested under its project and re-seeded with the mission STORY — mirroring how the
         // coordinator path threads s.project. undefined for a plain worker, so its successor is a plain
         // worker exactly as before.
-        try { succCs = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec, undefined, undefined, undefined, s.parentProject); }
+        // s.branch carries the predecessor's isolation branch (undefined for a shared-cwd worker): the
+        // successor CONTINUES it in a fresh worktree. Forking from base instead would leave every
+        // commit the predecessor just made — including the WIP we committed above — on a branch
+        // nobody is working on, which is the same "work quietly stranded" failure the WIP commit
+        // exists to prevent.
+        try { succCs = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec, undefined, undefined, undefined, s.parentProject, s.branch); }
         catch { succCs = null; }
     }
     if (succCs) {
@@ -1195,6 +1213,148 @@ function resolveClaude() {
     }
     return 'claude';
 }
+// —— Per-worker git worktree isolation (docs/WORKTREE-ISOLATION-DESIGN.md, P1) ————————————————————
+// Chris, 2026-07-24: "how do we make it so jarvis can work on multiple items in the same repository
+// so it doesn't f*** up with what I'm working on ... something with worktrees." Until now every
+// worker launched with cwd = repo.cwd — the same working tree Chris has open — so two workers, or a
+// worker and Chris, edited the SAME files. A code-mutating sub-worker now gets its own worktree on
+// its own `jarvis/<callsign>` branch, forked from the COMMITTED head of the integration branch, so
+// it can neither see nor clobber his uncommitted work.
+//
+// Everything below is BEST-EFFORT and must never throw: it runs inside spawnWorker and
+// retireSession, the machinery that keeps every session alive, including the coordinator's. A
+// non-git cwd, a detached HEAD, an existing branch, a full disk — each logs and falls back to the
+// shared cwd, which is exactly the behaviour that shipped before this. The decidable parts (naming,
+// collisions, base resolution, who isolates, what is sweepable) are pure helpers in jarvis-text.mjs
+// with unit tests in test/worktree.test.mjs; only the git calls live here.
+const WT_ROOT_ENV = process.env.JARVIS_WT_ROOT || '';
+const WT_ISOLATE = process.env.JARVIS_WORKTREES !== '0';     // kill switch: back to shared cwds
+const WT_TIMEOUT = 30000;                                    // a checkout of a big repo is not instant
+// git, with stderr captured rather than sprayed into the hub's log, and never throwing: null means
+// the command failed, '' means it succeeded silently (the two must stay distinguishable — a
+// successful `worktree remove` prints nothing).
+function gitOut(cwd, args, timeout = 10000) {
+    try { return String(execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'pipe'] })).trim(); }
+    catch { return null; }
+}
+function wtDirs(root) {
+    try { return readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => join(root, d.name)); }
+    catch { return []; }
+}
+// The pending worktree for a callsign the hub just spawned, held until that worker registers —
+// mirroring pendingPins/pendingTier/pendingBind, TTL-swept on the same 5-minute window. The worker
+// registers with the cwd it BOOTED in (the worktree), which resolves to no configured repo; this is
+// how registerSession learns the repo it really belongs to.
+const pendingWorktree = new Map();
+function takePendingWorktree(cs) {
+    const now = Date.now();
+    for (const [k, v] of pendingWorktree) if (now - v.ts > 300000) pendingWorktree.delete(k);
+    const v = pendingWorktree.get(cs);
+    pendingWorktree.delete(cs);
+    return v || null;
+}
+// Create this worker's worktree. Returns the plan (path/branch/base) or null to share the cwd.
+function makeWorktree(repo, cs, inheritBranch) {
+    try {
+        if (!repo || !repo.cwd || !existsSync(repo.cwd)) return null;
+        const head = gitOut(repo.cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+        if (head === null) {
+            record({ kind: 'sys', text: 'no worktree for ' + cs + ': ' + cwdKey(repo.cwd) + ' is not a git repo; sharing the cwd' });
+            return null;
+        }
+        const originHead = gitOut(repo.cwd, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
+        const base = worktreeBase(head, repo.base, (originHead || '').replace(/^origin\//, ''));
+        if (!base) {
+            record({ kind: 'sys', text: 'no worktree for ' + cs + ': detached HEAD in ' + cwdKey(repo.cwd) + ' and no base configured; sharing the cwd' });
+            return null;
+        }
+        const taken = (gitOut(repo.cwd, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/jarvis/']) || '').split('\n').filter(Boolean);
+        const root = worktreeRoot(repo.cwd, WT_ROOT_ENV);
+        const plan = worktreePlan(repo.key, cs, repo.cwd, base, { root: WT_ROOT_ENV, taken, paths: wtDirs(root), inherit: inheritBranch });
+        if (!plan) { record({ kind: 'sys', text: 'no worktree for ' + cs + ': could not name one under ' + root + '; sharing the cwd' }); return null; }
+        mkdirSync(plan.root, { recursive: true });
+        // create:false is the successor case — check the predecessor's branch out again rather than
+        // forking a new one from base, which would strand every commit it made.
+        const args = plan.create
+            ? ['worktree', 'add', '-b', plan.branch, plan.path, plan.base]
+            : ['worktree', 'add', plan.path, plan.branch];
+        if (gitOut(repo.cwd, args, WT_TIMEOUT) === null || !existsSync(plan.path)) {
+            record({ kind: 'sys', text: 'worktree add FAILED for ' + cs + ' (' + plan.branch + '); sharing ' + cwdKey(repo.cwd) });
+            return null;
+        }
+        record({ kind: 'sys', text: 'worktree for ' + cs + ': ' + plan.branch + (plan.create ? ' off ' + plan.base : ' (continued)') + ' at ' + plan.path });
+        return plan;
+    } catch (e) {
+        try { record({ kind: 'sys', text: 'worktree setup errored for ' + cs + ' (' + (e && e.message) + '); sharing the cwd' }); } catch { }
+        return null;
+    }
+}
+// Tear a worktree down: commit in-flight WIP to the branch, remove the directory, KEEP the branch.
+//
+// The commit is not optional and it is never a stash (the tms-merge-dance rule: commit in-flight
+// work, never stash it). The branch is the deliverable, awaiting merge. And if the commit does not
+// take — no git identity, a rejecting pre-commit hook — we LEAVE THE WORKTREE WHERE IT IS: a
+// stranded directory is recoverable by hand, a removed one with uncommitted work is gone forever.
+function teardownWorktree(s, cs) {
+    if (!s || !s.worktree) return null;
+    const wtPath = s.worktree, repoCwd = s.cwd || '', branch = s.branch || '?';
+    try {
+        if (existsSync(wtPath)) {
+            const dirty = gitOut(wtPath, ['status', '--porcelain'], WT_TIMEOUT);
+            if (dirty) {
+                gitOut(wtPath, ['add', '-A'], WT_TIMEOUT);
+                gitOut(wtPath, ['commit', '-m', 'WIP (' + cs + '): ' + (s.summary || s.purpose || 'in-flight work at retire')], WT_TIMEOUT);
+                if (gitOut(wtPath, ['status', '--porcelain'], WT_TIMEOUT)) {
+                    record({ kind: 'sys', text: 'worktree for ' + cs + ' has UNCOMMITTED work that would not commit; KEPT at ' + wtPath + ' on ' + branch });
+                    return 'kept';
+                }
+                record({ kind: 'sys', text: 'committed ' + cs + ' WIP to ' + branch });
+            }
+        }
+        if (!repoCwd) { record({ kind: 'sys', text: 'worktree for ' + cs + ' has no home repo to remove it from; KEPT at ' + wtPath }); return 'kept'; }
+        const removed = gitOut(repoCwd, ['worktree', 'remove', wtPath, '--force'], WT_TIMEOUT) !== null;
+        gitOut(repoCwd, ['worktree', 'prune'], WT_TIMEOUT);
+        record({ kind: 'sys', text: removed
+            ? 'worktree for ' + cs + ' removed; branch ' + branch + ' kept for merge'
+            : 'worktree remove FAILED for ' + cs + ' at ' + wtPath + '; branch ' + branch + ' kept' });
+        return removed ? 'removed' : 'kept';
+    } catch (e) {
+        try { record({ kind: 'sys', text: 'worktree teardown errored for ' + cs + ' (' + (e && e.message) + '); ' + wtPath + ' left in place' }); } catch { }
+        return 'kept';
+    }
+}
+// Boot sweep. Console-less workers are hub children, so a restart kills every one of them and leaves
+// its worktree on disk with no session to ever clean it up. Collect those: prune each repo's stale
+// administrative entries, then tear down any directory under a WT_ROOT that no live session claims
+// (WIP committed to its branch first — the sweep loses nothing).
+function sweepWorktrees() {
+    if (!WT_ISOLATE) return;
+    try {
+        const repos = loadRepos();
+        const roots = new Map();
+        for (const k of Object.keys(repos)) {
+            const r = repos[k];
+            if (!r || !r.cwd || !existsSync(r.cwd)) continue;
+            gitOut(r.cwd, ['worktree', 'prune'], WT_TIMEOUT);
+            const root = worktreeRoot(r.cwd, WT_ROOT_ENV);
+            if (root && existsSync(root)) roots.set(cwdKey(root), root);
+        }
+        const dirs = [];
+        for (const root of roots.values()) dirs.push(...wtDirs(root));
+        const orphans = orphanWorktrees(dirs, roster.sessions, Date.now());
+        for (const p of orphans) {
+            // A worktree's .git is a FILE pointing at the parent repo. No .git at all means this is
+            // some other directory that wandered into WT_ROOT — never touch it.
+            if (!existsSync(join(p, '.git'))) continue;
+            const owner = Object.values(roster.sessions).find(x => x && x.worktree && cwdKey(x.worktree) === cwdKey(p));
+            const common = gitOut(p, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+            const repoCwd = (owner && owner.cwd) || (common ? dirname(common.replace(/\\/g, '/').replace(/\/+$/, '')) : '');
+            teardownWorktree({ worktree: p, cwd: repoCwd, branch: (owner && owner.branch) || gitOut(p, ['rev-parse', '--abbrev-ref', 'HEAD']) || '?', purpose: 'orphaned by a hub restart' },
+                (owner && owner.callsign) || 'a dead session');
+        }
+        if (orphans.length) record({ kind: 'sys', text: 'boot sweep: collected ' + orphans.length + ' orphaned worktree' + (orphans.length === 1 ? '' : 's') });
+    } catch { }   // a sweep failure must never block the hub coming up
+}
 // Console-less worker spawning. A worker's only channel to Chris is this hub (board/chat/perm
 // cards over HTTP), so its terminal window is pure crash-exposure: combining DOS/console windows
 // tears that console down and kills the worker. node-pty runs claude inside an invisible ConPTY
@@ -1230,7 +1390,7 @@ function spawnWorkerConsoleless(cs, repo, boot, model, hookSettings) {
     workerPtys.set(cs, proc);
     return true;
 }
-function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, parentProject) {
+function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, parentProject, inheritBranch) {
     const cs = assignCallsign();
     pendingPins.set(cs, Date.now());
     const effTier = (tier || repo.tier) === 'trusted' ? 'trusted' : null;
@@ -1247,6 +1407,13 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
     // never echoes it back. The boot prompt below is a request; this is the guarantee.
     const boundTo = project ? String(project).toLowerCase().trim() : null;
     if (boundTo || subOf) pendingBind.set(cs, { project: boundTo, parentProject: subOf, ts: Date.now() });
+    // ISOLATION: a code-mutating sub-worker gets its own worktree + branch and launches THERE, so it
+    // never shares a working tree with Chris or with another worker. Best-effort — wt stays null on
+    // any git failure and the worker launches in repo.cwd exactly as it always did.
+    const wt = (WT_ISOLATE && shouldIsolate({ project: boundTo, parentProject: subOf, meeting, purpose, isolate: repo && repo.isolate }))
+        ? makeWorktree(repo, cs, inheritBranch) : null;
+    if (wt) pendingWorktree.set(cs, { path: wt.path, branch: wt.branch, base: wt.base, repoCwd: repo.cwd, repoKey: repo.key, ts: Date.now() });
+    const runRepo = wt ? { ...repo, cwd: wt.path } : repo;
     let boot = 'You are a JARVIS worker session. Fetch http://127.0.0.1:' + PORT + '/protocol with a plain GET request and follow it exactly. Register with pin: ' + cs + ' and purpose: ' + safePurpose + (project ? ' and project: ' + project : '') + (subOf ? ' and parentProject: ' + subOf : '') + '.';
     if (handoff) {
         // Stash the handoff under this callsign (plain letters -> safe in the .cmd, no %-encoding)
@@ -1287,10 +1454,13 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
         if (meeting.link) boot += ' Calendar event: ' + meeting.link + '.';
         boot += ' You have Google Calendar, Google Drive, and Jira MCP tools - use them. Look this event up in Google Calendar by its title and today\'s date to get the attendees, agenda/description, and any attached notes doc; if a notes doc is attached, READ it now for context. Draft Jira items only when Chris asks. Interaction is typing-first: keep spoken /say lines to short headlines and put notes, action items, drafts, and lists in chat via /send to human. When the meeting ends, post a concise summary - decisions, action items, and any drafted Jira items - and /retire with that as your handoff.';
     }
+    // Tell it where it is. Without this a worker sees an unfamiliar path, assumes something is wrong,
+    // and "helpfully" switches branches or goes looking for the real checkout.
+    if (wt) boot += ' You are in a DEDICATED git worktree at ' + wt.path + ' on branch ' + wt.branch + ' (forked from ' + wt.base + '). Commit freely here: you cannot see or touch other worktrees or Chris\'s own checkout, so nothing you do can collide with his work. Do NOT switch branches and do not go looking for the main checkout. On retire, commit everything - your branch is how your work merges back.';
     boot += ' Permissions: read-only and routine build commands (git status/diff/log, npm run lint, node --check, ls/cat/grep/rg, dotnet build/test) run WITHOUT asking the human; only risky or out-of-repo actions prompt. Favor those pre-approved commands, batch shell calls, and self-verify (run the lint gate yourself) instead of asking. If you fan out subagents, keep them to the same safe command set so they do not each trigger a prompt.' + (effTier ? ' You are a TRUSTED session: your non-risky actions are auto-approved — work autonomously and only surface genuine decisions.' : '');
     const hookSettings = repo.permissionMode === 'bypassPermissions' ? null : join(DATA, 'perm-settings.json');
-    if (CONSOLELESS && spawnWorkerConsoleless(cs, repo, boot, model, hookSettings)) {
-        record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + repo.cwd + ' (' + repo.key + ') [console-less]' });
+    if (CONSOLELESS && spawnWorkerConsoleless(cs, runRepo, boot, model, hookSettings)) {
+        record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + runRepo.cwd + ' (' + repo.key + ')' + (wt ? ' [worktree ' + wt.branch + ']' : '') + ' [console-less]' });
         return cs;
     }
     const pm = repo.permissionMode ? ' --permission-mode ' + repo.permissionMode : '';
@@ -1303,7 +1473,7 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
         'title ' + tabTitle,
         'set JARVIS_CALLSIGN=' + cs,
         'set JARVIS_PORT=' + PORT,
-        'cd /d "' + repo.cwd + '"',
+        'cd /d "' + runRepo.cwd + '"',
         '"' + resolveClaude() + '"' + pm + mm + hookFlag + ' "' + boot + '"',
     ].join('\r\n') + '\r\n');
     const child = spawn('wt', ['new-tab', '--title', tabTitle, '--suppressApplicationTitle', 'cmd', '/k', scriptPath], { detached: true, stdio: 'ignore' });
@@ -1314,12 +1484,16 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
             // The session will never register, so free the pinned callsign and remove the
             // leftover spawn script instead of letting both linger (phantom pin / .cmd clutter).
             pendingPins.delete(cs);
+            // ...and give back the worktree we cut for a worker that will never boot, so the next
+            // spawn on this callsign gets its own name back instead of a suffix.
+            const dead = takePendingWorktree(cs);
+            if (dead) teardownWorktree({ worktree: dead.path, cwd: dead.repoCwd, branch: dead.branch, purpose: 'terminal launch failed' }, cs);
             try { unlinkSync(scriptPath); } catch { }
         });
         c2.unref();
     });
     child.unref();
-    record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + repo.cwd + ' (' + repo.key + ')' });
+    record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + runRepo.cwd + ' (' + repo.key + ')' + (wt ? ' [worktree ' + wt.branch + ']' : '') });
     return cs;
 }
 // Two-step close gate for a mission: "mission accomplished" arms this, the follow-up "yes"
@@ -2924,6 +3098,10 @@ async function main() {
         logCrash('listen-failed (' + ((e && e.code) || '?') + ') on ' + PORT + ' -- another hub may own it; exiting for the supervisor', e);
         process.exit(e && e.code === 'EADDRINUSE' ? 3 : 1);
     });
+
+    // Collect worktrees whose worker died with the last hub (console-less workers are hub children).
+    // After the listen, so a slow git call on a big repo never delays the port coming up.
+    sweepWorktrees();
 
     let consolePage = null;
     let context = null;

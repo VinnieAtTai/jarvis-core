@@ -117,7 +117,14 @@ Per the scratch recipe (`JARVIS_PORT=8199` + scratch `JARVIS_DATA` + `JARVIS_NO_
 
 ## Status / phasing
 
-Design only. Implementation is a `spawnWorker` + `retireSession` + roster-shape change, so it is
+**P1 SHIPPED 2026-07-27.** Pure helpers (`worktreeRoot`, `worktreeBase`, `worktreePlan`,
+`shouldIsolate`, `orphanWorktrees`) in jarvis-text.mjs with test/worktree.test.mjs; git calls +
+spawn/retire/boot-sweep wiring in jarvis-core.mjs. Isolation is best-effort — any git failure falls
+back to the shared cwd — and `JARVIS_WORKTREES=0` turns it off entirely. Two additions the design
+did not spell out: a retire-kept branch collides with its own recycled callsign (suffixed), and a
+successor CONTINUES its predecessor's branch rather than forking from base. P2/P3 still open.
+
+The rest of this section is the original plan. Implementation is a `spawnWorker` + `retireSession` + roster-shape change, so it is
 restart-gated -- but it is NOT in the parked pending tree (that touches `registerSession`/`readBody`/
 console), so it lands cleanly on its own. Suggested phasing:
 

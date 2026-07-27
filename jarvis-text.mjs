@@ -736,3 +736,125 @@ export function parseBodyLenient(data) {
     } catch { }
     return {};
 }
+
+// —— Per-worker git worktree isolation (docs/WORKTREE-ISOLATION-DESIGN.md, P1) ————————————————————
+// Chris, 2026-07-24: "how do we make it so jarvis can work on multiple items in the same repository
+// so it doesn't f*** up with what I'm working on ... something with worktrees." Every worker used to
+// launch in repo.cwd — the same working tree Chris has open — so two workers, or a worker and Chris,
+// edited the SAME files: WIP clobbers, branch churn, a worker trampling whatever he had open.
+//
+// These helpers are the decidable half of the fix: WHERE a worktree goes, WHAT it forks from, WHICH
+// workers get one, and WHICH leftovers are safe to sweep. Pure, so the naming and collision rules
+// are testable without a real repo (test/worktree.test.mjs). The git calls themselves live in
+// jarvis-core.mjs and are strictly best-effort: any failure falls back to the shared cwd.
+
+const WT_DIR = '.jarvis-wt';
+const wtSlashes = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '');
+
+// WT_ROOT: where a repo's worktrees live — a sibling of the repo, one level UP, so a worktree is
+// never INSIDE a repo. That placement is load-bearing, not tidiness: a worktree under d:/code/tms
+// would show up in that repo's own `git status` as an untracked directory, i.e. new noise in exactly
+// the checkout this feature exists to keep clean. d:/code/tms -> d:/code/.jarvis-wt.
+// `override` (JARVIS_WT_ROOT) wins, for tests and for parking worktrees on another disk. A drive
+// root or garbage returns null — there is no safe sibling — and the caller then shares the cwd.
+export function worktreeRoot(repoCwd, override) {
+    if (override) return wtSlashes(override);
+    const p = wtSlashes(repoCwd);
+    const cut = p.lastIndexOf('/');
+    if (cut <= 0) return null;              // '', 'd:', 'd:/', '/foo' — nothing to sit beside
+    return p.slice(0, cut) + '/' + WT_DIR;
+}
+
+// Which branch a worktree forks FROM. The repo's CURRENT branch is the integration line the human is
+// on (e.g. NewBeta2), so workers fork off it and merge back cleanly — and because a worktree forks
+// from committed HEAD, his uncommitted WIP is neither visible to the worker nor clobberable by it.
+//
+// `git rev-parse --abbrev-ref HEAD` answers the literal string 'HEAD' when the checkout is DETACHED;
+// branching from that would fork off a nameless commit, so fall back to a configured base (a repos
+// .json `base`) and then to the repo's default branch. Null means we could not name a base at all,
+// which means no isolation rather than a wrong one.
+export function worktreeBase(head, configured, fallback) {
+    const h = String(head || '').trim();
+    if (h && h !== 'HEAD' && !/\s/.test(h)) return h;
+    const c = String(configured || '').trim();
+    if (c) return c;
+    return String(fallback || '').trim() || null;
+}
+
+// Where THIS worker's worktree goes and what its branch is called:
+//   branch = jarvis/<callsign>,  path = <WT_ROOT>/<repoKey>-<callsign>
+// Names stay short deliberately — a worktree is a full checkout and Windows still has MAX_PATH.
+//
+// The collision case is NOT hypothetical. Retire keeps the branch (it is the deliverable, awaiting
+// merge) and callsigns are recycled, so the second worker ever spawned as `xray` in a repo meets an
+// existing jarvis/xray and `worktree add -b` fails outright — isolation would quietly stop happening
+// after one lap of the alphabet. So suffix until BOTH the branch and the directory are free.
+//
+// `inherit` is the successor case: a worker that hands off leaves its work committed on jarvis/<cs>,
+// so its replacement CONTINUES that branch (checked out into a fresh worktree, `create:false`)
+// rather than forking a new one from base and stranding everything the predecessor did.
+export function worktreePlan(repoKey, callsign, repoCwd, base, opts = {}) {
+    const o = opts && typeof opts === 'object' ? opts : {};
+    const root = worktreeRoot(repoCwd, o.root);
+    const cs = String(callsign || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const key = String(repoKey || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12) || 'repo';
+    const b = String(base || '').trim();
+    if (!root || !cs || !b) return null;
+    const taken = new Set((o.taken || []).map(x => String(x).toLowerCase()));
+    const dirs = new Set((o.paths || []).map(p => wtSlashes(p).toLowerCase()));
+    const inherit = String(o.inherit || '').trim();
+    for (let n = 1; n <= 99; n++) {
+        const sfx = n > 1 ? '-' + n : '';
+        const path = root + '/' + key + '-' + cs + sfx;
+        if (dirs.has(path.toLowerCase())) continue;
+        if (inherit) return { root, path, branch: inherit, base: b, create: false };
+        const branch = 'jarvis/' + cs + sfx;
+        if (taken.has(branch.toLowerCase())) continue;
+        return { root, path, branch, base: b, create: true };
+    }
+    return null;
+}
+
+// Which workers get a worktree. A checkout costs real disk, so this is not free — but the wrong
+// answer in the OTHER direction puts a code-mutating worker back in the human's working tree, which
+// is the entire thing we are preventing. The bias is therefore deliberate: when in doubt, isolate.
+//
+// - sub-worker (`parentProject` — the only workers the hub hands build tasks to): YES.
+// - coordinator (`project`): NO. It delegates rather than edits (manager-stays-thin) and must stay in
+//   the real checkout, since it answers questions about the repo the human is looking at.
+// - meeting worker: NO — it takes notes, it does not build.
+// - non-git cwd: NO — nothing to fork from; the caller shares the cwd and logs.
+// - an explicit `isolate` flag on the spawn body always wins, in either direction.
+// Read-only wording opts a sub-worker out, and that keyword list stays TIGHT on purpose: guessing
+// "share" wrong can clobber the human's tree; guessing "isolate" wrong costs one directory.
+export function shouldIsolate(spec) {
+    const s = spec && typeof spec === 'object' ? spec : {};
+    if (s.git === false) return false;
+    if (s.isolate === true) return true;
+    if (s.isolate === false) return false;
+    if (s.project || s.meeting) return false;
+    if (!s.parentProject) return false;
+    return !/\b(research|read[\s-]?only|readonly|investigate|audit|triage|watch|monitor|explore|browse)\b/i.test(String(s.purpose || ''));
+}
+
+// Which directories under WT_ROOT belong to nobody. A hub restart kills every console-less worker
+// (their ptys are hub children) but leaves its worktree on disk, so boot has to collect them —
+// otherwise the disk fills with dead checkouts and, worse, a recycled callsign trips over its own
+// leftover directory and silently loses isolation.
+//
+// A worktree is an orphan when no UNENDED session claims it with a heartbeat inside `staleMs`. That
+// freshness test is what protects the one worker that can legitimately outlive the hub (a wt-tab
+// worker, JARVIS_CONSOLELESS=0): it is still beating, so its worktree is left alone. Removal is the
+// caller's job and it commits any WIP to the branch first — nothing is ever swept away unsaved.
+export function orphanWorktrees(dirs, sessions, now, opts = {}) {
+    const o = opts && typeof opts === 'object' ? opts : {};
+    const staleMs = Number.isFinite(o.staleMs) ? o.staleMs : 120000;
+    const live = new Set();
+    for (const uid in (sessions || {})) {
+        const s = sessions[uid];
+        if (!s || s.ended || !s.worktree) continue;
+        const seen = Date.parse(s.lastSeen);
+        if (Number.isFinite(seen) && (now - seen) < staleMs) live.add(wtSlashes(s.worktree).toLowerCase());
+    }
+    return (dirs || []).filter(d => d && !live.has(wtSlashes(d).toLowerCase()));
+}
