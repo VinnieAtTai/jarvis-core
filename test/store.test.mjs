@@ -130,8 +130,9 @@ test('STORE: register, retire and every board op write themselves into db.mjs as
 
         // ---- 5. the row follows the task across BOARDS, and a bump is not a lane change -----------
         // A board op is not confined to the poster's own column: findTaskAll searches every board, so
-        // the row's callsign has to be where the task actually LIVES, not who asked. (record() logs the
-        // poster's board in the transcript, which is why a reconstruction cannot get this right.)
+        // the row's callsign has to be where the task actually LIVES, not who asked. (record() used to
+        // log the POSTER's board in the transcript, which cost the reconstruction its start/done times
+        // on exactly these cross-board cases; credit.test.mjs now pins the two records to agree.)
         const three = await hub.post('/worklist', { op: 'add', callsign: 'tango', text: 'NOTE: probe card three' });
         const id3 = three && three.task && three.task.id;
         assert.ok(id3, 'add returned no task id: ' + JSON.stringify(three));

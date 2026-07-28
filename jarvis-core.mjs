@@ -3147,11 +3147,12 @@ async function handleRequest(req, res) {
         const board = ensureBoard(w, cs);
         const needle = String(b.text || '').trim();
         let task = needle || undefined;
-        // Where the task ENDS UP, for the reporting store below. Tracked per-branch because neither
-        // half is derivable from `cs` and `b.op` alone: findTaskAll searches EVERY board, so a
-        // start/done/move can land on another session's, and `drop` leaves the board entirely.
-        // `stamped` names the timestamp column this op IS the moment of, if any.
-        let lane = null, owner = cs, stamped = null;
+        // Where the task ENDS UP, for the transcript line and the reporting store below. Tracked
+        // per-branch because neither half is derivable from `cs` and `b.op` alone: findTaskAll searches
+        // EVERY board, so a start/done/move can land on another session's, and `drop` leaves the board
+        // entirely. `stamped` names the timestamp column this op IS the moment of, if any; `from` is
+        // the board a move took it OFF.
+        let lane = null, owner = cs, stamped = null, from = null;
         if (b.op === 'add' && needle) {
             task = makeTask(needle, b);
             board.queued.push(task);
@@ -3194,6 +3195,7 @@ async function handleRequest(req, res) {
             ensureBoard(w, String(b.to).toLowerCase()).queued.push(t);
             task = t;
             owner = String(b.to).toLowerCase();   // the row follows the task to its new board
+            from = hit.cs;                        // ...and the record still says where it came from
             lane = 'queued';
         } else if (b.op === 'clear-done') {
             board.done = [];
@@ -3201,7 +3203,18 @@ async function handleRequest(req, res) {
             return json(res, 400, { error: 'op must be add|start|done|review|top|drop|move|clear-done' });
         }
         saveWork(w);
-        record({ kind: 'task', op: b.op, board: cs, task: textOf(task) });
+        // Credit the board HOLDING the task, not the one that POSTED the op. findTaskAll searches every
+        // board, so `cs` is only the poster and can be somebody else entirely -- and this line is not
+        // just a log, it is a SOURCE. db.mjs's taskTimesFromTranscript keys it as (board, text) and has
+        // to match task rows keyed on the board the task actually lives on, so crediting the poster
+        // produced a key that matched nothing: a cross-board start or done did not misplace the
+        // timestamp, it LOST it, and every reconstruction inherited that hole. `owner` is the same value
+        // the live store write below uses, which is what makes the two records agree rather than merely
+        // both existing. The voice handlers above already do this (they read hit.cs); this was the older
+        // half that did not.
+        // `from` only appears on a move, mirroring the voice path's move line: with `board` naming the
+        // destination, the source board would otherwise be absent from the record entirely.
+        record({ kind: 'task', op: b.op, board: owner, task: textOf(task), ...(from ? { from } : {}) });
         // The board op, as it happens. LANE IS CURRENT TRUTH; startedAt/doneAt are HISTORY, and the
         // two are allowed to disagree. db.mjs COALESCEs every column, so a timestamp once written can
         // never be cleared -- which means `ready` on a finished task leaves its doneAt standing beside
