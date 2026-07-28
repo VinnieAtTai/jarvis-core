@@ -2612,6 +2612,85 @@ async function handleRequest(req, res) {
         }).filter(Boolean).filter(a => !heldKeys.has(cwdKey(a.cwd))).sort((x, y) => Date.parse(y.ended || 0) - Date.parse(x.ended || 0));
         return json(res, 200, { count: items.length, items });
     }
+    if (key === 'GET /report') {
+        // The reporting store's READ surface — the first one it has ever had, and deliberately nothing
+        // more than a serializer. db.mjs already owns every query (recentWork / listSessions /
+        // listTasks / taskCounts) and they had exactly one caller, its own CLI. So b5be7e2 put the hub
+        // on the live write path and the history has been accumulating since with no way to ask for it.
+        // This asks. It adds NO new SQL: a second definition of "what got done" living here is how the
+        // two answers start to disagree, and db.mjs's is the one the semantics were settled against.
+        //
+        // This stays inside b5be7e2's rule — "nothing in the hub ever READS it back, so no hub
+        // behaviour can come to depend on its contents" — in the sense that mattered: the rows go
+        // straight OUT to the caller, and no hub state, decision or branch is taken on them. Serving
+        // history is not depending on it. Keep it that way; the moment hub logic tests one of these
+        // values, an unavailable store stops being harmless.
+        //
+        // Three things a read here must never do:
+        //  1. Assume the store is there. It is OFF whenever db.mjs would not load or its file would not
+        //     open, and the hub boots and serves anyway — so an unavailable store answers 503 saying
+        //     so. NOT an empty 200: "history is switched off" and "nothing has ever been worked on"
+        //     look identical that way, and this repo has already paid for reading silence as success.
+        //  2. Throw into the hub. Same discipline as the writes — the store is a bystander.
+        //  3. Count its own failures against the WRITE path. storeFails/storeOff belong to the record,
+        //     so they are deliberately not touched below: if a read could trip that kill-switch, then
+        //     asking for the history would be a way to switch the history off.
+        if (storeOff || !storeDb || !storeMod) {
+            return json(res, 503, { error: 'reporting store unavailable — history is off for this hub process (see crash.log)', store: 'off' });
+        }
+        const view = String(u.searchParams.get('view') || 'work');
+        if (view !== 'work' && view !== 'sessions' && view !== 'tasks') {
+            return json(res, 400, { error: 'view must be work|sessions|tasks' });
+        }
+        const limit = Math.max(1, Math.min(1000, Number(u.searchParams.get('limit')) || 100));
+        try {
+            // A whole-table aggregate GROUPED BY LANE, and lane is the CURRENT TRUTH. Two things this
+            // buys, both of them traps b5be7e2 documented:
+            //   'done' is what got finished — never a doneAt count. op:ready pulls a finished card back
+            //   to queued and COALESCE means its doneAt cannot be cleared, so counting timestamps
+            //   over-reports, and a confidently wrong throughput number is worse than none.
+            //   'dropped' is abandoned work, and it appears here as its own lane rather than being
+            //   folded in or quietly filtered out — a lane the backfill can never produce, so this is
+            //   the only place it is visible. A caller excludes it KNOWINGLY or not at all.
+            const counts = storeMod.taskCounts(storeDb);
+            let items, total = null;
+            if (view === 'sessions') {
+                // searchParams.get() answers null for an absent key, which is exactly what db.mjs's
+                // `opts.project != null` guards read as "no filter" — so these pass through untouched.
+                items = storeMod.listSessions(storeDb, {
+                    project: u.searchParams.get('project'),
+                    parentProject: u.searchParams.get('parentProject'),
+                    activeOnly: u.searchParams.get('activeOnly') === '1',
+                });
+            } else if (view === 'tasks') {
+                items = storeMod.listTasks(storeDb, {
+                    callsign: u.searchParams.get('callsign'),
+                    lane: u.searchParams.get('lane'),
+                });
+            } else {
+                items = storeMod.recentWork(storeDb, limit);
+            }
+            // Cap here for the two views db.mjs returns whole, and report `total` so the truncation is
+            // never silent — a short list that looks complete is its own kind of wrong answer. `work`
+            // gets no total on purpose: recentWork caps in SQL, and its HAVING clause means the
+            // reportable-session count is not a plain table count. Re-deriving it here would be that
+            // second definition again, so the honest move is to omit it and let `limit` speak.
+            if (items.length > limit) { total = items.length; items = items.slice(0, limit); }
+            return json(res, 200, {
+                store: storeMod.defaultDbPath(),
+                view, limit, counts,
+                // The finished figure, spelled out so no caller has to know the lane rule to get it
+                // right. It IS counts.done — one number from one source, not a second opinion.
+                finished: counts.done || 0,
+                count: items.length,
+                ...(total == null ? {} : { total }),
+                items,
+            });
+        } catch (e) {
+            logCrash('reporting-store-read-failed (GET /report view=' + view + ')', e);
+            return json(res, 500, { error: 'reporting store read failed (see crash.log)', store: 'on' });
+        }
+    }
     if (key === 'GET /repos') {
         // Read-only repo list for the console's new-session composer (the + tab).
         const repos = loadRepos();
