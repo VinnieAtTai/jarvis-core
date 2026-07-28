@@ -118,6 +118,51 @@ for (const sig of ['SIGINT', 'SIGBREAK', 'SIGHUP']) {
     try { process.on(sig, () => logCrash('ignored-signal', new Error(sig + ' received; staying up (use WIND DOWN / commands stop to shut down)'))); } catch { }
 }
 
+// Reporting store (db.mjs) — the LIVE event path.
+//
+// db.mjs keeps a local SQLite record of sessions and tasks for PM-style history ("what did each
+// worker do, how much got finished"). It shipped as a backfill only: a RECONSTRUCTION assembled
+// after the fact from the JSON state and the append-only logs, so it could never know more than
+// those files still remembered. The hooks below make it a RECORD instead — register, retire and
+// every board op write their row as the event happens — which is the difference between history
+// and a re-read of the present.
+//
+// Three rules keep this strictly additive, because reporting is not the hub's job:
+//   1. The import is DYNAMIC and guarded. db.mjs statically imports node:sqlite; a static import
+//      here would mean a runtime without that builtin could not boot the hub AT ALL. Loaded once
+//      at boot, and if it throws the store simply stays off for the life of the process.
+//   2. Every write is best-effort inside a try/catch. A store failure must never fail a register,
+//      a retire, or a board op — those are the real work and the store is a bystander.
+//   3. Nothing here ever READS from it. The store is write-only on the hub's side (the queries in
+//      db.mjs serve its CLI), so no hub behaviour can come to depend on its contents.
+let storeMod = null;      // db.mjs namespace once loaded
+let storeDb = null;       // open handle, or null while the store is unavailable
+let storeOff = false;     // sticky: it does not work here, stop trying on every event
+let storeFails = 0;
+async function initStore() {
+    try {
+        storeMod = await import('./db.mjs');
+        // No path argument: db.mjs owns defaultDbPath(), so the file the hub writes and the file
+        // `node db.mjs backfill` reads can never drift apart.
+        storeDb = storeMod.init();
+    } catch (e) {
+        storeMod = null; storeDb = null; storeOff = true;
+        logCrash('reporting-store-unavailable (history off; hub otherwise unaffected)', e);
+    }
+}
+// Run one store write, swallowing everything. Three consecutive failures turn the store off for
+// good: a transient lock recovers on the next event, but an unwritable db would otherwise append to
+// crash.log once per register/retire/board op forever.
+function store(what, fn) {
+    if (storeOff || !storeDb) return false;
+    try { fn(storeMod, storeDb); storeFails = 0; return true; }
+    catch (e) {
+        logCrash('reporting-store-write-failed (' + what + ')', e);
+        if (++storeFails >= 3) { storeOff = true; logCrash('reporting-store-off', new Error('3 consecutive write failures; history off for this process')); }
+        return false;
+    }
+}
+
 const CONSOLE_HTML = readFileSync(join(HERE, 'console.html'), 'utf8');
 const CONSOLE_CSS = readFileSync(join(HERE, 'console.css'), 'utf8');
 const CONSOLE_JS = readFileSync(join(HERE, 'console.js'), 'utf8');
@@ -931,6 +976,15 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
     if (wt) record({ kind: 'sys', text: cs + ' is isolated on ' + wt.branch + ' (worktree ' + wt.path + ', repo ' + cwdKey(cwd) + ')' });
     if (roster.awayUntil && Date.now() < roster.awayUntil) roster.sessions[uid].trustUntil = roster.awayUntil;
     saveRoster();
+    // The session enters the reporting store the moment it exists (best-effort; see initStore).
+    // Read back off the ROSTER ROW rather than the arguments so the live write and db.mjs's roster
+    // backfill agree field for field: purpose falls back to the callsign there, and cwd was already
+    // remapped from the worktree to the repo above.
+    const srow = roster.sessions[uid];
+    store('register ' + uid, (m, db) => m.upsertSession(db, {
+        uid, callsign: cs, cwd: srow.cwd, purpose: srow.purpose,
+        project: srow.project, parentProject: srow.parentProject, registeredAt: srow.started,
+    }));
     const w = loadWork();
     // A project worker binds to the project's durable card/column and gets NO separate card.
     ensureBoard(w, proj || cs);
@@ -987,6 +1041,18 @@ function retireSession(uid, summary, opts = {}) {
     s.ended = new Date().toISOString();
     if (summary) s.summary = summary;
     const cs = s.callsign;
+    // Close the session out in the reporting store HERE, before any of the teardown below: the retire
+    // is already a fact in the roster, so the record must not hinge on the pty kill or the worktree
+    // teardown surviving. The identity fields ride along even though only retiredAt/summary are new:
+    // both writes read the SAME roster row, so re-sending them is a no-op on a row that already has
+    // them and COMPLETES one for a session that registered while the store was unavailable (or before
+    // these hooks existed). Be precise about what db.mjs's COALESCE(excluded, existing) buys here --
+    // it stops a NULL from wiping a value, NOT a non-null from replacing one. So it is passing the
+    // roster's own values that makes these two writes order-independent, not the COALESCE.
+    store('retire ' + uid, (m, db) => m.upsertSession(db, {
+        uid, callsign: cs, cwd: s.cwd, purpose: s.purpose, project: s.project,
+        parentProject: s.parentProject, registeredAt: s.started, retiredAt: s.ended, summary: s.summary,
+    }));
     try { unlinkSync(join(DATA, 'spawn-' + cs + '.cmd')); } catch { } // its launch script is done with
     // A console-less worker runs in a ConPTY owned by its own pty-host process; with no window to
     // close, its idle claude process would otherwise linger forever after retire — and now that
@@ -3002,9 +3068,15 @@ async function handleRequest(req, res) {
         const board = ensureBoard(w, cs);
         const needle = String(b.text || '').trim();
         let task = needle || undefined;
+        // Where the task ENDS UP, for the reporting store below. Tracked per-branch because neither
+        // half is derivable from `cs` and `b.op` alone: findTaskAll searches EVERY board, so a
+        // start/done/move can land on another session's, and `drop` leaves the board entirely.
+        // `stamped` names the timestamp column this op IS the moment of, if any.
+        let lane = null, owner = cs, stamped = null;
         if (b.op === 'add' && needle) {
             task = makeTask(needle, b);
             board.queued.push(task);
+            lane = 'queued';
         } else if (b.op === 'start' || b.op === 'done' || b.op === 'drop' || b.op === 'ready' || b.op === 'review') {
             const lists = b.op === 'start' ? ['queued', 'done', 'review']
                 : b.op === 'done' ? ['working', 'queued', 'review']
@@ -3020,6 +3092,13 @@ async function handleRequest(req, res) {
             if (b.op === 'ready') dest.queued.push(t);
             if (b.op === 'review') dest.review.push(t);
             task = t;
+            owner = hit.cs;
+            // 'dropped' is a lane that exists ONLY in the store: a dropped task is gone from
+            // worklist.json, so the backfill can never see one. Naming it here is what lets a report
+            // EXCLUDE abandoned work instead of silently losing it.
+            lane = b.op === 'start' ? 'working' : b.op === 'done' ? 'done'
+                : b.op === 'ready' ? 'queued' : b.op === 'review' ? 'review' : 'dropped';
+            stamped = b.op === 'start' ? 'startedAt' : b.op === 'done' ? 'doneAt' : null;
         } else if (b.op === 'top') {
             const hit = findTaskAll(w, needle, ['queued', 'working', 'review', 'done'], cs);
             if (!hit) return json(res, 404, { error: 'no task matching ' + needle });
@@ -3027,12 +3106,16 @@ async function handleRequest(req, res) {
             const [t] = arr.splice(hit.i, 1);
             arr.unshift(t);
             task = t;
+            owner = hit.cs;
+            lane = hit.list;    // a bump reorders within a lane; it does not change one
         } else if (b.op === 'move' && needle && b.to) {
             const hit = findTaskAll(w, needle, ['working', 'queued', 'done'], cs);
             if (!hit) return json(res, 404, { error: 'no task matching ' + needle });
             const [t] = w.sessions[hit.cs][hit.list].splice(hit.i, 1);
             ensureBoard(w, String(b.to).toLowerCase()).queued.push(t);
             task = t;
+            owner = String(b.to).toLowerCase();   // the row follows the task to its new board
+            lane = 'queued';
         } else if (b.op === 'clear-done') {
             board.done = [];
         } else {
@@ -3040,6 +3123,23 @@ async function handleRequest(req, res) {
         }
         saveWork(w);
         record({ kind: 'task', op: b.op, board: cs, task: textOf(task) });
+        // The board op, as it happens. LANE IS CURRENT TRUTH; startedAt/doneAt are HISTORY, and the
+        // two are allowed to disagree. db.mjs COALESCEs every column, so a timestamp once written can
+        // never be cleared -- which means `ready` on a finished task leaves its doneAt standing beside
+        // lane='queued'. That is the deliberate call, not an oversight: it WAS done at that moment,
+        // and un-finishing it is not time travel. The consequence a report has to respect is that
+        // "what is finished" means lane='done', NEVER doneAt IS NOT NULL.
+        // `clear-done` writes nothing on purpose: it empties a lane without changing any task's fate,
+        // and the store is precisely the history the board just threw away.
+        // Tasks with no id (pre-v3 bare strings) are skipped -- upsertTask needs a primary key, and
+        // minting one here would not match the synthetic id the backfill derives for the same task.
+        if (lane && task && typeof task === 'object' && task.id) {
+            const t = task;
+            store('worklist ' + b.op + ' ' + t.id, (m, db) => m.upsertTask(db, {
+                id: t.id, callsign: owner, text: textOf(t), lane, addedAt: t.addedAt,
+                ...(stamped ? { [stamped]: new Date().toISOString() } : {}),
+            }));
+        }
         return json(res, 200, { ok: true, op: b.op, task });
     }
     if (key === 'POST /mission') {
@@ -3444,6 +3544,12 @@ async function main() {
         process.exit(e && e.code === 'EADDRINUSE' ? 3 : 1);
     });
 
+    // Bring the reporting store up BEFORE the boot reconcile: that sweep retires every worker that
+    // did not survive, and those retires are history worth keeping. After the listen, per the rule
+    // below -- the port comes up first, unconditionally. A register landing in the millisecond
+    // between the two is simply not stored; the store is best-effort by design and nothing reads it.
+    await initStore();
+
     // Re-adopt the workers that outlived the last hub, bury the ones that did not, and restore the
     // spawn state that was in flight when it went down. This also owns the worktree sweep, which it
     // defers until survivors have had a chance to check in — calling sweepWorktrees() here directly
@@ -3512,6 +3618,9 @@ async function main() {
     console.log(`  build      -> ${BUILD.short || 'unknown'}${treeNote}  pid ${process.pid}`);
     console.log(`  data dir   -> ${DATA}`);
     console.log(`  transcript -> ${TRANSCRIPT}`);
+    // Say whether history is actually being recorded. An unavailable store is invisible by design --
+    // every write is swallowed -- and this repo has paid for treating silence as success before.
+    console.log(`  store      -> ${storeDb ? storeMod.defaultDbPath() : 'OFF (db.mjs unavailable; see crash.log)'}`);
     console.log(`  console    -> ${ORIGIN}`);
     enqueueSay('Jarvis online.', 'jarvis');
 

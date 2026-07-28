@@ -10,6 +10,7 @@
         "test:revive": "set JARVIS_INTEGRATION=1&& node --test test/revive.test.mjs",
         "test:subworker": "set JARVIS_INTEGRATION=1&& node --test test/subworker.test.mjs",
         "test:boardcard": "set JARVIS_INTEGRATION=1&& node --test test/boardcard.test.mjs",
+        "test:store": "set JARVIS_INTEGRATION=1&& node --test test/store.test.mjs",
         "test:integration": "set JARVIS_INTEGRATION=1&& node --test"
     },
     "dependencies": {
