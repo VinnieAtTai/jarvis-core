@@ -309,3 +309,5 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,"Segoe UI Emoji","S
 .sexit{margin-left:auto;cursor:pointer;color:#7a8a9c;border:1px solid #1f2c3a;border-radius:5px;padding:1px 8px;white-space:nowrap}
 .sexit:hover{color:#5db4d9;border-color:#5db4d9}
 .snote{color:#7a8a9c;font-size:12px;line-height:1.5;text-align:center;padding:18px 10px}
+/* Shown only when the archive scan hit its byte bound, i.e. `total` is a floor. Hover for the detail. */
+.scap{color:#e0b050;border:1px solid #5a4a2a;border-radius:5px;padding:1px 7px;cursor:help;white-space:nowrap}
