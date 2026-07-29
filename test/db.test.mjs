@@ -152,6 +152,65 @@ test('taskTimesFromTranscript — earliest start, latest done, keyed by board+te
     assert.equal(t.doneAt, '5');
 });
 
+test('taskTimesFromTranscript — THE MOVED CARD: a move carries its history to the board it lands on', () => {
+    // The hole this closes: the times are keyed (board, text) but the rows they enrich come from
+    // worklist.json, which knows only where a card is NOW. Started on alpha, moved to bravo, finished
+    // there -- pre-fix the lookup for bravo found the done time and no start time at all, so the
+    // backfill reported a finished card that was never begun.
+    const events = [
+        { kind: 'task', op: 'add', board: 'alpha', task: 'ship it', ts: '1' },
+        { kind: 'task', op: 'start', board: 'alpha', task: 'ship it', ts: '2' },
+        { kind: 'task', op: 'move', board: 'bravo', from: 'alpha', task: 'ship it', ts: '3' },
+        { kind: 'task', op: 'done', board: 'bravo', task: 'ship it', ts: '4' },
+    ];
+    const map = taskTimesFromTranscript(events);
+    assert.deepEqual(map.get(taskTimeKey('bravo', 'ship it')), { startedAt: '2', doneAt: '4' });
+    // And the board it LEFT stops answering for it, or a card that moved away still dates work on a
+    // board that no longer holds it.
+    assert.equal(map.get(taskTimeKey('alpha', 'ship it')), undefined);
+});
+
+test('taskTimesFromTranscript — history survives more than one hop, in any arrival order', () => {
+    const events = [
+        { kind: 'task', op: 'start', board: 'alpha', task: 'ship it', ts: '2' },
+        { kind: 'task', op: 'move', board: 'bravo', from: 'alpha', task: 'ship it', ts: '3' },
+        { kind: 'task', op: 'move', board: 'delta', from: 'bravo', task: 'ship it', ts: '4' },
+        { kind: 'task', op: 'done', board: 'delta', task: 'ship it', ts: '5' },
+    ];
+    assert.deepEqual(taskTimesFromTranscript(events).get(taskTimeKey('delta', 'ship it')), { startedAt: '2', doneAt: '5' });
+    // Order-independent: the replay reads chronologically, so a caller's hand-built array does not
+    // have to be pre-sorted for the chain to hold. (The live transcript is append-only anyway.)
+    const shuffled = [events[3], events[1], events[0], events[2]];
+    assert.deepEqual(taskTimesFromTranscript(shuffled).get(taskTimeKey('delta', 'ship it')), { startedAt: '2', doneAt: '5' });
+});
+
+test('taskTimesFromTranscript — a move with no `from` leaves the times where they were', () => {
+    // Lines written before 7b34183 carry no source board. The fallback is the OLD behaviour on
+    // purpose: a stranded start time is recoverable, an invented source board is not.
+    const events = [
+        { kind: 'task', op: 'start', board: 'alpha', task: 'ship it', ts: '2' },
+        { kind: 'task', op: 'move', board: 'bravo', task: 'ship it', ts: '3' },
+        { kind: 'task', op: 'done', board: 'bravo', task: 'ship it', ts: '4' },
+    ];
+    const map = taskTimesFromTranscript(events);
+    assert.deepEqual(map.get(taskTimeKey('alpha', 'ship it')), { startedAt: '2' });
+    assert.deepEqual(map.get(taskTimeKey('bravo', 'ship it')), { doneAt: '4' });
+});
+
+test('taskTimesFromTranscript — moving onto a board that already has that text merges, never overwrites', () => {
+    // Two boards really do carry cards with identical text. Once one lands on the other they are no
+    // more separable than two same-text cards on one board always were, so the merge keeps the
+    // earliest start and the latest done rather than dropping either side.
+    const events = [
+        { kind: 'task', op: 'start', board: 'bravo', task: 'ship it', ts: '1' },
+        { kind: 'task', op: 'done', board: 'bravo', task: 'ship it', ts: '2' },
+        { kind: 'task', op: 'start', board: 'alpha', task: 'ship it', ts: '3' },
+        { kind: 'task', op: 'done', board: 'alpha', task: 'ship it', ts: '4' },
+        { kind: 'task', op: 'move', board: 'bravo', from: 'alpha', task: 'ship it', ts: '5' },
+    ];
+    assert.deepEqual(taskTimesFromTranscript(events).get(taskTimeKey('bravo', 'ship it')), { startedAt: '1', doneAt: '4' });
+});
+
 test('tasksFromWorklist — flattens v3 board into lane-tagged rows; synthesizes id when missing', () => {
     const wl = {
         version: 3, focus: 'jarvis',
@@ -231,6 +290,35 @@ test('backfill — parses a small fixture data dir and is idempotent', () => {
         backfill(db, dir);
         assert.equal(listSessions(db).length, 1);
         assert.equal(listTasks(db).length, 1);
+        db.close();
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test('backfill — a card that changed boards is dated on the board it now sits on', () => {
+    // The pure test above proves the replay; this proves the JOIN, which is where the symptom showed.
+    // worklist.json holds the card on bravo -- the only place it has ever been, as far as the board
+    // knows -- while the whole first half of its life is logged against alpha.
+    const dir = mkdtempSync(join(tmpdir(), 'jarvisdb-moved-'));
+    try {
+        writeFileSync(join(dir, 'transcript.jsonl'), [
+            JSON.stringify({ kind: 'task', op: 'add', board: 'alpha', task: 'BUG: dated on the wrong board', ts: '2026-07-28T01:00:00Z' }),
+            JSON.stringify({ kind: 'task', op: 'start', board: 'alpha', task: 'BUG: dated on the wrong board', ts: '2026-07-28T01:05:00Z' }),
+            JSON.stringify({ kind: 'task', op: 'move', board: 'bravo', from: 'alpha', task: 'BUG: dated on the wrong board', ts: '2026-07-28T01:20:00Z' }),
+            JSON.stringify({ kind: 'task', op: 'done', board: 'bravo', task: 'BUG: dated on the wrong board', ts: '2026-07-28T01:40:00Z' }),
+        ].join('\n') + '\n');
+        writeFileSync(join(dir, 'worklist.json'), JSON.stringify({
+            version: 3, focus: 'jarvis',
+            sessions: { bravo: { working: [], queued: [], review: [], done: [{ id: 't_moved', text: 'BUG: dated on the wrong board', addedAt: '2026-07-28T01:00:00Z' }] } },
+        }));
+
+        const db = init(':memory:');
+        backfill(db, dir);
+        const [t] = listTasks(db, { callsign: 'bravo' });
+        assert.equal(t.doneAt, '2026-07-28T01:40:00Z', 'the done time was already reachable -- it happened after the move');
+        assert.equal(t.startedAt, '2026-07-28T01:05:00Z',
+            'a moved card came back with no start time at all: finished work that looks like it never began');
         db.close();
     } finally {
         rmSync(dir, { recursive: true, force: true });

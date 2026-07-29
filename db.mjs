@@ -284,17 +284,61 @@ export function sessionsFromTranscript(events) {
 // transcript's task events, so a worklist task (which stores only addedAt) can be enriched with when
 // it was started/finished. startedAt = earliest op=start; doneAt = latest op=done. The event's
 // `board` field IS the callsign, and its `task` field is the same text the worklist stores.
+//
+// A MOVE hands the card's history to its new board, and that is the whole reason this reads events in
+// order rather than folding min/max over them in any order. The keys are (board, text), but the rows
+// this map is joined against come from worklist.json -- which knows only where a card is NOW. So a
+// card started on one board and later moved was keyed under a board it no longer sits on, the join
+// found nothing, and the backfill produced a row with no start or done time at all: not the wrong
+// date, NO date, looking exactly like work that was never begun. Replaying the move re-keys the
+// history onto the board the card ended up on, which is the board the worklist will ask about.
+//
+// A move only replays if the event carries `from`. Older lines predate it (added 7b34183) and fall
+// back to the previous behaviour -- the times stay stranded on the source key -- because inventing a
+// source board would be worse than admitting the line cannot say where the card came from.
 export function taskTimesFromTranscript(events) {
+    // Chronological. The transcript is append-only so it already arrives this way; the sort is for
+    // callers handing over a hand-built array, and it is stable, so events sharing a millisecond keep
+    // their file order (a move and a start in the same tick must not swap).
+    const list = (Array.isArray(events) ? events : [])
+        .filter(e => e && e.kind === 'task' && e.board && e.task != null)
+        .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
     const map = new Map();
-    for (const e of (Array.isArray(events) ? events : [])) {
-        if (!e || e.kind !== 'task' || !e.board || e.task == null) continue;
+    for (const e of list) {
         const key = pairKey(e.board, e.task);
+        if (e.op === 'move') {
+            // The source board no longer holds this card, so its key is released as well as read --
+            // otherwise a card moved away keeps answering for the board it left.
+            //
+            // No `&& e.from` guard, deliberately: only a truthy `board` is ever stored as a key, so a
+            // line without a source resolves to a key nothing was written under, finds nothing to
+            // carry, and leaves the pre-7b34183 behaviour standing. The absent-`from` fallback IS this
+            // lookup coming back empty -- a separate branch claiming to handle it read like an extra
+            // rule while being something no probe could tell from a no-op.
+            const src = pairKey(e.from, e.task);
+            const carried = map.get(src);
+            map.delete(src);
+            if (carried) map.set(key, mergeTaskTimes(map.get(key), carried));
+            continue;
+        }
         const cur = map.get(key) || {};
         if (e.op === 'start' && (!cur.startedAt || e.ts < cur.startedAt)) cur.startedAt = e.ts;
         if (e.op === 'done' && (!cur.doneAt || e.ts > cur.doneAt)) cur.doneAt = e.ts;
         map.set(key, cur);
     }
     return map;
+}
+
+// Fold two histories of one card into one: earliest start, latest done. Deliberately the same rule
+// the single-board accumulation above uses, because a destination key can already be occupied -- two
+// boards genuinely do carry cards with identical text -- and the two histories are then no more
+// separable than two same-text cards on one board ever were.
+function mergeTaskTimes(into, from) {
+    const a = into || {}, b = from || {};
+    const out = { ...a };
+    if (b.startedAt && (!out.startedAt || b.startedAt < out.startedAt)) out.startedAt = b.startedAt;
+    if (b.doneAt && (!out.doneAt || b.doneAt > out.doneAt)) out.doneAt = b.doneAt;
+    return out;
 }
 
 // The key taskTimesFromTranscript uses, exported so callers (backfill) and tests share one convention
