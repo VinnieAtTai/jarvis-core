@@ -297,3 +297,15 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,"Segoe UI Emoji","S
 .toast.err{border-left-color:#e06c6c}
 .toast.ok{border-left-color:#5dd97c}
 .toast.gone{opacity:0}
+
+/* Chat search. The box lives in #bar next to EXPAND/RAW/LOCK so it rides with the chat panel and
+   nothing else has to move; results render into #chat with the ordinary bubble markup. */
+#qbox{flex:1;min-width:90px;background:#0d1420;border:1px solid #1f2c3a;border-radius:6px;color:#d7e3f0;padding:3px 9px;font:12px Consolas,monospace;outline:none}
+#qbox:focus{border-color:#5db4d9}
+#qbox::placeholder{color:#5a6b7c}
+.shead{display:flex;align-items:center;gap:6px;font-size:11px;color:#7a8a9c;border-bottom:1px solid #1f2c3a;padding-bottom:6px;margin-bottom:10px}
+.shead b{color:#d7e3f0}
+.scount{color:#5db4d9;font-weight:bold}
+.sexit{margin-left:auto;cursor:pointer;color:#7a8a9c;border:1px solid #1f2c3a;border-radius:5px;padding:1px 8px;white-space:nowrap}
+.sexit:hover{color:#5db4d9;border-color:#5db4d9}
+.snote{color:#7a8a9c;font-size:12px;line-height:1.5;text-align:center;padding:18px 10px}
