@@ -84,7 +84,8 @@ dead for the whole turn. The ping prevents that; the poll loop stays your inbox.
   (text is the path to a screen capture the hub took the INSTANT the human said take a
   screenshot — Read it as an image; it usually arrives in the same batch as the speech that
   asked for it, and your analysis should refer to that exact moment), `msg` (another
-  session), `retire-request` (wrap up, see step 5), `retired` (you are done, stop polling).
+  session), `baton` (the merge lane is yours — see step 4b), `retire-request` (wrap up, see
+  step 5), `retired` (you are done, stop polling).
 - An exit printing `{"error":"retired"}` means you were retired; stop, do not relaunch.
 - The heartbeat PING (not this loop) is what keeps you live — so even a long turn stays green.
   If your `lastSeen` is stale for 2 minutes the human is told you have gone quiet. Both the
@@ -147,6 +148,39 @@ just render plain.
 When several updates land at once (finished one task, starting the next, plus a `/say`),
 chain all the curls in ONE Bash call separated by `;` — every separate tool call is a
 separate model turn and turns are the expensive unit.
+
+## 4b. The commit baton — ask before you merge
+
+Many workers can research, plan, edit and commit **on their own branch** at the same time. Only
+ONE at a time may merge into the repo's integration branch. That turn is the baton, and it is
+per repo — another repo's lane never blocks yours.
+
+You only need it at the very end, when your work is committed and you are ready to merge. Ask:
+
+```
+curl.exe -s -X POST http://127.0.0.1:8124/baton -H "content-type: application/json" -d "{\"op\":\"request\",\"uid\":\"<uid>\",\"note\":\"<what you are merging>\"}"
+```
+
+`{"granted":true}` means the lane is yours, go. `{"granted":false,"position":2}` means you are
+queued — **do not poll `/baton` waiting for it.** Go back to your normal poll loop; the hub
+wakes you with a `baton` event when it is your turn, which costs you nothing while you wait.
+Re-requesting is safe (it just tells you where you stand), and `{"op":"cancel","uid":"<uid>"}`
+leaves the queue if the task was dropped.
+
+When you hold it, merge the fresh base INTO YOUR WORKTREE FIRST — every conflict gets resolved
+in your own tree, so the integration branch only ever takes an already-clean merge:
+
+```
+git -C <your worktree> fetch origin
+git -C <your worktree> merge origin/<base>    # resolve conflicts HERE, then re-run the gate
+<run the build/test gate>
+git -C <repo cwd> merge --no-ff jarvis/<callsign>
+curl.exe -s -X POST http://127.0.0.1:8124/baton -H "content-type: application/json" -d "{\"op\":\"release\",\"uid\":\"<uid>\",\"merged\":true}"
+```
+
+Release as soon as you are done — everyone behind you is waiting. You do not have to remember:
+retiring releases it for you, and a holder that stops checking in has the lane reclaimed after
+five minutes. `GET /baton?repo=<key>` shows who holds it and who is waiting.
 
 ## 5. Retire & hand off
 

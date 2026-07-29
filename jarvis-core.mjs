@@ -9,6 +9,7 @@ import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
 import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
+import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap } from './jarvis-text.mjs';
 import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1088,6 +1089,12 @@ function retireSession(uid, summary, opts = {}) {
     // in-flight WIP to the worker's branch, drop the directory, keep the branch (it is the
     // deliverable). The successor spawned below inherits that branch and continues on it.
     teardownWorktree(s, cs);
+    // Free any merge lane this worker held (and take it out of any queue it was waiting in) BEFORE the
+    // successor spawn below. A dead holder must never wedge the lane, and a retire is the one moment
+    // we know for certain it is gone -- the stale sweep is only the backstop for workers that die
+    // without saying so. The successor does not inherit: it re-requests, so an unfinished merge rejoins
+    // the queue rather than being granted to a session that has not read the handoff yet.
+    try { releaseBatonsFor(uid, cs); } catch (e) { logCrash('baton-release-on-retire-failed', e); }
     const w = loadWork();
     const board = w.sessions[cs] || { working: [], queued: [], done: [], review: [] };
     // The handoff record: one-line summary + detailed notes + the FULL board snapshot (all lanes).
@@ -1620,6 +1627,12 @@ function reconcileWorkersOnBoot() {
     const buried = buryGhosts(first.ghosts, 'Lost when the hub restarted');
     restoreBootingState(hosts);
     saveRoster();
+    // Revalidate the merge lanes now that the corpses are `ended`: a holder or queue entry the restart
+    // buried has to leave, or the lane comes back up shut with nobody able to release it. staleMs
+    // Infinity keeps this to what is PROVABLY gone -- every survivor's lastSeen is still frozen at
+    // pre-restart, so a staleness reap here would rob a worker that is very much alive. Quiet, because
+    // buryGhosts already speaks for the whole fleet and one line per lane would be a casualty list.
+    try { reapBatons({ staleMs: Infinity, quiet: true }); } catch (e) { logCrash('baton-boot-revalidate-failed', e); }
     if (buried) enqueueSay('Back up. ' + buried + (buried === 1 ? ' session did not survive the restart.' : ' sessions did not survive the restart.'), 'jarvis');
     // The suspected rows and the worktree sweep both wait out the grace window: a wt-tab survivor
     // deserves the chance to poll before it is judged, and the sweep must not run while any live
@@ -1637,6 +1650,12 @@ function reconcileWorkersOnBoot() {
             // there means Chris watches the roster empty itself a minute and a half after boot with
             // nothing said, which reads exactly like the bug he asked us to fix.
             if (n) enqueueSay('Roster reconciled. Cleared ' + n + (n === 1 ? ' session that never came back.' : ' sessions that never came back.'), 'jarvis');
+            // No second baton revalidation here, deliberately. Every session buried by THIS pass goes
+            // through retireSession, which releases its lane and clears it from every queue on the way
+            // past -- so a reap here could only ever repeat what the burial just did. What the boot
+            // revalidation above catches is the case no burial can: a holder the roster has never heard
+            // of (a store left by an earlier roster, a hand-edited file). Adding a copy that no probe
+            // can distinguish from a no-op is how a rule stops being checked.
             collectDeadWorkerConfigs(late);
             sweepWorktrees(late);
         } catch { }        // a reconcile failure must never take the hub down
@@ -1686,6 +1705,188 @@ function sweepWorktrees(hosts) {
         }
         if (orphans.length) record({ kind: 'sys', text: 'boot sweep: collected ' + orphans.length + ' orphaned worktree' + (orphans.length === 1 ? '' : 's') });
     } catch { }   // a sweep failure must never block the hub coming up
+}
+// ---- commit baton: one serialized merge lane per repo (docs/COMMIT-BATON-DESIGN.md) -----------
+// P2 of the worktree work above, and deliberately adjacent to it: isolation stops workers clobbering
+// each other's FILES, the baton stops them clobbering each other's MERGES. It gates the merge lane
+// only -- everything else stays parallel -- and the hub never runs `git merge` itself. It hands out
+// turns; the worker does the work, in its own worktree, against a fresh base.
+//
+// The decisions (grant / queue / release / revoke) are pure helpers in jarvis-text.mjs with unit tests
+// in test/baton.test.mjs. What lives here is the four things they cannot know: the file, the roster,
+// the git call that names the base, and the event that wakes the worker whose turn it is.
+const BATONS = join(DATA, 'batons.json');
+// The store is one lane per repo key, keyed exactly as resolveRepo().key -- so jarvis-core and tms
+// have independent lanes and can never block each other. A bare map (repos.json's shape, not
+// missions.json's {version, missions:[]}) because the design's shape is `{ "tms": {lane} }` and a
+// `version` key alongside repo keys would read as a repo called version.
+function loadBatons() {
+    if (existsSync(BATONS)) {
+        let raw = null, bad = false;
+        try { raw = JSON.parse(readFileSync(BATONS, 'utf8')); } catch { bad = true; }
+        // Valid JSON of the WRONG SHAPE gets the same treatment as unparseable. Falling through to an
+        // empty store would mean the next save silently overwrote the only copy, which is the one
+        // thing every state file here promises not to do.
+        if (!bad && (!raw || typeof raw !== 'object' || Array.isArray(raw))) bad = true;
+        if (bad) backupCorrupt(BATONS);
+        else {
+            const out = {};
+            for (const k of Object.keys(raw)) out[k] = normalizeLane(raw[k]);
+            return out;
+        }
+    }
+    return {};
+}
+function saveBatons(b) {
+    atomicWrite(BATONS, JSON.stringify(b, null, 1));
+}
+// The integration branch a lane's merges land on. Resolved from the repo's own checkout the SAME way
+// the worktree path resolves a fork point (worktreeBase), so isolation and the baton can never
+// disagree about what "the base" is. null means we could not name one, and the holder falls back to
+// whatever branch the repo is on -- which is what it would have merged into anyway.
+function laneBase(repoKey, sessionCwd) {
+    try {
+        const row = loadRepos()[repoKey] || null;
+        // A caller may name a lane for a repo it is not sitting in (the console forcing a lane it can
+        // see on the board). Only trust the session's cwd when it really is that repo, or the lane
+        // would be stamped with a base read out of somebody else's checkout.
+        const cwd = (row && row.cwd) || (sessionCwd && resolveRepo(sessionCwd).key === repoKey ? sessionCwd : '');
+        if (!cwd || !existsSync(cwd)) return null;
+        const head = gitOut(cwd, ['rev-parse', '--abbrev-ref', 'HEAD']);
+        if (head === null) return null;
+        const originHead = gitOut(cwd, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
+        return worktreeBase(head, row && row.base, (originHead || '').replace(/^origin\//, ''));
+    } catch { return null; }
+}
+// Which lane a request means: an explicit `repo` wins, else the repo the session is working on. A
+// session's cwd is the REPO (registerSession stores the repo and keeps the worktree beside it), so an
+// isolated worker resolves to the same lane as a shared-cwd one -- they are merging into the same
+// branch, which is the entire thing being serialized.
+function batonRepoKey(s, bodyRepo) {
+    const named = String(bodyRepo || '').toLowerCase().trim().replace(/[^a-z0-9_.-]/g, '');
+    if (named) return named;
+    if (!s || !s.cwd) return null;
+    try { return resolveRepo(s.cwd).key || null; } catch { return null; }
+}
+const batonWho = (e) => (e && (e.cs || e.uid)) || '?';
+// The grant is an EVENT, not something a waiting worker polls for. A queued worker parks on its
+// ordinary poll loop -- zero tokens while idle, the existing rule for idle sessions -- and is woken
+// when the lane becomes its turn, exactly like speech and msg. The text carries the recipe rather
+// than a bare "your turn" because the worker has to merge the fresh base FIRST, in its own tree.
+//
+// Only a QUEUE->HOLDER transition is evented. A worker granted the lane synchronously by its own
+// request already has the answer in the response, and waking it to repeat that costs a turn.
+function notifyBatonGrant(repoKey, lane, holder) {
+    if (!holder || !holder.uid) return;
+    busAppend({
+        from: 'jarvis', to: holder.uid, kind: 'baton',
+        text: 'baton granted: ' + repoKey + ' (base ' + ((lane && lane.base) || 'unknown') + '). Merge the fresh base into YOUR worktree first, run the gate there, then merge your branch into the base and POST /baton {"op":"release","uid":"<uid>","merged":true}.',
+    });
+}
+// When the hub last saw a session: epoch ms, or null when it is retired or gone from the roster.
+// This is the reaper's whole view of liveness, and it is deliberately NOT aliveNow(): that is a
+// 2-minute window, and a worker running a full build gate legitimately goes minutes without polling.
+// Measuring the raw signal lets the lane wait BATON_STALE_MS instead of punishing a long turn.
+function batonSeenAt(uid) {
+    const s = roster.sessions[uid];
+    if (!s || s.ended) return null;
+    const t = Date.parse(s.lastSeen || s.started);
+    return Number.isFinite(t) ? t : null;
+}
+// Take lanes back off holders that are gone and clear dead workers out of the queues. A lane that
+// depends on a worker staying healthy is a lane that wedges -- the wedged-worker failure mode that
+// took primeng down on 2026-07-24 -- so this runs on a timer, at boot, and on every /baton call.
+//
+// opts.staleMs Infinity is the BOOT rule: sweep only what is provably gone (retired/missing) and
+// ignore the clock, because right after a restart every survivor's lastSeen is frozen at whatever it
+// was before the hub went down and would read as five minutes quiet.
+// opts.quiet suppresses the spoken line (boot can bury a fleet at once; one voice line per lane
+// would be a casualty list).
+// The stale window, overridable. The design calls 5 minutes a DEFAULT, and this is the only knob that
+// makes the sweep exercisable at all: a test that had to wait out five real minutes to watch a lane be
+// reclaimed would not get written, and an unexercised sweep is the half of this feature most likely to
+// be wrong (it is the one that fires when nobody is watching). A non-positive/garbage value means the
+// default -- never zero, which would revoke a holder the instant it stopped polling.
+const BATON_STALE = (() => { const v = Number(process.env.JARVIS_BATON_STALE_MS); return v > 0 ? v : BATON_STALE_MS; })();
+function reapBatons(opts = {}) {
+    const staleMs = opts.staleMs === Infinity || Number.isFinite(opts.staleMs) ? opts.staleMs : BATON_STALE;
+    let store;
+    try { store = loadBatons(); } catch { return false; }
+    const grants = [];
+    let dirty = false;
+    for (const key of Object.keys(store)) {
+        const r = batonReap(store[key], batonSeenAt, Date.now(), staleMs);
+        if (!r.revoked && !r.dropped.length) continue;
+        store[key] = r.lane;
+        dirty = true;
+        if (r.revoked) {
+            record({ kind: 'sys', text: 'merge lane ' + key + ' reclaimed from ' + batonWho(r.revoked) + ' (gone)' + (r.grantedTo ? ' -> ' + batonWho(r.grantedTo) : ' (free)') });
+            if (!opts.quiet) enqueueSay('Merge lane reclaimed from ' + batonWho(r.revoked) + '.', 'jarvis');
+        }
+        if (r.dropped.length) record({ kind: 'sys', text: 'merge lane ' + key + ' dropped ' + r.dropped.length + ' dead queue entr' + (r.dropped.length === 1 ? 'y' : 'ies') + ': ' + r.dropped.map(batonWho).join(', ') });
+        if (r.grantedTo) grants.push([key, r.lane, r.grantedTo]);
+    }
+    // Persist BEFORE waking anyone. A worker told it holds the lane must never be able to ask and be
+    // told it does not, which is what an event pushed ahead of a failed write would produce.
+    if (dirty) {
+        try { saveBatons(store); } catch (e) { logCrash('baton-save-failed (reap)', e); return false; }
+        for (const [k, lane, holder] of grants) notifyBatonGrant(k, lane, holder);
+    }
+    return dirty;
+}
+// Nobody has to ask for the sweep to happen: a lane whose holder died silently would otherwise stay
+// shut until the next /baton call, and the workers who would make that call are the ones being
+// blocked. .unref() so it never keeps the process alive on its own.
+//
+// The period follows the window rather than being its own number, because the two are one decision:
+// sweeping every 30s against a 2s window (or every 30s against a window shortened for a test) would
+// mean the lane's reclaim time was really the sweep period all along. Clamped to [5s, 30s] -- the
+// floor stops a tiny window turning this into a busy loop, and 30s is as slow as it gets.
+const BATON_SWEEP_MS = Math.min(30000, Math.max(5000, BATON_STALE));
+setInterval(() => { try { reapBatons(); } catch (e) { logCrash('baton-reap-failed', e); } }, BATON_SWEEP_MS).unref();
+// Retire releases. The stale sweep is the backstop for a worker that dies without saying so; a retire
+// is the case where we KNOW it is gone, so the lane should move on immediately rather than sit shut
+// for five minutes. Called from retireSession before any successor is spawned -- and a successor
+// deliberately does NOT inherit the baton: it re-requests, so an unfinished merge goes back into the
+// fair queue instead of being handed to a session that has not read the handoff yet.
+//
+// Blind across every lane, because a worker can hold one lane while queued on another.
+function releaseBatonsFor(uid, cs) {
+    let store;
+    try { store = loadBatons(); } catch { return; }
+    const grants = [];
+    let dirty = false;
+    for (const key of Object.keys(store)) {
+        const lane = store[key];
+        if (lane.holder && lane.holder.uid === uid) {
+            const r = batonRelease(lane, uid, Date.now());
+            store[key] = r.lane;
+            dirty = true;
+            record({ kind: 'sys', text: 'merge lane ' + key + ' released by ' + (cs || uid) + ' on retire' + (r.grantedTo ? ' -> ' + batonWho(r.grantedTo) : ' (free)') });
+            if (r.grantedTo) grants.push([key, r.lane, r.grantedTo]);
+        } else if (lane.queue.some(e => e.uid === uid)) {
+            store[key] = batonCancel(lane, uid).lane;
+            dirty = true;
+            record({ kind: 'sys', text: (cs || uid) + ' left the ' + key + ' merge queue on retire' });
+        }
+    }
+    if (dirty) {
+        try { saveBatons(store); } catch (e) { logCrash('baton-save-failed (retire)', e); return; }
+        for (const [k, lane, holder] of grants) notifyBatonGrant(k, lane, holder);
+    }
+}
+// One lane, shaped for a caller: queue positions spelled out so nobody has to count, and `waiting` so
+// the console can render "2 waiting" without walking the array.
+function batonView(key, lane) {
+    const l = lane || normalizeLane(null);
+    return {
+        repo: key,
+        base: l.base,
+        holder: l.holder,
+        queue: l.queue.map((e, i) => ({ ...e, position: i + 1 })),
+        waiting: l.queue.length,
+        lastHandoff: l.lastHandoff,
+    };
 }
 // Console-less worker spawning. A worker's only channel to Chris is this hub (board/chat/perm
 // cards over HTTP), so its terminal window is pure crash-exposure: combining DOS/console windows
@@ -2439,6 +2640,24 @@ async function handleRequest(req, res) {
     if (key === 'GET /board') {
         const w = loadWork();
         const projById = {}; for (const p of (loadProjects().projects || [])) projById[p.name] = p;   // one read per /board, not per card
+        // Merge-lane state per card, so the lock chip + waiting strip need no second fetch (mirroring
+        // how parentProject was surfaced in eca1395). One store read per /board, not one per card, and
+        // NO git call -- the base is whatever the lane was stamped with when it was granted.
+        const batonLanes = loadBatons();
+        const batonFor = (uid) => {
+            if (!uid) return null;
+            for (const k of Object.keys(batonLanes)) {
+                const l = batonLanes[k];
+                if (l.holder && l.holder.uid === uid) {
+                    return { repo: k, base: l.base, holding: true, takenAt: l.holder.takenAt, waiting: l.queue.length, queue: l.queue.map(batonWho) };
+                }
+                const i = l.queue.findIndex(e => e.uid === uid);
+                if (i >= 0) {
+                    return { repo: k, base: l.base, holding: false, position: i + 1, waiting: l.queue.length, holder: l.holder ? batonWho(l.holder) : null };
+                }
+            }
+            return null;
+        };
         const lives = liveCallsigns().filter(c => !(roster.sessions[liveUidOf(c)] || {}).project);
         const order = [w.focus, ...lives.filter(cs => cs !== w.focus), ...(w.focus === 'jarvis' ? [] : ['jarvis'])];
         const extras = Object.keys(w.sessions).filter(cs => !order.includes(cs));
@@ -2483,6 +2702,8 @@ async function handleRequest(req, res) {
                 // The project a SUB-WORKER is nested under (its .parentProject), so the console can
                 // group its card beneath that project/mission; null for coordinators + plain workers.
                 parentProject: (uid && roster.sessions[uid] && roster.sessions[uid].parentProject) || null,
+                // The merge lane this card's worker holds, or is waiting in; null for neither.
+                baton: batonFor(uid),
                 working: b.working, queued: b.queued, done: b.done, review: b.review || [],
             };
         });
@@ -2713,6 +2934,108 @@ async function handleRequest(req, res) {
             logCrash('reporting-store-read-failed (GET /report view=' + view + ')', e);
             return json(res, 500, { error: 'reporting store read failed (see crash.log)', store: 'on' });
         }
+    }
+    if (key === 'GET /baton') {
+        // Lane state, for the console and for a worker's own check. The reap first is deliberate: a
+        // lane whose holder died must never be SERVED as busy, because the answer a worker acts on is
+        // this one. It is a write on a read, the same way the pendingPins/pendingBind TTL sweeps happen
+        // on access, and it can only ever remove entries the roster already says are gone.
+        try { reapBatons(); } catch (e) { logCrash('baton-reap-failed (GET /baton)', e); }
+        const store = loadBatons();
+        const want = String(u.searchParams.get('repo') || '').toLowerCase().trim();
+        if (want) return json(res, 200, { staleMs: BATON_STALE, ...batonView(want, store[want]) });
+        return json(res, 200, { staleMs: BATON_STALE, lanes: Object.keys(store).map(k => batonView(k, store[k])) });
+    }
+    if (key === 'POST /baton') {
+        const b = await readBody(req);
+        const op = String(b.op || '').toLowerCase().trim();
+        try { reapBatons(); } catch (e) { logCrash('baton-reap-failed (POST /baton)', e); }
+        const store = loadBatons();
+        const save = () => { try { saveBatons(store); return true; } catch (e) { logCrash('baton-save-failed (' + op + ')', e); return false; } };
+        if (op === 'force') {
+            // The human's override, from the console: break a lane they think is stuck. No uid --
+            // Chris is not a session. ALWAYS announced (spoken + recorded): a lane changing hands
+            // without the worker asking is exactly the thing that must never happen silently.
+            const target = String(b.cs || '').toLowerCase().replace(/[^a-z]/g, '');
+            let to = null;
+            if (target) {
+                const tuid = liveUidOf(target);
+                if (!tuid) return json(res, 404, { error: 'no live session ' + target });
+                const ts = roster.sessions[tuid];
+                to = { uid: tuid, cs: target, branch: ts.branch || null, note: String(b.note || 'human override') };
+            }
+            const repoKey = batonRepoKey(to ? roster.sessions[to.uid] : null, b.repo);
+            if (!repoKey) return json(res, 400, { error: 'force needs repo (or a cs whose session has a cwd)' });
+            const lane = store[repoKey] || normalizeLane(null);
+            // Nothing to break and nobody named to hand it to: say so, rather than writing an empty
+            // lane to disk and reporting a handover that did not happen. Forcing a lane that does not
+            // exist yet is still legitimate WITH a target -- that is Chris granting a turn up front.
+            if (!to && !lane.holder && !lane.queue.length) return json(res, 404, { error: 'no baton lane for ' + repoKey });
+            const base = laneBase(repoKey, to ? roster.sessions[to.uid].cwd : '');
+            const r = batonForce({ ...lane, base: base || lane.base }, to, Date.now());
+            store[repoKey] = r.lane;
+            if (!save()) return json(res, 500, { error: 'could not write batons.json (see crash.log)' });
+            const what = 'merge lane ' + repoKey + ' forced by the console: '
+                + (r.revoked ? 'revoked from ' + batonWho(r.revoked) : 'was free')
+                + (r.grantedTo ? ' -> ' + batonWho(r.grantedTo) : ' -> free');
+            record({ kind: 'sys', text: what });
+            enqueueSay(r.grantedTo
+                ? 'Merge lane ' + repoKey + ' handed to ' + batonWho(r.grantedTo) + '.'
+                : 'Merge lane ' + repoKey + ' is now free.', 'jarvis');
+            if (r.grantedTo) notifyBatonGrant(repoKey, r.lane, r.grantedTo);
+            return json(res, 200, { ok: true, ...batonView(repoKey, r.lane), revoked: r.revoked ? batonWho(r.revoked) : null, grantedTo: r.grantedTo ? batonWho(r.grantedTo) : null });
+        }
+        const s = roster.sessions[b.uid];
+        if (!s) return json(res, 404, { error: 'unknown uid' });
+        const repoKey = batonRepoKey(s, b.repo);
+        if (!repoKey) return json(res, 400, { error: 'could not resolve a repo for this session; pass repo' });
+        const lane = store[repoKey] || normalizeLane(null);
+        if (op === 'request') {
+            if (s.ended) return json(res, 410, { error: 'retired' });
+            // Re-resolve the base on every request: it is what the holder will merge, and Chris moves
+            // the integration branch. A git read that fails keeps whatever the lane already knew rather
+            // than blanking it -- a stale base beats no base, and null already means "use the repo's
+            // current branch".
+            const base = laneBase(repoKey, s.cwd);
+            const r = batonRequest({ ...lane, base: base || lane.base }, {
+                uid: b.uid, cs: s.callsign, branch: b.branch || s.branch || null, note: b.note,
+            }, Date.now());
+            store[repoKey] = r.lane;
+            if (!save()) return json(res, 500, { error: 'could not write batons.json (see crash.log)' });
+            if (!r.already) {
+                record({ kind: 'sys', text: r.granted
+                    ? 'merge lane ' + repoKey + ' granted to ' + s.callsign + (r.lane.base ? ' (base ' + r.lane.base + ')' : '')
+                    : 'merge lane ' + repoKey + ' busy with ' + r.holder + '; ' + s.callsign + ' queued at ' + r.position });
+            }
+            return json(res, 200, {
+                ok: true, granted: r.granted, position: r.position, holder: r.holder,
+                already: r.already, repo: repoKey, base: r.lane.base, waiting: r.lane.queue.length,
+            });
+        }
+        if (op === 'release') {
+            const r = batonRelease(lane, b.uid, Date.now());
+            if (!r.held) return json(res, 200, { ok: true, held: false, repo: repoKey, holder: lane.holder ? batonWho(lane.holder) : null });
+            store[repoKey] = r.lane;
+            if (!save()) return json(res, 500, { error: 'could not write batons.json (see crash.log)' });
+            // Whether the merge actually LANDED is the punchlist's question, so it goes in the log
+            // rather than being inferred from the lane moving on.
+            record({ kind: 'sys', text: 'merge lane ' + repoKey + ' released by ' + s.callsign + (b.merged ? ' (merged)' : ' (nothing merged)') + (r.grantedTo ? ' -> ' + batonWho(r.grantedTo) : ' (free)') });
+            if (r.grantedTo) notifyBatonGrant(repoKey, r.lane, r.grantedTo);
+            return json(res, 200, { ok: true, held: true, repo: repoKey, grantedTo: r.grantedTo ? batonWho(r.grantedTo) : null, waiting: r.lane.queue.length });
+        }
+        if (op === 'cancel') {
+            const c = batonCancel(lane, b.uid);
+            // Cancelling while HOLDING is a mistake worth naming: doing nothing quietly would leave the
+            // lane shut by a worker that believes it let go.
+            if (c.holding) return json(res, 409, { error: 'you hold the ' + repoKey + ' lane; use op:release' });
+            if (c.dropped) {
+                store[repoKey] = c.lane;
+                if (!save()) return json(res, 500, { error: 'could not write batons.json (see crash.log)' });
+                record({ kind: 'sys', text: s.callsign + ' left the ' + repoKey + ' merge queue' });
+            }
+            return json(res, 200, { ok: true, dropped: c.dropped, repo: repoKey, waiting: c.lane.queue.length });
+        }
+        return json(res, 400, { error: 'op must be request|release|cancel|force' });
     }
     if (key === 'GET /repos') {
         // Read-only repo list for the console's new-session composer (the + tab).

@@ -147,11 +147,56 @@ Per the scratch recipe (`JARVIS_PORT=8199` + scratch `JARVIS_DATA` + `JARVIS_NO_
 
 ## Status / phasing
 
-Design only. Implementation is a new store + three route arms + a `retireSession` hook, so it is
-**restart-gated** and, like the worktree spec, is **not** in the parked pending tree.
-
-- **P1 (worktrees)** must land first -- a baton without isolation still leaves everyone editing one
+- **P1 (worktrees)** SHIPPED (12e0c90) -- a baton without isolation still leaves everyone editing one
   dirty tree, so serializing the merge buys much less.
-- **P2a** store + `/baton` routes + pure helpers + retire hook + `baton` poll event (server).
-- **P2b** WORKER.md protocol section (request before merging, the merge recipe, release on done).
-- **P2c** console lock chip + waiting strip + force override.
+- **P2a** SHIPPED: store + `/baton` routes + pure helpers + retire hook + `baton` poll event (server).
+- **P2b** SHIPPED: WORKER.md §4b (request before merging, the merge recipe, release on done).
+- **P2c** NOT DONE: console lock chip + waiting strip + force override, and the voice phrases. The
+  server half of it is in place -- `/board` carries a `baton` field per card ({repo, base, holding,
+  takenAt|position, waiting, queue}) so the chip needs no extra fetch -- but `console.js` is
+  deliberately untouched while the console-shell options are still unpicked.
+
+**Restart-gated**: the hub must be rebuilt for any of this to be live.
+
+### What the implementation does differently, and why
+
+Six places where the code and the sketch above diverge. Each is a case where following the sketch
+literally would have produced something that could not work or could not be checked.
+
+1. **`batonReap(lane, seenAt, now, staleMs)`, not `isAlive`.** §4 asks for a holder whose
+   `aliveNow(uid)` has been false for longer than `BATON_STALE_MS`. A boolean cannot express that
+   without the lane persisting *when it first read dead* -- a ratchet field that would also need
+   re-arming after every restart, since a survivor's `lastSeen` is frozen at pre-restart. So the
+   probe hands over the raw signal (last-seen ms, or null for retired/missing) and the helper
+   measures it directly: the same five-minute guarantee, no extra state. `staleMs: Infinity` then
+   means "sweep only what is provably gone", which is exactly the boot rule §1 asks for.
+2. **An untargeted `force` POPS the queue** rather than setting `holder: null`. Freeing a lane that
+   still has workers queued on it is its own wedge: a queued worker is parked on its poll loop
+   waiting to be woken, and re-requesting only reports the position it already has, so nothing
+   would ever grant. The lane goes genuinely free only when the queue is empty.
+3. **One boot revalidation, not two.** It runs in the reconcile pass before the grace window. A
+   second pass after the late burial would be indistinguishable from a no-op, because every burial
+   goes through `retireSession`, which already releases the lane and clears the queues. What the
+   boot pass uniquely catches is a holder the roster has never heard of -- a store left behind by an
+   earlier `sessions.json`, or a hand-edited file.
+4. **`JARVIS_BATON_STALE_MS`, and the sweep period derives from it** (clamped to [5s, 30s]). §4
+   calls five minutes a *default*; this is the knob that makes it one. Without it the sweep is
+   untestable except by waiting out five real minutes, which is how the half of a feature that fires
+   when nobody is watching goes unverified forever. Deriving the period from the window keeps the two
+   from disagreeing about how quickly a lane is actually reclaimed.
+5. **A grant is evented only on a QUEUE -> HOLDER transition.** A worker granted the lane
+   synchronously by its own request already has the answer in the response; waking it to repeat that
+   costs a turn for nothing.
+6. **Valid JSON of the wrong shape is treated as corrupt.** `backupCorrupt` on a parse failure alone
+   would let an array (or any non-map) fall through to an empty store, and the next save would
+   overwrite the only copy -- the one thing every state file here promises not to do.
+
+### Verified
+
+`npm run test:baton` (6 cases, real hub) + `test/baton.test.mjs` (10 cases, pure). Suite:
+**345/345/0** with the gate open, 326/19-skipped closed. Every assertion in both files was
+mutation-probed -- 50 probes, all caught -- per the house rule that a test which has never failed
+has not been shown to check anything. Three probes SURVIVED on the first pass and each was a real
+gap, not a probe error: the boot revalidation, the sweep timer and the reap-on-read were all being
+covered by whichever mechanism happened to fire first, so the tests were split until each pins the
+one thing it claims to.

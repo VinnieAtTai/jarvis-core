@@ -1101,3 +1101,199 @@ export function buildIdentity({ rev, status, bootedAt, pid } = {}) {
         pid: Number.isFinite(pid) ? pid : null,
     };
 }
+
+// —— Commit baton: one serialized merge lane per repo (docs/COMMIT-BATON-DESIGN.md, P2) ——————————
+// P1 (worktrees, above) isolates the FILESYSTEM so parallel workers stop clobbering each other. It
+// leaves the hard half open: once N workers each hold a `jarvis/<cs>` branch they all want to merge
+// into the same base, which is concurrent `git merge` on one branch, half-merged states when two land
+// seconds apart, and nobody knowing whose turn it is. The baton gates the MERGE LANE ONLY -- research,
+// planning, editing and committing inside your own worktree stay unrestricted and parallel.
+//
+// The decisions live here, pure, because they are the part worth pinning: who gets the lane, who
+// waits and in what order, and when a lane is taken back off a worker that died holding it. The hub
+// owns the file I/O, the git call that names the base, and pushing the grant event.
+//
+// INVARIANT, and every function below preserves it: at most one holder per lane, and a uid appears
+// AT MOST ONCE across holder+queue. Two entries for one uid is not cosmetic -- a release would grant
+// the lane to a worker that is already the holder and leave a phantom behind it forever.
+
+// How long a holder may be unseen before the lane is taken back. Deliberately longer than the
+// 2-minute gone-quiet threshold: a worker running a full build/test gate does not poll for minutes at
+// a stretch, and robbing it mid-merge is worse than a lane sitting idle a little longer.
+export const BATON_STALE_MS = 300000;
+
+// One participant, identity only. The timestamp is stamped by whoever builds the row rather than
+// here, because the two roles record genuinely different facts: a holder carries `takenAt` (when the
+// lane became yours) and a queued worker carries `since` (when you joined the line). Returns null for
+// anything with no usable uid, so a junk row is dropped rather than half-shaped.
+function batonParty(e) {
+    if (!e || typeof e !== 'object') return null;
+    const uid = String(e.uid == null ? '' : e.uid).trim();
+    if (!uid) return null;
+    return {
+        uid,
+        cs: e.cs ? String(e.cs) : null,
+        branch: e.branch ? String(e.branch) : null,
+        note: e.note == null ? '' : String(e.note),
+    };
+}
+// The two role stamps. Passing a party through asHolder DROPS `since` and vice versa, so a row's
+// shape always says which role it is in -- there is never a queue entry carrying a stale takenAt.
+const asHolder = (p, ts) => ({ ...p, takenAt: ts });
+const asQueued = (p, ts) => ({ ...p, since: ts });
+// The ISO stamp for a lane change, from the injected `now` (epoch ms or an ISO string) and NOTHING
+// else. Never falls back to a wall-clock read: these helpers stay a pure function of their arguments,
+// so an unreadable `now` yields a null timestamp rather than a value the caller did not supply.
+function batonTs(now) {
+    const t = typeof now === 'string' ? Date.parse(now) : Number(now);
+    return Number.isFinite(t) ? new Date(t).toISOString() : null;
+}
+
+// Coerce a stored lane into the current shape. Pure, invents no timestamps, and drops a uid that
+// appears more than once (see the invariant above) -- a hand-edited or half-written file must not be
+// able to seat one worker twice.
+export function normalizeLane(raw) {
+    const r = raw && typeof raw === 'object' ? raw : {};
+    const h = batonParty(r.holder);
+    const holder = h ? { ...h, takenAt: r.holder.takenAt ? String(r.holder.takenAt) : null } : null;
+    const seen = new Set(holder ? [holder.uid] : []);
+    const queue = [];
+    for (const q of (Array.isArray(r.queue) ? r.queue : [])) {
+        const p = batonParty(q);
+        if (!p || seen.has(p.uid)) continue;
+        seen.add(p.uid);
+        queue.push({ ...p, since: q.since ? String(q.since) : null });
+    }
+    return {
+        base: r.base ? String(r.base) : null,
+        holder,
+        queue,
+        lastHandoff: r.lastHandoff ? String(r.lastHandoff) : null,
+    };
+}
+
+// Ask for the lane. Free -> you hold it. Busy -> you are appended to the FIFO queue with your
+// position. IDEMPOTENT in both directions: re-requesting while you already hold it, or while you are
+// already queued, reports where you stand and adds nothing -- a worker that retries after a timeout
+// must not end up in the queue twice, or behind itself.
+//
+// FIFO with no priority field is the whole point (fairness is what makes serialization tolerable);
+// preemption stays a non-goal until a real case turns up.
+export function batonRequest(lane, req, now) {
+    const L = normalizeLane(lane);
+    const p = batonParty(req);
+    const held = L.holder ? (L.holder.cs || L.holder.uid) : null;
+    if (!p) return { lane: L, granted: false, position: null, holder: held, already: false };
+    if (L.holder && L.holder.uid === p.uid) return { lane: L, granted: true, position: 0, holder: held, already: true };
+    const qi = L.queue.findIndex(e => e.uid === p.uid);
+    if (qi >= 0) return { lane: L, granted: false, position: qi + 1, holder: held, already: true };
+    const ts = batonTs(now);
+    if (!L.holder) {
+        return { lane: { ...L, holder: asHolder(p, ts), lastHandoff: ts }, granted: true, position: 0, holder: p.cs || p.uid, already: false };
+    }
+    return { lane: { ...L, queue: [...L.queue, asQueued(p, ts)] }, granted: false, position: L.queue.length + 1, holder: held, already: false };
+}
+
+// Hand the lane on. Pops the FIFO queue and grants to the next in line, whose `since` becomes a
+// `takenAt`. A release by anyone who is NOT the holder is a no-op reporting `held:false` -- including
+// by someone sitting in the queue, who wants batonCancel instead. Making it a no-op rather than an
+// error matters on the retire path, which releases blind for every lane.
+export function batonRelease(lane, uid, now) {
+    const L = normalizeLane(lane);
+    const id = String(uid == null ? '' : uid).trim();
+    if (!id || !L.holder || L.holder.uid !== id) return { lane: L, held: false, grantedTo: null };
+    const ts = batonTs(now);
+    const [next, ...rest] = L.queue;
+    const grantedTo = next ? asHolder(batonParty(next), ts) : null;
+    return {
+        // lastHandoff means "when the lane last changed HANDS", so releasing to an empty queue leaves
+        // it alone: nobody took it, and claiming otherwise would misdate the last real handoff.
+        lane: { ...L, holder: grantedTo, queue: next ? rest : [], lastHandoff: grantedTo ? ts : L.lastHandoff },
+        held: true,
+        grantedTo,
+    };
+}
+
+// Drop out of the queue without ever holding (the task was dropped, or the worker changed its mind).
+// Reports `holding` when the caller is in fact the holder: that is a release, not a cancel, and
+// silently doing nothing there would leave the lane wedged by someone who believes they let it go.
+export function batonCancel(lane, uid) {
+    const L = normalizeLane(lane);
+    const id = String(uid == null ? '' : uid).trim();
+    const holding = !!(id && L.holder && L.holder.uid === id);
+    const queue = id ? L.queue.filter(e => e.uid !== id) : L.queue;
+    const dropped = L.queue.length - queue.length;
+    return { lane: dropped ? { ...L, queue } : L, dropped: dropped > 0, holding };
+}
+
+// The human's override: break a lane they think is stuck. `to` is who gets it next, or null.
+//
+// With a target: that worker becomes the holder and is removed from the queue if it was waiting, so
+// it cannot hold a place it now owns. The revoked holder is NOT put at the back of the queue -- the
+// human took the lane off it deliberately, and quietly re-queueing it would hand it straight back.
+//
+// With no target: revoke and POP THE QUEUE, rather than leaving the lane free with workers still
+// waiting on it. That combination is its own wedge: a queued worker is parked on its poll loop
+// waiting to be woken, and re-requesting only reports the position it already has, so nothing would
+// ever grant. "Free the lane" only means holder:null when the queue is genuinely empty.
+export function batonForce(lane, to, now) {
+    const L = normalizeLane(lane);
+    const ts = batonTs(now);
+    const revoked = L.holder;
+    const p = batonParty(to);
+    if (p) {
+        return {
+            lane: { ...L, holder: asHolder(p, ts), queue: L.queue.filter(e => e.uid !== p.uid), lastHandoff: ts },
+            revoked, grantedTo: asHolder(p, ts),
+        };
+    }
+    const [next, ...rest] = L.queue;
+    const grantedTo = next ? asHolder(batonParty(next), ts) : null;
+    return {
+        lane: { ...L, holder: grantedTo, queue: next ? rest : [], lastHandoff: grantedTo ? ts : L.lastHandoff },
+        revoked, grantedTo,
+    };
+}
+
+// Take the lane back off a holder that is gone, and clear dead workers out of the queue, in one pass.
+// A lane that depends on a worker staying healthy is a lane that wedges: this is the same failure
+// mode that took primeng down on 2026-07-24, and a merge queue nobody can enter is worse than no
+// queue at all.
+//
+// `seenAt(uid)` answers when the hub last saw that session -- epoch ms or an ISO string -- or null
+// when it is retired or not in the roster at all. Two separate verdicts come out of that:
+//   null      -> gone, revoke NOW. Nothing to wait for; the session does not exist any more.
+//   too old   -> unseen for >= staleMs, revoke. Note this is NOT the hub's 2-minute aliveNow window:
+//                the spec asks for "aliveNow false for > BATON_STALE_MS", which a boolean cannot
+//                express without the lane remembering when it first read dead. Measuring the one
+//                signal directly gives the same 5-minute guarantee with no extra persisted state and
+//                no ratchet to re-arm after a restart.
+// `staleMs` of Infinity therefore means "sweep only what is provably gone, ignore staleness" -- which
+// is exactly what a boot revalidation needs, because right after a restart every survivor's lastSeen
+// is frozen at whatever it was before the hub went down and would read as 5 minutes quiet.
+// An unreadable `now` spares every live entry rather than reaping the lane on a bad clock.
+export function batonReap(lane, seenAt, now, staleMs = BATON_STALE_MS) {
+    const L = normalizeLane(lane);
+    const t = Number(typeof now === 'string' ? Date.parse(now) : now);
+    const gone = (e) => {
+        if (!e) return false;
+        let seen = null;
+        try { seen = seenAt ? seenAt(e.uid) : null; } catch { seen = null; }
+        if (seen == null) return true;
+        const at = typeof seen === 'number' ? seen : Date.parse(seen);
+        if (!Number.isFinite(at) || !Number.isFinite(t)) return false;
+        return (t - at) >= staleMs;
+    };
+    const dropped = L.queue.filter(gone);
+    const queue = L.queue.filter(e => !gone(e));
+    if (!gone(L.holder)) {
+        return { lane: dropped.length ? { ...L, queue } : L, revoked: null, dropped, grantedTo: null };
+    }
+    const ts = batonTs(now);
+    const [next, ...rest] = queue;
+    const grantedTo = next ? asHolder(batonParty(next), ts) : null;
+    return {
+        lane: { ...L, holder: grantedTo, queue: next ? rest : [], lastHandoff: grantedTo ? ts : L.lastHandoff },
+        revoked: L.holder, dropped, grantedTo,
+    };
+}

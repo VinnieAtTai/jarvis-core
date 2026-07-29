@@ -15,6 +15,7 @@
         "test:credit": "set JARVIS_INTEGRATION=1&& node --test test/credit.test.mjs",
         "test:spawnslot": "set JARVIS_INTEGRATION=1&& node --test test/spawnslot.test.mjs",
         "test:schedulenudge": "set JARVIS_INTEGRATION=1&& node --test test/schedulenudge.test.mjs",
+        "test:baton": "set JARVIS_INTEGRATION=1&& node --test test/batonhttp.test.mjs",
         "test:integration": "set JARVIS_INTEGRATION=1&& node --test"
     },
     "dependencies": {
