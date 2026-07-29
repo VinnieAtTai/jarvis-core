@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, unlinkSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, unlinkSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:http';
@@ -66,6 +67,10 @@ const AI_SPEND = join(DATA, 'ai-spend.json');        // conversational-tab month
 // value means "no cap" (see capExceeded), so a clean default is enforced here.
 const AI_CAP = (() => { const v = Number(process.env.JARVIS_AI_CAP); return v > 0 ? v : 20; })();
 const ARCHIVE = join(DATA, 'archive');
+// The transcript ARCHIVE: every line trimTranscript() takes off the front of the display cache, in
+// the order it left. Append-only, never rewritten, and read by GET /search alongside the cache.
+// Not to be confused with ARCHIVE above, which is a DIRECTORY of one JSON epitaph per retired session.
+const TRANSCRIPT_ARCHIVE = join(DATA, 'transcript-archive.jsonl');
 const WORKER_DOC = join(HERE, 'WORKER.md');
 const PORT = Number(process.env.JARVIS_PORT || 8124);
 const ORIGIN = `http://127.0.0.1:${PORT}`;
@@ -77,6 +82,29 @@ const NATO = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', '
 // past it, so the (atomic) file rewrite happens every ~SLACK events, not on every append.
 const CACHE_CAP = 5000;
 const CACHE_SLACK = 1000;
+// How much of the transcript archive GET /search reads, and how much of it is ever resident.
+//
+// The archive is walked BACKWARDS in ARCHIVE_CHUNK_BYTES slices — newest first, which is the order a
+// search wants anyway — so peak memory is one slice, not the file. That makes the byte cap a LATENCY
+// bound rather than a memory one: it exists so one search cannot spend seconds of the hub's single
+// thread, not to stop the archive growing.
+//
+// Sized on measurement, not guesswork: the live transcript held 5510 lines at ~285 bytes each over the
+// seven days to 2026-07-29, so the cache cap is reached about weekly and the archive will grow ~11 MB
+// a month. 64 MiB is therefore roughly six months of history, worst case ~1s of scanning broken across
+// ~64 awaits so long-polls keep being served. Raising it is this one constant — and when the cap DOES
+// clip, /search says so (`archive.capped` + `archive.oldestScannedTs`) and the hub logs it, so a search
+// never answers "no such chat" about history it declined to read.
+//
+// The env override exists so the bounded-scan behaviour is testable without a 64 MiB fixture; the chunk
+// size deliberately has no override, because a seam bug that only appears at the real 1 MiB boundary is
+// exactly what a shrunk-for-tests chunk would hide.
+const ARCHIVE_SCAN_CAP_BYTES = (() => { const v = Number(process.env.JARVIS_ARCHIVE_SCAN_CAP); return v > 0 ? v : 64 * 1024 * 1024; })();
+const ARCHIVE_CHUNK_BYTES = 1024 * 1024;
+// How far back archiveTailLine() reads to recognise an already-archived batch. Declared up here with
+// the other bounds rather than beside its function, because the boot-time trimTranscript() below runs
+// before that point in the file and a const — unlike a function declaration — does not hoist its value.
+const ARCHIVE_TAIL_WINDOW = 64 * 1024;
 
 mkdirSync(DATA, { recursive: true });
 mkdirSync(ARCHIVE, { recursive: true });
@@ -352,12 +380,174 @@ function saveRosterThrottled() {
     const now = Date.now();
     if (now - lastRosterFlush >= ROSTER_FLUSH_MS) { lastRosterFlush = now; saveRoster(); }
 }
-// Keep the display cache + its file bounded. The transcript is display-only (not index-
-// referenced), so trimming the front is safe; we rewrite the file from the capped cache.
+// Keep the display cache + its file bounded WITHOUT losing what comes off the front.
+//
+// This used to say trimming the front was safe "because the transcript is display-only (not index-
+// referenced)". That premise died the day GET /search shipped: the transcript stopped being a scroll-back
+// buffer and became the searchable record of every conversation, so this function was quietly deleting
+// that record a week at a time. Measured on the live hub before the fix — 5510 lines, oldest
+// 2026-07-22T10:56Z, i.e. exactly the seven days the cap holds — against a human who expected to search
+// months. The cache still has to be bounded (it is walked synchronously by /transcript and /search);
+// what changes is where the dropped lines GO.
+//
+// Order matters, and it is chosen for the survivable failure. The batch is appended to the archive
+// FIRST and the trimmed transcript is written only after. A crash between the two therefore re-archives
+// the same batch on the next boot — duplicate lines — whereas the reverse order loses them outright,
+// which is the bug this is fixing. archiveTranscriptLines() then catches that replay: the batch boundary
+// is deterministic (the same splice recomputed from the same file), so if the archive already ends with
+// the batch's last line, it has already taken this batch.
+//
+// And if the archive will not take them at all, the whole trim is abandoned rather than completed
+// lossily: an over-cap cache is bounded and self-healing (the next record() retries), while a trim whose
+// archive write failed is the original bug back again.
 function trimTranscript() {
     if (transcriptCache.length <= CACHE_CAP + CACHE_SLACK) return;
-    transcriptCache.splice(0, transcriptCache.length - CACHE_CAP);
+    const cut = transcriptCache.length - CACHE_CAP;
+    try { archiveTranscriptLines(transcriptCache.slice(0, cut)); }
+    catch (e) { logCrash('transcript-archive-append-failed (trim abandoned, nothing dropped)', e); return; }
+    transcriptCache.splice(0, cut);
     atomicWrite(TRANSCRIPT, transcriptCache.map(e => JSON.stringify(e)).join('\n') + (transcriptCache.length ? '\n' : ''));
+}
+// Append a trimmed batch to the archive, unless the archive already ends with it (see trimTranscript).
+// Throws on a write failure — deliberately, because the caller must not drop lines the archive refused.
+function archiveTranscriptLines(entries) {
+    if (!entries.length) return;
+    const lines = entries.map(e => JSON.stringify(e));
+    if (archiveTailLine() === lines[lines.length - 1]) {
+        logCrash('transcript-archive-replay', new Error('archive already ends with this batch of '
+            + lines.length + ' lines (a crash between the append and the transcript rewrite); not re-appending'));
+        return;
+    }
+    appendFileSync(TRANSCRIPT_ARCHIVE, lines.join('\n') + '\n');
+}
+// The archive's last line, or null. Reads only the tail because the archive is months of chat and this
+// runs on every trim. A line longer than the window reads back partial and so will not match, which
+// costs a duplicate append rather than a lost batch — the same direction the ordering above is chosen for.
+function archiveTailLine() {
+    try {
+        if (!existsSync(TRANSCRIPT_ARCHIVE)) return null;
+        const size = statSync(TRANSCRIPT_ARCHIVE).size;
+        if (!size) return null;
+        const want = Math.min(size, ARCHIVE_TAIL_WINDOW);
+        const fd = openSync(TRANSCRIPT_ARCHIVE, 'r');
+        try {
+            const buf = Buffer.allocUnsafe(want);
+            readSync(fd, buf, 0, want, size - want);
+            const parts = buf.toString('utf8').split('\n').filter(Boolean);
+            return parts.length ? parts[parts.length - 1].replace(/\r$/, '') : null;
+        } finally { closeSync(fd); }
+    } catch (e) { logCrash('transcript-archive-tail-read-failed', e); return null; }
+}
+// Walk the archive NEWEST-FIRST in bounded slices, handing each raw JSONL line to onLine().
+//
+// Backwards because that is the order search needs, and because it makes the cap mean "the newest N
+// bytes of history" instead of the oldest. Three details are load-bearing:
+//   - Slices are stitched as BUFFERS, split on the newline byte, and only then decoded. Decoding a slice
+//     that begins mid-character would plant a replacement glyph in the partial line at its front, and
+//     that line is precisely the one carried down to be completed by the next slice. 0x0A cannot occur
+//     inside a multi-byte UTF-8 sequence, so splitting bytes first is exact where splitting text is not.
+//   - The carry is COPIED out of the slice. A subarray keeps its whole 1 MiB backing buffer alive, which
+//     would turn a bounded scan into one retained megabyte per iteration.
+//   - The size is snapshotted before the first read. The archive is append-only, so a concurrent trim can
+//     only add bytes ABOVE the snapshot and can never move the ones being read — which is also why there
+//     is no rotation: renaming segments mid-scan would invalidate every offset below.
+async function scanArchiveBackwards(onLine, capBytes = ARCHIVE_SCAN_CAP_BYTES) {
+    const stats = { searched: false, lines: 0, bytes: 0, capped: false, oldestScannedTs: null };
+    if (!existsSync(TRANSCRIPT_ARCHIVE)) return stats;
+    let fh = null;
+    try {
+        fh = await open(TRANSCRIPT_ARCHIVE, 'r');
+        const st = await fh.stat();
+        // "No archive yet" and "an archive I cannot read" are different answers and must not collapse
+        // into the same one. An absent or empty file is the honest searched:false above; anything else
+        // that is not a plain file is a fault, and a search has to say so rather than quietly report a
+        // cache-only result as though that were all of history. (Windows opens a DIRECTORY without
+        // complaint and stats it at size 0, which is exactly how that collapse gets in.)
+        if (!st.isFile()) throw new Error('archive path is not a regular file');
+        const size = st.size;
+        if (!size) return stats;
+        stats.searched = true;
+        let last = null;
+        const emit = (slice) => {
+            const line = slice.toString('utf8').replace(/\r$/, '');
+            if (!line) return;
+            stats.lines++; last = line; onLine(line);
+        };
+        let pos = size, carry = Buffer.alloc(0);
+        while (pos > 0 && stats.bytes < capBytes) {
+            const want = Math.min(ARCHIVE_CHUNK_BYTES, pos, capBytes - stats.bytes);
+            // A zero-length slice would read nothing and leave `pos` where it was: an infinite loop on
+            // the hub's only thread, which takes voice, the console and every long-poll down with it.
+            // The while condition already prevents that, so this line is REDUNDANT BY DESIGN and both
+            // mutation probes against it survive as equivalent mutants -- either guard alone terminates
+            // the loop and enforces the cap. Kept anyway, and the redundancy noted rather than removed:
+            // the probe that deleted the while condition HUNG rather than failing, which is how it became
+            // clear that termination rested entirely on a bound three lines away.
+            if (want <= 0) break;
+            const start = pos - want;
+            const buf = Buffer.allocUnsafe(want);
+            await fh.read(buf, 0, want, start);
+            stats.bytes += want;
+            const block = carry.length ? Buffer.concat([buf, carry]) : buf;
+            let end = block.length;
+            for (;;) {
+                if (end <= 0) break;
+                const nl = block.lastIndexOf(0x0a, end - 1);
+                if (nl < 0) break;
+                emit(block.subarray(nl + 1, end));
+                end = nl;
+            }
+            carry = Buffer.from(block.subarray(0, end));
+            pos = start;
+        }
+        // Only a scan that reached byte 0 has seen the whole archive; the first line of the file has no
+        // newline before it, so it arrives as the final carry rather than through the loop above.
+        if (pos === 0 && carry.length) emit(carry);
+        stats.capped = pos > 0;
+        if (last) { const m = /"ts":"([^"]*)"/.exec(last); stats.oldestScannedTs = m ? m[1] : null; }
+        return stats;
+    } catch (e) {
+        // A search that cannot read the archive must say so, not quietly answer from the cache alone.
+        logCrash('transcript-archive-read-failed', e);
+        stats.error = String((e && e.message) || e);
+        return stats;
+    } finally {
+        if (fh) { try { await fh.close(); } catch { } }
+    }
+}
+// One predicate and one projection for BOTH halves of a search, so the cache walk and the archive walk
+// can never drift into answering differently about the same line. Returns the hit, or null for a miss.
+function searchProject(e, want, terms, fromWant, missionWant) {
+    if (!e || !want[e.kind]) return null;
+    if (missionWant && e.missionId !== missionWant) return null;
+    const who = e.kind === 'speech' ? 'you' : e.kind === 'sys' ? 'sys' : (e.from || 'jarvis');
+    if (fromWant && who.toLowerCase() !== fromWant) return null;
+    const hay = String(e.text == null ? '' : e.text).toLowerCase();
+    if (!terms.every(t => hay.includes(t))) return null;
+    return {
+        ts: e.ts,
+        kind: e.kind === 'sys' ? 'sys' : e.kind === 'react' ? 'react' : 'msg',
+        srcKind: e.kind,
+        who,
+        to: e.to || null,
+        missionId: e.missionId || null,
+        img: e.img || null,
+        text: e.text,
+        ...(e.kind === 'react' ? { target: e.target, reaction: e.reaction } : {}),
+    };
+}
+// Say the cap out loud. Loudly ONCE in the transcript, because a search box fires a request every few
+// keystrokes and a sys line per capped search would bury the conversation being searched; on stdout
+// every time, where it costs nothing and lands in the watchdog log.
+let archiveCapAnnounced = false;
+function noteArchiveCapped(stats) {
+    const mb = Math.round(ARCHIVE_SCAN_CAP_BYTES / (1024 * 1024));
+    console.warn('[search] archive scan stopped at the ' + mb + ' MB cap; chat older than '
+        + stats.oldestScannedTs + ' was not read');
+    if (archiveCapAnnounced) return;
+    archiveCapAnnounced = true;
+    record({ kind: 'sys', text: 'search: the chat archive is bigger than the ' + mb + ' MB scan cap, so chat older than '
+        + stats.oldestScannedTs + ' is archived but not being searched. Raise JARVIS_ARCHIVE_SCAN_CAP to reach it.' });
 }
 // Cap the event bus. The poll cursor is an ABSOLUTE event index, so dropping k entries off the
 // front means bumping busBase by k (and persisting it): busBase + bus.length stays constant as
@@ -3183,9 +3373,16 @@ async function handleRequest(req, res) {
         }));
         return json(res, 200, lim > 0 ? evts.slice(-lim) : evts);
     }
-    // Chat search over the transcript -- "a search for chats would be legit". transcriptCache IS the
-    // whole transcript (loaded at boot, appended by record()), so this is an in-memory filter: no file
-    // I/O, nothing to page, and the CACHE_CAP trim above is the only thing that ages a hit out.
+    // Chat search over the transcript -- "a search for chats would be legit".
+    //
+    // v1 said transcriptCache "IS the whole transcript ... the CACHE_CAP trim above is the only thing
+    // that ages a hit out". Both halves of that were true and the second one was the bug: the trim ages
+    // out EVERYTHING older than 5000 lines, which measured out at seven days, so a search sold as
+    // covering months could only ever see the last week of it. The trim now archives instead of
+    // deleting (see trimTranscript), and this route reads the cache AND that archive.
+    //
+    // Always-on, never a flag. An `archive=1` opt-in would have left the exact original bug in place for
+    // anyone who did not know to pass it, which is everyone using the search box.
     //
     // A hit is deliberately GET /transcript's projection, field for field, so a console search box can
     // render results with the code it already has. srcKind is the one addition: /transcript collapses
@@ -3235,33 +3432,47 @@ async function handleRequest(req, res) {
         const lim = Math.min(Number.isFinite(askedLim) && askedLim > 0 ? askedLim : LIMIT_DEFAULT, LIMIT_MAX);
 
         // NEWEST FIRST -- a search across months of history that hands back the oldest match first is
-        // useless -- so walk the cache backwards. `total` keeps counting past the limit so a caller can
-        // say "50 of 347" instead of pretending 50 was all there was.
+        // useless. Cache backwards, THEN archive backwards: every archived line is older than every
+        // cached one by construction (the archive is what fell off the cache's front), so those two
+        // walks concatenated are already in descending order and nothing needs sorting. `total` keeps
+        // counting past the limit so a caller can say "50 of 347" instead of pretending 50 was all
+        // there was -- which is why the archive is scanned even once the page is full.
         const hits = [];
         let total = 0;
+        const take = (hit) => { if (hit) { total++; if (hits.length < lim) hits.push(hit); } };
         for (let i = transcriptCache.length - 1; i >= 0; i--) {
-            const e = transcriptCache[i];
-            if (!want[e.kind]) continue;
-            if (missionWant && e.missionId !== missionWant) continue;
-            const who = e.kind === 'speech' ? 'you' : e.kind === 'sys' ? 'sys' : (e.from || 'jarvis');
-            if (fromWant && who.toLowerCase() !== fromWant) continue;
-            const hay = String(e.text == null ? '' : e.text).toLowerCase();
-            if (!terms.every(t => hay.includes(t))) continue;
-            total++;
-            if (hits.length >= lim) continue;
-            hits.push({
-                ts: e.ts,
-                kind: e.kind === 'sys' ? 'sys' : e.kind === 'react' ? 'react' : 'msg',
-                srcKind: e.kind,
-                who,
-                to: e.to || null,
-                missionId: e.missionId || null,
-                img: e.img || null,
-                text: e.text,
-                ...(e.kind === 'react' ? { target: e.target, reaction: e.reaction } : {}),
-            });
+            take(searchProject(transcriptCache[i], want, terms, fromWant, missionWant));
         }
-        return json(res, 200, { q, terms, kinds, limit: lim, total, truncated: total > hits.length, results: hits });
+        // Then the history the cache no longer holds. A raw-substring prefilter keeps JSON.parse off the
+        // ~99% of archived lines that cannot match: the projected text is a verbatim substring of its
+        // JSONL line, so a line missing the term cannot hold it after parsing either. That only holds for
+        // terms JSON does not rewrite, though -- a term containing a quote or a backslash appears escaped
+        // in the line and the prefilter would MISS it -- so those terms are excluded from the prefilter
+        // rather than trusted, which costs speed on an exotic query instead of correctness.
+        const plainTerms = terms.filter(t => !/["\\]/.test(t) && ![...t].some(c => c.charCodeAt(0) < 32));
+        const archive = await scanArchiveBackwards((line) => {
+            const low = line.toLowerCase();
+            for (const t of plainTerms) if (!low.includes(t)) return;
+            let e = null;
+            try { e = JSON.parse(line); } catch { return; }
+            take(searchProject(e, want, terms, fromWant, missionWant));
+        });
+        if (archive.capped) noteArchiveCapped(archive);
+        // `archive` is additive: every field a caller had in v1 keeps its name and meaning, so a console
+        // box written against the old shape renders this unchanged. It is here because a bounded read
+        // that does not report its bound is indistinguishable from a complete one.
+        return json(res, 200, {
+            q, terms, kinds, limit: lim, total, truncated: total > hits.length, results: hits,
+            archive: {
+                searched: archive.searched,
+                lines: archive.lines,
+                bytes: archive.bytes,
+                cap: ARCHIVE_SCAN_CAP_BYTES,
+                capped: archive.capped,
+                oldestScannedTs: archive.oldestScannedTs,
+                ...(archive.error ? { error: archive.error } : {}),
+            },
+        });
     }
     // The durable, mission-keyed conversation thread: every event tagged with this missionId, plus
     // any message bused to a worker currently bound to the mission's project. Survives sub-worker
