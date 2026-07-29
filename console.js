@@ -370,8 +370,100 @@ function pinStripFor(show) {
         + '<span class="pincaret">' + (pinStripOpen ? '▾' : '▸') + '</span> 📌 PINNED <span class="pincount">' + pins.length + '</span></div>'
         + body + '</div>';
 }
+// One chat bubble. Lifted out of renderChat so the SEARCH view renders hits with exactly the
+// markup the live chat uses (reactions, pin, copy and all) instead of a second set of markup that
+// would drift. `_search` is the only behavioural difference: it always shows the sender chip and
+// switches the timestamp to a date-aware one. Dividers are handled here too, as they were inline.
+function chatBubble(g, reactMap, _mission, _search) {
+    if (g.divider) return '<div class="divider">&#9472;&#9472; ' + esc(g.divider) + ' &#9472;&#9472;</div>';
+    const me = g.who === 'you';
+    const chip = (!me && (_search || (g.who !== 'jarvis' && (_mission || g.who !== focusCS)))) ? '<span class="chip">' + esc(g.who.toUpperCase()) + ' &#183; </span>' : '';
+    const cur = reactMap[g.ts];
+    // Ordered happiest -> poop: squee, fire, love, up (positives, descending), then down, poop.
+    const reactBar = '<span class="reacts">' + ['squee', 'fire', 'love', 'up', 'down', 'poop'].map(k => '<span class="rx' + (cur === k ? ' on' : '') + '" data-react="' + k + '" data-ts="' + escAttr(g.ts || '') + '">' + REMOJI[k] + '</span>').join('') + '</span>';
+    // Pin toggle (mirrors .copybtn placement). Reads pinnedMsgs each render so pins survive the
+    // poll re-render and reload; a pinned bubble gets a subtle highlight class + filled pin.
+    const _key = msgKey(g.who, g.ts), _pinned = pinnedMsgs.has(_key);
+    const pinBtn = '<span class="pinbtn' + (_pinned ? ' on' : '') + '" data-pin="' + escAttr(_key) + '" title="' + (_pinned ? 'unpin this message' : 'pin / bookmark this message') + '">' + (_pinned ? '📌' : '📍') + '</span>';
+    return '<div class="row ' + (me ? 'me' : 'them') + '" data-mkey="' + escAttr(_key) + '"><div class="bubble' + (_pinned ? ' pinned' : '') + '">' + chip
+        + richText(g.texts.join('\n'))
+        + (g.img ? '<br><a href="' + g.img + '" target="_blank"><img src="' + g.img + '" class="thumb"></a>' : '')
+        + '<span class="t">' + (_search ? fmtWhen(g.ts) : fmtHM(g.ts)) + '</span>'
+        + '<span class="copybtn" data-c="' + btoa(unescape(encodeURIComponent(g.texts.join('\n')))) + '" title="copy markdown">📋</span>' + '<span class="htmlbtn" data-copyhtml="' + b64(g.texts.join('\n')) + '" title="copy formatted — paste into email or docs with styling">html</span>' + pinBtn + reactBar + '</div></div>';
+}
+// ---- Chat search ------------------------------------------------------------------------------
+// GET /search over the whole transcript, rendered into #chat in place of the live conversation.
+// searchHits === null means "not searching" -- an EMPTY ARRAY is a real result (no matches) and
+// must still show the results view, so every check here is against null, never truthiness of len.
+let searchHits = null;      // null = live chat; array = the hits on screen
+let searchMeta = null;      // {q, total, shown, truncated} -- what the header states
+let searchRendered = '';    // signature of what is already in #chat. renderChat is called every
+                            // 1.5s by the board poll, and rebuilding innerHTML resets scrollTop,
+                            // so an unchanged result set must NOT be re-rendered.
+const qboxEl = document.getElementById('qbox');
+const qexitEl = document.getElementById('qexit');
+function searchSig() { return searchMeta ? searchMeta.q + String.fromCharCode(31) + searchMeta.total + String.fromCharCode(31) + searchMeta.shown : ''; }
+async function runSearch() {
+    const q = (qboxEl.value || '').trim();
+    if (!q) { exitSearch(); return; }
+    if (rawMode) setRaw(false);   // hits render into #chat, which RAW hides
+    let r;
+    try {
+        const resp = await fetch('/search?q=' + encodeURIComponent(q));
+        // A hub build without /search does NOT 404 -- the server falls through to serving
+        // console.html with a 200, so .json() would throw a confusing SyntaxError. Name the real
+        // cause instead: the endpoint ships in the code but needs a hub restart to be live.
+        const ct = resp.headers.get('content-type') || '';
+        if (!ct.includes('json')) { uiToast('This hub build has no /search yet -- use JARVIS > Restart & deploy, then search again.', 'error'); return; }
+        r = await resp.json();
+    } catch { uiToast('Search failed - could not reach the hub.', 'error'); return; }
+    if (r && r.error) { uiToast(r.error, 'error'); return; }
+    searchHits = Array.isArray(r.results) ? r.results : [];
+    searchMeta = { q, total: r.total || 0, shown: searchHits.length, truncated: !!r.truncated };
+    searchRendered = '';
+    qexitEl.style.display = 'inline-block';
+    renderChat();
+}
+// Back out to the live chat. Safe to call when not searching.
+function exitSearch() {
+    if (searchHits === null) return;
+    searchHits = null; searchMeta = null; searchRendered = '';
+    qexitEl.style.display = 'none';
+    renderChat();
+}
+// Count line for the search header. Pure, and unit-tested (test/searchbox.test.mjs) because the
+// honesty of it is the point: when the server truncates it hands back `total` precisely so this can
+// say "newest 50 of 347" rather than showing 50 rows that imply 50 was everything.
+function searchCountLabel(shown, total, truncated) {
+    if (!total) return 'no matches';
+    if (truncated) return 'newest ' + shown + ' of ' + total;
+    return total + (total === 1 ? ' match' : ' matches');
+}
+function renderSearch() {
+    const sig = searchSig();
+    if (sig === searchRendered) return;   // already on screen -- do not stomp the scroll position
+    searchRendered = sig;
+    const m = searchMeta;
+    const head = '<div class="shead"><span class="scount">' + esc(searchCountLabel(m.shown, m.total, m.truncated)) + '</span> for <b>' + esc(m.q) + '</b>'
+        + '<span class="sexit" data-sexit="1" title="back to the live chat">&#10005; back to chat</span></div>';
+    // Each hit is its own bubble: results are newest-first and non-adjacent, so the chat's
+    // "merge consecutive lines from one sender" grouping would join unrelated matches.
+    const body = searchHits.length
+        ? searchHits.map(h => chatBubble({ who: h.who, texts: [h.text == null ? '' : h.text], ts: h.ts, lastTs: h.ts, img: h.img }, {}, false, true)).join('')
+        : '<div class="snote">No matches for <b>' + esc(m.q) + '</b>.<br>Search covers your speech and session chat. All terms must appear in the same line.</div>';
+    chatEl.innerHTML = head + body;
+    chatEl.scrollTop = 0;   // newest match is first
+}
+qboxEl.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); runSearch(); }
+    else if (e.key === 'Escape') { qboxEl.value = ''; exitSearch(); qboxEl.blur(); }
+    e.stopPropagation();   // 't' and 'r' are global view hotkeys -- typing them must not toggle the view
+});
+qexitEl.onclick = () => { qboxEl.value = ''; exitSearch(); };
+
 function renderChat() {
     renderTabs();
+    if (searchHits !== null) { renderSearch(); return; }
     const reactMap = {};
     for (const e of chatEvts) if (e.kind === 'react' && e.target) reactMap[e.target] = e.reaction;
     const groups = [];
@@ -388,23 +480,7 @@ function renderChat() {
     // In a mission chat, always label each bubble by its sending worker (never suppress the chip
     // against focusCS) — the whole point is telling several workers apart in one aggregated chat.
     const _mission = activeTab.startsWith('m:');
-    chatEl.innerHTML = missionFilterBar() + pinStripFor(show) + show.map(g => {
-        if (g.divider) return '<div class="divider">&#9472;&#9472; ' + esc(g.divider) + ' &#9472;&#9472;</div>';
-        const me = g.who === 'you';
-        const chip = (!me && g.who !== 'jarvis' && (_mission || g.who !== focusCS)) ? '<span class="chip">' + esc(g.who.toUpperCase()) + ' &#183; </span>' : '';
-        const cur = reactMap[g.ts];
-        // Ordered happiest -> poop: squee, fire, love, up (positives, descending), then down, poop.
-        const reactBar = '<span class="reacts">' + ['squee', 'fire', 'love', 'up', 'down', 'poop'].map(k => '<span class="rx' + (cur === k ? ' on' : '') + '" data-react="' + k + '" data-ts="' + escAttr(g.ts || '') + '">' + REMOJI[k] + '</span>').join('') + '</span>';
-        // Pin toggle (mirrors .copybtn placement). Reads pinnedMsgs each render so pins survive the
-        // poll re-render and reload; a pinned bubble gets a subtle highlight class + filled pin.
-        const _key = msgKey(g.who, g.ts), _pinned = pinnedMsgs.has(_key);
-        const pinBtn = '<span class="pinbtn' + (_pinned ? ' on' : '') + '" data-pin="' + escAttr(_key) + '" title="' + (_pinned ? 'unpin this message' : 'pin / bookmark this message') + '">' + (_pinned ? '📌' : '📍') + '</span>';
-        return '<div class="row ' + (me ? 'me' : 'them') + '" data-mkey="' + escAttr(_key) + '"><div class="bubble' + (_pinned ? ' pinned' : '') + '">' + chip
-            + richText(g.texts.join('\n'))
-            + (g.img ? '<br><a href="' + g.img + '" target="_blank"><img src="' + g.img + '" class="thumb"></a>' : '')
-            + '<span class="t">' + fmtHM(g.ts) + '</span>'
-            + '<span class="copybtn" data-c="' + btoa(unescape(encodeURIComponent(g.texts.join('\n')))) + '" title="copy markdown">📋</span>' + '<span class="htmlbtn" data-copyhtml="' + b64(g.texts.join('\n')) + '" title="copy formatted — paste into email or docs with styling">html</span>' + pinBtn + reactBar + '</div></div>';
-    }).join('');
+    chatEl.innerHTML = missionFilterBar() + pinStripFor(show) + show.map(g => chatBubble(g, reactMap, _mission)).join('');
     rawEl.innerHTML = chatEvts.slice(-200).reverse().map(e =>
         '<div>[' + fmtHMS(e.ts) + '] <b>' + esc(e.kind === 'sys' ? 'SYS' : (e.who === 'you' ? 'YOU' : String(e.who).toUpperCase())) + '</b> ' + esc(e.text) + '</div>'
     ).join('');
@@ -433,6 +509,8 @@ function flashMsg(key) {
     if (b) { b.classList.add('pinflash'); setTimeout(() => b.classList.remove('pinflash'), 1400); }
 }
 chatEl.addEventListener('click', (e) => {
+    // "back to chat" in the search header -- same exit as the bar button and Esc.
+    if (e.target.closest && e.target.closest('[data-sexit]')) { qboxEl.value = ''; exitSearch(); return; }
     // Pin toggle on a bubble — flip localStorage state, re-render so the strip + highlight update.
     const pb = e.target.closest ? e.target.closest('[data-pin]') : null;
     if (pb) {
@@ -569,6 +647,21 @@ let schedFilter = 'all';   // SCHEDULE panel pills: 'all' | 'meetings' | 'tasks'
 // schedule column right-aligns cleanly (no ragged "9:00 AM" vs "12:00 PM").
 function fmtHM(iso) { if (!iso) return ''; const d = new Date(iso); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
 function fmtHMS(iso) { if (!iso) return ''; const d = new Date(iso); return fmtHM(iso) + ':' + String(d.getSeconds()).padStart(2, '0'); }
+// Timestamp for a SEARCH hit. The chat uses fmtHM (time only) because everything on screen is from
+// the last few minutes; search reaches back months, where a bare "14:32" actively reads as today.
+// So: today -> "14:32", earlier this year -> "Jun 3 14:32", another year -> "Jun 3 2025 14:32".
+// Pure, with `now` injectable, so it is unit-testable (test/searchbox.test.mjs).
+function fmtWhen(iso, now) {
+    const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    const n = now ? new Date(now) : new Date();
+    const hm = fmtHM(iso);
+    if (d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate()) return hm;
+    const day = MON[d.getMonth()] + ' ' + d.getDate();
+    return (d.getFullYear() === n.getFullYear() ? day : day + ' ' + d.getFullYear()) + ' ' + hm;
+}
 // human countdown to a future ms-delta: "in 8 min" / "in 1 hr 20 min"
 function fmtCountdown(ms) {
     const totalMin = Math.round(ms / 60000);
@@ -1623,6 +1716,7 @@ document.getElementById('stabs').onclick = (e) => {
     const t = e.target.closest ? e.target.closest('[data-tab]') : null;
     if (!t) return;
     activeTab = t.getAttribute('data-tab');
+    qboxEl.value = ''; exitSearch();   // a tab click means 'show me that chat', not 'stay in results'
     renderChat();
 };
 // "+" tab → inline composer with two modes. Repo: pick a repo + purpose. Meeting: pick a
