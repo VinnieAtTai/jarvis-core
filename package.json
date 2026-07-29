@@ -17,6 +17,7 @@
         "test:schedulenudge": "set JARVIS_INTEGRATION=1&& node --test test/schedulenudge.test.mjs",
         "test:baton": "set JARVIS_INTEGRATION=1&& node --test test/batonhttp.test.mjs",
         "test:delegate": "set JARVIS_INTEGRATION=1&& node --test test/delegate.test.mjs",
+        "test:search": "set JARVIS_INTEGRATION=1&& node --test test/search.test.mjs",
         "test:integration": "set JARVIS_INTEGRATION=1&& node --test"
     },
     "dependencies": {

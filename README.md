@@ -77,6 +77,7 @@ Workers follow [WORKER.md](WORKER.md) (served live at `GET /protocol`).
 | `POST /repos {name, cwd, defaultPurpose?, permissionMode?}` | register a spawnable workspace |
 | `POST /hear {text}` | inject an utterance as if spoken (testing / typing) |
 | `GET /roster` / `GET /board` / `GET /worklist` / `GET /transcript?limit=` | state reads |
+| `GET /search?q=&kinds=&from=&missionId=&limit=` | chat search over the transcript: terms ANDed, case-insensitive, newest first. Defaults to the conversation (`speech`/`chat`/`tts`); `kinds=all` or a comma-list widens into `sys`/`task`/`react` |
 
 ## Files (all in `JARVIS_DATA`, default this folder)
 
