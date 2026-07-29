@@ -13,6 +13,7 @@
         "test:store": "set JARVIS_INTEGRATION=1&& node --test test/store.test.mjs",
         "test:report": "set JARVIS_INTEGRATION=1&& node --test test/report.test.mjs",
         "test:credit": "set JARVIS_INTEGRATION=1&& node --test test/credit.test.mjs",
+        "test:spawnslot": "set JARVIS_INTEGRATION=1&& node --test test/spawnslot.test.mjs",
         "test:integration": "set JARVIS_INTEGRATION=1&& node --test"
     },
     "dependencies": {

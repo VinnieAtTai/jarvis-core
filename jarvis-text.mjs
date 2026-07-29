@@ -646,24 +646,79 @@ export function repoRow(prev, body) {
 // (newestProjectSession); an explicit project.repo would remove the inference but needs a store
 // migration, so it stays a follow-up.
 //
-// Returns null, or {name, ambiguous} -- ambiguous is how many active mission-backed projects claim
-// this repo (1 is the clean case). More than one is real, not hypothetical: d:/code/tms is claimed
-// by both `primeng` and `mycarrierpackets`. Most-recent-session wins, and the caller logs the
-// collision rather than silently guessing. Pure: reads, mutates nothing.
-export function projectOwningCwd(projects, sessions, cwd) {
+// Returns null, or {name, ambiguous} -- ambiguous is how many live-mission projects claim this repo
+// (1 is the clean case). More than one is real, not hypothetical: d:/code/tms is claimed by both
+// `primeng` and `mycarrierpackets`. Most-recent-session wins, and the caller logs the collision
+// rather than silently guessing. Pure: reads, mutates nothing.
+//
+// `missions` is the missions store and is REQUIRED, because the gate is not "the project names a
+// mission" but "the mission it names is still LIVE". Those read the same until a mission is
+// archived, and then they diverge badly: on 2026-07-28 both `macropoint` and `mycarrierpackets`
+// still pointed at the ARCHIVED Descartes mission, so three projects raced for d:/code/tms and a
+// TMS worker was filed as a primeng sub-worker. A dead mission must not win a repo, or even
+// compete for one. Omitting the argument -- or handing over a store nothing can be read out of --
+// resolves to "no mission can be confirmed live", which returns null and stands auto-bind DOWN
+// rather than guessing: an orphan standalone card is visible and one command to fix, while a
+// session bound to a dead mission's project is neither.
+export function projectOwningCwd(projects, sessions, cwd, missions) {
     const key = cwdKey(cwd);
-    if (!key) return null;
-    const list = Array.isArray(projects) ? projects : (projects && Array.isArray(projects.projects) ? projects.projects : null);
-    if (!list) return null;
+    const list = projectList(projects);
+    if (!key || !list) return null;
+    // ONE enforcement point for "the mission is live", deliberately: an empty set already rejects
+    // every project below, so an extra early return here would be a second copy of the same rule
+    // with nothing to keep it honest -- a mutation probe cannot tell it apart from a no-op.
+    const live = liveMissionIds(missions);
     let best = null, bestSeen = -Infinity, matches = 0;
     for (const p of list) {
         if (!p || !p.name || p.status !== 'active' || !p.missionId) continue;
+        if (!live.has(String(p.missionId))) continue;
         const hit = newestProjectSession(sessions, p.name);
         if (!hit || cwdKey(hit.cwd) !== key) continue;
         matches++;
         if (hit.seen > bestSeen) { bestSeen = hit.seen; best = String(p.name); }
     }
     return best ? { name: best, ambiguous: matches } : null;
+}
+// Which ACTIVE projects have last been worked in this repo, newest occupant first.
+//
+// Deliberately NOT mission-gated, and that is the whole reason it exists separately from
+// projectOwningCwd: this one is not choosing what to BIND a session to, it is answering "is there
+// already a brain in this repo" for the spawn path -- and the project that keeps raising that
+// question is `jarvis`, the mission-less one the bind gate exists to exclude. On 2026-07-28 two
+// jarvis coordinators were spawned into d:/claude/jarvis-core 27 seconds apart and overlapped for
+// 76, with nothing in the log to say so. Pure: reads, mutates nothing.
+export function activeProjectsForCwd(projects, sessions, cwd) {
+    const key = cwdKey(cwd);
+    const list = projectList(projects);
+    if (!key || !list) return [];
+    const hits = [];
+    for (const p of list) {
+        if (!p || !p.name || p.status !== 'active') continue;
+        const hit = newestProjectSession(sessions, p.name);
+        if (!hit || cwdKey(hit.cwd) !== key) continue;
+        hits.push({ name: String(p.name), seen: hit.seen });
+    }
+    return hits.sort((a, b) => b.seen - a.seen).map(h => h.name);
+}
+// The projects store arrives either as the raw {projects:[...]} file or as the bare array, depending
+// on the caller; one reader so a malformed store is null (never a throw) in both places.
+function projectList(projects) {
+    if (Array.isArray(projects)) return projects;
+    return (projects && Array.isArray(projects.projects)) ? projects.projects : null;
+}
+// The ids of every mission that has NOT been archived. Mirrors normalizeMission's rule -- archived
+// is the only status that means dead, anything else reads as active -- so the gate and the store's
+// own normalizer can never disagree about what "live" means. An id missing from this set covers the
+// archived case AND the dangling one (a project pointing at a mission that is simply gone).
+function liveMissionIds(missions) {
+    const list = Array.isArray(missions) ? missions : (missions && Array.isArray(missions.missions) ? missions.missions : null);
+    const out = new Set();
+    if (!list) return out;
+    for (const m of list) {
+        if (!m || typeof m !== 'object' || !m.id || m.status === 'archived') continue;
+        out.add(String(m.id));
+    }
+    return out;
 }
 
 // Resolve which session currently HOLDS console focus. Focus is one of: the solo brain 'jarvis'

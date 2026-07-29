@@ -9,7 +9,7 @@ import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
 import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // What code is actually RUNNING, resolved once at load and stated out loud.
@@ -956,7 +956,7 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
     let autoBound = '';
     if (!proj && !pproj && cwd) {
         try {
-            const owner = projectOwningCwd(loadProjects(), roster.sessions, cwd);
+            const owner = projectOwningCwd(loadProjects(), roster.sessions, cwd, loadMissions());
             if (owner) {
                 const mgr = projectWorkerUid(owner.name);          // the new session is not in the roster yet, so this cannot self-match
                 if (mgr && aliveNow(mgr)) { pproj = owner.name; autoBound = 'sub-worker'; }
@@ -3026,11 +3026,39 @@ async function handleRequest(req, res) {
         const repo = resolveRepo(cwd);
         roster.handoffs = roster.handoffs || {};
         const handoff = roster.handoffs[handoffKey(cwd, purpose)] || null;
-        const cs = spawnWorker(repo, purpose, b.model, handoff, b.tier, b.project, b.meeting, b.parentProject);
-        const subOf = (!b.project && b.parentProject) ? String(b.parentProject).toLowerCase().trim() : null;
-        const launchWhat = b.meeting && b.meeting.title ? 'meeting worker for ' + b.meeting.title : (b.project ? b.project + ' worker' : (subOf ? subOf + ' sub-worker' : cs));
+        // THE THIRD SPAWN SITE. The retire auto-successor and mission auto-revive both ask
+        // coordinatorHeld before minting a coordinator; this endpoint -- the console "+" and the
+        // voice spawn -- never did, so it was the one door left open to two brains on one project.
+        // A human's explicit ask is not refused: the new session NESTS under the incumbent instead,
+        // which is the same coordinator-if-free-else-sub-worker rule auto-bind applies at register,
+        // so both doors decide alike rather than each having its own idea of the slot.
+        let project = b.project ? String(b.project).toLowerCase().trim() : null;
+        let parentProject = b.parentProject ? String(b.parentProject).toLowerCase().trim() : null;
+        let held = null;
+        if (project) {
+            held = coordinatorHeld(project);
+            if (held) { parentProject = project; project = null; }
+        }
+        const cs = spawnWorker(repo, purpose, b.model, handoff, b.tier, project, b.meeting, parentProject);
+        const subOf = (!project && parentProject) ? parentProject : null;
+        if (held) {
+            record({ kind: 'sys', text: 'spawn: ' + parentProject + ' already has a coordinator (' + (held.callsign || held.uid) + ' is ' + (held.kind === 'live' ? 'live' : 'booting') + '), so ' + cs + ' launches as its sub-worker instead' });
+        } else if (!project && !parentProject) {
+            // No binding asked for at all. This stays a standalone session -- inferring one from the
+            // repo is auto-bind's job at register, and it is mission-gated on purpose -- but the
+            // overlap gets NAMED here, because that is what was missing when two jarvis coordinators
+            // ran 76 seconds deep into each other with the log showing only two ordinary spawns.
+            try {
+                for (const name of activeProjectsForCwd(loadProjects(), roster.sessions, cwd)) {
+                    const h = coordinatorHeld(name);
+                    if (!h) continue;
+                    record({ kind: 'sys', text: 'spawn: ' + cs + ' is standalone in ' + repo.key + ' where ' + (h.callsign || h.uid) + ' already ' + (h.kind === 'live' ? 'coordinates' : 'boots as coordinator of') + ' ' + name });
+                }
+            } catch { }   // visibility only; an unreadable project store must never block a spawn
+        }
+        const launchWhat = b.meeting && b.meeting.title ? 'meeting worker for ' + b.meeting.title : (project ? project + ' worker' : (subOf ? subOf + ' sub-worker' : cs));
         enqueueSay('Launching ' + launchWhat + ' in ' + repo.key + (handoff ? ', resuming the handoff' : '') + '.', 'jarvis');
-        return json(res, 200, { ok: true, callsign: cs });
+        return json(res, 200, { ok: true, callsign: cs, ...(held ? { nestedUnder: parentProject } : {}) });
     }
     if (key === 'POST /permission') {
         const b = await readBody(req);
