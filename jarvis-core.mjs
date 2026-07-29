@@ -9,7 +9,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
+import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
 import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap } from './jarvis-text.mjs';
 import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
@@ -1612,6 +1612,10 @@ function resolveClaude() {
 const WT_ROOT_ENV = process.env.JARVIS_WT_ROOT || '';
 const WT_ISOLATE = process.env.JARVIS_WORKTREES !== '0';     // kill switch: back to shared cwds
 const WT_TIMEOUT = 30000;                                    // a checkout of a big repo is not instant
+// Where Claude Code keeps its per-directory trust decisions. JARVIS_CLAUDE_CONFIG is a test seam:
+// nothing in the suite may go anywhere near the real one.
+const CLAUDE_HOME = process.env.USERPROFILE || process.env.HOME || '';
+const CLAUDE_JSON = process.env.JARVIS_CLAUDE_CONFIG || (CLAUDE_HOME ? join(CLAUDE_HOME, '.claude.json') : '');
 // git, with stderr captured rather than sprayed into the hub's log, and never throwing: null means
 // the command failed, '' means it succeeded silently (the two must stay distinguishable — a
 // successful `worktree remove` prints nothing).
@@ -1634,6 +1638,43 @@ function takePendingWorktree(cs) {
     const v = pendingWorktree.get(cs);
     pendingWorktree.delete(cs);
     return v || null;
+}
+// Register a freshly created worktree as trusted, so its worker boots into its job instead of into
+// Claude Code's folder-trust prompt. claudeTrustPatch (jarvis-text.mjs) carries the measurements and
+// the argument for why this is the hub's decision to make.
+//
+// Everything here is shaped to be UNABLE to hurt that file. It is the human's live global config --
+// mcpServers, oauthAccount, every project's history -- and losing it would be far worse than a worker
+// stopping on a prompt. So: read-modify-write rather than composing a new document; refuse to write at
+// all unless the existing file parsed, because writing a fresh minimal file over a transient read
+// failure is precisely how a config gets wiped; the same 2-space JSON the file already uses, so
+// Claude Code's own next write is not a whole-file reformat; atomicWrite, so a crash mid-write cannot
+// truncate it; and never throw, because a hub that dies inside spawnWorker is worse than the bug.
+//
+// Known and accepted race: another live claude session holds this file in memory and writes its own
+// full copy on exit, which can drop the flag we just set. The failure mode of losing that race is
+// exactly today's behaviour -- the worker meets the prompt -- so it is not worth locking the human's
+// config over.
+function trustWorktreePath(p) {
+    try {
+        if (!p || !CLAUDE_JSON || !existsSync(CLAUDE_JSON)) {
+            record({ kind: 'sys', text: 'no trust mark for ' + p + ': ' + (CLAUDE_JSON || 'no home dir') + ' not found; the worker may stop on the folder-trust prompt' });
+            return false;
+        }
+        let cfg;
+        try { cfg = JSON.parse(readFileSync(CLAUDE_JSON, 'utf8')); }
+        catch (e) {
+            record({ kind: 'sys', text: 'no trust mark for ' + p + ': could not parse ' + CLAUDE_JSON + ' (' + (e && e.message) + '); leaving it ALONE' });
+            return false;
+        }
+        const next = claudeTrustPatch(cfg, p);
+        if (!next) return true;                  // already trusted -- touching the file would be gratuitous
+        atomicWrite(CLAUDE_JSON, JSON.stringify(next, null, 2));
+        return true;
+    } catch (e) {
+        try { record({ kind: 'sys', text: 'trust mark errored for ' + p + ' (' + (e && e.message) + '); continuing' }); } catch { }
+        return false;
+    }
 }
 // Create this worker's worktree. Returns the plan (path/branch/base) or null to share the cwd.
 function makeWorktree(repo, cs, inheritBranch) {
@@ -1664,6 +1705,9 @@ function makeWorktree(repo, cs, inheritBranch) {
             record({ kind: 'sys', text: 'worktree add FAILED for ' + cs + ' (' + plan.branch + '); sharing ' + cwdKey(repo.cwd) });
             return null;
         }
+        // BEFORE the worker launches, not after: claude reads its trust state the instant it starts
+        // in this directory, and there is no second chance to answer the dialog console-lessly.
+        trustWorktreePath(plan.path);
         record({ kind: 'sys', text: 'worktree for ' + cs + ': ' + plan.branch + (plan.create ? ' off ' + plan.base : ' (continued)') + ' at ' + plan.path });
         return plan;
     } catch (e) {

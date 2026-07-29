@@ -991,6 +991,49 @@ export function worktreePlan(repoKey, callsign, repoCwd, base, opts = {}) {
     return null;
 }
 
+// Claude Code's first-run FOLDER-TRUST prompt, and why a brand-new worktree walks straight into it.
+//
+// A worker launched in a directory Claude Code does not trust stops at "Quick safety check: Is this a
+// project you created or one you trust?" -- a dialog that fires BEFORE the model starts, so the boot
+// prompt never runs and /register is never called. The hub sees no roster row at all: not ended, not
+// booting, absent, with the pinned callsign burned. It is indistinguishable from a spawn that simply
+// failed, and a console-less worker has nobody to press Enter, so it waits there forever. Three
+// broker dispatches died exactly this way on 2026-07-29.
+//
+// The mechanism is ANCESTOR-INHERITED per-directory trust, measured that night rather than reasoned:
+// the real claude, launched through node-pty into fresh directories, prompts when no ancestor is
+// trusted and starts clean when one is. d:/claude is trusted, so all eleven jarvis worktrees under
+// d:/claude/.jarvis-wt inherited that while their own hasTrustDialogAccepted stayed false; d:/code is
+// not trusted, so every broker worktree under it prompted. Measured too, because it is the intuitive
+// wrong answer: --permission-mode bypassPermissions does NOT suppress the dialog. The landmine
+// therefore waits for any repo whose parent directory is untrusted, whatever permissions it runs with.
+//
+// So the hub registers the path it just created, and only that path. This is not a new trust decision
+// taken on the human's behalf: he configured the repo in repos.json, its checkout is one he already
+// works in, and the worktree is an implementation detail of isolation. Marking the PARENT instead
+// would be shorter and much too broad -- it would pre-trust every future repo that happens to sit
+// beside this one, including ones the hub has never heard of.
+//
+// Pure, so the merge rule is testable without going near the real config. Returns null when there is
+// nothing to do (already trusted, or a path that cannot be keyed) and otherwise the WHOLE object to
+// write back, every other key carried through untouched: this is the human's live global config, and
+// the only field that is ours to set is this one flag on this one path.
+export function claudeTrustPatch(cfg, wtPath) {
+    const plain = (x) => !!x && typeof x === 'object' && !Array.isArray(x);
+    // Trimmed: a path that is only whitespace is not a directory, and a key with stray spaces
+    // would never match the one Claude Code looks up. Either way it has no business in that file.
+    const key = wtSlashes(wtPath).trim();
+    if (!key || !plain(cfg)) return null;
+    // A shape we do not recognise is a shape we do not rewrite. Refusing costs one trust prompt --
+    // the bug we already have -- while guessing costs the human's global config.
+    const projects = cfg.projects === undefined ? {} : cfg.projects;
+    if (!plain(projects)) return null;
+    const entry = projects[key] === undefined ? {} : projects[key];
+    if (!plain(entry)) return null;
+    if (entry.hasTrustDialogAccepted === true) return null;   // already trusted; do not touch the file
+    return { ...cfg, projects: { ...projects, [key]: { ...entry, hasTrustDialogAccepted: true } } };
+}
+
 // Which workers get a worktree. A checkout costs real disk, so this is not free — but the wrong
 // answer in the OTHER direction puts a code-mutating worker back in the human's working tree, which
 // is the entire thing we are preventing. The bias is therefore deliberate: when in doubt, isolate.
