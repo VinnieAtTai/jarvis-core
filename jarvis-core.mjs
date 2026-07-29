@@ -1119,6 +1119,27 @@ function retireSession(uid, summary, opts = {}) {
     // a sub-worker; the project-coordinator path below keeps its own "manager retired" append.
     if (s.parentProject && !s.project && s.summary) {
         try { appendProjectLog(s.parentProject, cs, 'sub-worker retired: ' + s.summary); } catch { }
+        // ...and PUSH it to the live coordinator, which closes the delegation loop. The append above is
+        // durable but PASSIVE: it lands in a store the manager has no reason to re-read, so a manager
+        // that delegated could only notice its own delegate had finished by polling the project log --
+        // busy-work for the one session that is supposed to stay thin and responsive. Deliver it to the
+        // inbox it is already sitting on instead.
+        //
+        // Only a LIVE holder can be sent anything: a booting one has not registered (nothing would ever
+        // read the event) and it rehydrates the project log on boot anyway, which is where the append
+        // above is waiting for it. The retiring session can never BE that holder -- s.ended is stamped
+        // at the top of this function, and a .parentProject sub-worker never holds the coordinator slot
+        // regardless -- but compare the uid anyway, so neither invariant can quietly become a message
+        // addressed to a corpse if a later change relaxes one of them.
+        //
+        // Its OWN try, not the append's: an unreadable project store must not cost the coordinator its
+        // notification, and neither failure may ever block the retire.
+        try {
+            const pc = coordinatorHeld(s.parentProject);
+            if (pc && pc.kind === 'live' && pc.uid && pc.uid !== uid) {
+                busAppend({ from: 'jarvis', to: pc.uid, kind: 'msg', text: 'your sub-worker ' + cs + ' retired: ' + s.summary });
+            }
+        } catch (e) { logCrash('subworker-retire-notify-failed', e); }
     }
 
     if (s.project) {
@@ -2037,6 +2058,25 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
     }
     if (project) boot += ' You are the ' + project + ' PROJECT worker: your task board IS the ' + project + ' column - use callsign "' + project + '" for every /worklist op (add/start/done/etc), not your own callsign, and speech the human points at ' + project + ' arrives on your poll loop. When you must hand off, /retire with successor:true so a fresh ' + project + ' worker takes over.'
         + ' You are also this project\'s persistent MANAGER: the project owns a durable context store. The moment you register, GET http://127.0.0.1:' + PORT + '/project?name=' + project + ' to rehydrate that context (summary, current focus, open threads, recent-work log, doc links) and RESUME from it - do not start cold. As the project moves, keep it current so the next manager rebuilds from recent work: POST http://127.0.0.1:' + PORT + '/project-context {"name":"' + project + '","summary":"...","currentFocus":"...","openThreads":[...],"log":"one line of what just happened"} (send only the fields that changed; log entries are append-only and capped).';
+    // DELEGATION, and the reason it has to be said here. POST /spawn has always accepted
+    // parentProject, so a coordinator could always have dispatched its own sub-workers -- but nothing
+    // ever TOLD one. /protocol, which every worker reads on boot, documents registering, polling,
+    // reporting and retiring; it never mentions spawning, because it is written for the worker end of
+    // the wire. So the capability existed and went unused: managers did the heavy lifting inline,
+    // which is the "coordinators must stay thin" problem seen from the other side -- a manager three
+    // minutes into its own build turn is a manager Chris cannot reach. Spell the contract out where
+    // the role is handed over.
+    //
+    // ONLY on this branch, deliberately: `subOf` workers must not spawn grandchildren. Delegation is
+    // one level deep on purpose -- a tree of sub-workers has no coordinator anyone can find, and the
+    // retire-summary feedback path (below, and in retireSession) is defined for exactly one hop.
+    // NO ANGLE BRACKETS in this paragraph, and it is not a style rule. node-pty runs claude through
+    // cmd.exe when it resolves to a .cmd, so the whole prompt is re-parsed as a cmd command line, and
+    // a stray "<" or ">" is a REDIRECTION: measured, an angle-bracketed placeholder here made cmd
+    // answer "The system cannot find the file specified" and the worker never registered at all. The
+    // rest of the boot text has always been angle-bracket free, and safePurpose above strips the same
+    // class from the one part a human controls. Placeholders go in quotes instead.
+    if (project) boot += ' You DELEGATE the heavy work rather than doing it yourself. To dispatch a sub-worker: POST http://127.0.0.1:' + PORT + '/spawn {"cwd":"the repo path","purpose":"one short speakable line","parentProject":"' + project + '"} - the response carries the new callsign, and it is parentProject that nests the worker under ' + project + ' instead of minting an unrelated session. Brief it with POST http://127.0.0.1:' + PORT + '/send {"from":"your uid","to":"its callsign","text":"goals, paths, constraints"} - send goals and paths, never file contents it can read itself. When it retires, its one-line summary auto-appends to the ' + project + ' project log AND arrives as a message on your poll loop, so you get the outcome back without watching for it. The discipline that makes this worth doing: delegate the HEAVY work (long builds, wide sweeps, deep research) and stay THIN and responsive. A coordinator that disappears into a twenty-minute turn cannot be reached, cannot re-plan, and has become the bottleneck it was meant to remove.';
     // If this project drives a mission, the human talks to the MISSION (not to you by callsign), so a
     // message can land on the durable mission thread while no coordinator is live — the very message
     // that auto-revived you. Tell the coordinator to catch up on that thread the instant it registers;
