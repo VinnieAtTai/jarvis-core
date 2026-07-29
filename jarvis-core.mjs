@@ -3183,6 +3183,86 @@ async function handleRequest(req, res) {
         }));
         return json(res, 200, lim > 0 ? evts.slice(-lim) : evts);
     }
+    // Chat search over the transcript -- "a search for chats would be legit". transcriptCache IS the
+    // whole transcript (loaded at boot, appended by record()), so this is an in-memory filter: no file
+    // I/O, nothing to page, and the CACHE_CAP trim above is the only thing that ages a hit out.
+    //
+    // A hit is deliberately GET /transcript's projection, field for field, so a console search box can
+    // render results with the code it already has. srcKind is the one addition: /transcript collapses
+    // everything that is not sys or react into 'msg', which is fine when you are only ever shown the
+    // conversation but loses the sys-vs-task distinction the moment a search widens into them.
+    //
+    // NOT in v1, so the next session reads these as scoped out rather than missed:
+    //   - ai-threads.json, the conversational side-tabs, is a SEPARATE chat surface. v1 covers the
+    //     transcript because that is the chat he lives in; searching the side-threads is a v2.
+    //   - surrounding context (N lines either side of a hit). A real usability win, but the endpoint
+    //     lands first.
+    if (key === 'GET /search') {
+        // Every kind record() can put in the transcript. Keep this in step with record()'s callers --
+        // an unlisted kind is unreachable through `kinds` AND invisible to kinds=all.
+        const SEARCHABLE = ['speech', 'chat', 'tts', 'sys', 'task', 'react'];
+        // "chats" means the CONVERSATION. sys and task are machinery: measured on the live transcript
+        // they are 2.4k lines of 5.4k, and formulaic ones -- every register, retire and board move --
+        // so a common term hits hundreds of near-identical lines and buries the real hits under them.
+        const DEFAULT_KINDS = ['speech', 'chat', 'tts'];
+        const LIMIT_DEFAULT = 50, LIMIT_MAX = 200;
+
+        const q = String(u.searchParams.get('q') || '');
+        // Case-insensitive, ANDed, SUBSTRING terms: every term must appear somewhere in the line, not
+        // necessarily on a word boundary -- he searches partial ids, shas and path fragments.
+        const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+        // A blank q is an ERROR, not an empty result set: [] here is indistinguishable from "nothing
+        // in months of history matches", which is the wrong thing to let someone believe.
+        if (!terms.length) return json(res, 400, { error: 'q required: one or more terms to search for, e.g. /search?q=commit%20baton' });
+
+        const kindsRaw = String(u.searchParams.get('kinds') || '').trim().toLowerCase();
+        let kinds;
+        if (!kindsRaw) kinds = DEFAULT_KINDS;
+        else if (kindsRaw === 'all') kinds = SEARCHABLE;
+        else {
+            kinds = kindsRaw.split(',').map(s => s.trim()).filter(Boolean);
+            // Same reasoning as the blank q: a typo'd kind must not answer with a confident empty set.
+            const bad = kinds.filter(k => !SEARCHABLE.includes(k));
+            if (bad.length) return json(res, 400, { error: 'unknown kind: ' + bad.join(', ') + ' -- use all, or any of ' + SEARCHABLE.join(', ') });
+        }
+        const want = {};
+        for (const k of kinds) want[k] = 1;
+        // Narrowing filters. `from` matches the PROJECTED who -- what the console actually shows -- so
+        // from=you finds his own speech, from=jarvis the hub's, from=<callsign> one session's.
+        const fromWant = String(u.searchParams.get('from') || '').trim().toLowerCase();
+        const missionWant = String(u.searchParams.get('missionId') || '').trim();
+        const askedLim = Math.floor(Number(u.searchParams.get('limit')));
+        const lim = Math.min(Number.isFinite(askedLim) && askedLim > 0 ? askedLim : LIMIT_DEFAULT, LIMIT_MAX);
+
+        // NEWEST FIRST -- a search across months of history that hands back the oldest match first is
+        // useless -- so walk the cache backwards. `total` keeps counting past the limit so a caller can
+        // say "50 of 347" instead of pretending 50 was all there was.
+        const hits = [];
+        let total = 0;
+        for (let i = transcriptCache.length - 1; i >= 0; i--) {
+            const e = transcriptCache[i];
+            if (!want[e.kind]) continue;
+            if (missionWant && e.missionId !== missionWant) continue;
+            const who = e.kind === 'speech' ? 'you' : e.kind === 'sys' ? 'sys' : (e.from || 'jarvis');
+            if (fromWant && who.toLowerCase() !== fromWant) continue;
+            const hay = String(e.text == null ? '' : e.text).toLowerCase();
+            if (!terms.every(t => hay.includes(t))) continue;
+            total++;
+            if (hits.length >= lim) continue;
+            hits.push({
+                ts: e.ts,
+                kind: e.kind === 'sys' ? 'sys' : e.kind === 'react' ? 'react' : 'msg',
+                srcKind: e.kind,
+                who,
+                to: e.to || null,
+                missionId: e.missionId || null,
+                img: e.img || null,
+                text: e.text,
+                ...(e.kind === 'react' ? { target: e.target, reaction: e.reaction } : {}),
+            });
+        }
+        return json(res, 200, { q, terms, kinds, limit: lim, total, truncated: total > hits.length, results: hits });
+    }
     // The durable, mission-keyed conversation thread: every event tagged with this missionId, plus
     // any message bused to a worker currently bound to the mission's project. Survives sub-worker
     // turnover because it is keyed by the mission, not by any one callsign.
