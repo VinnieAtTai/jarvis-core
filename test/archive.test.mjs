@@ -231,6 +231,62 @@ describe('a crash between the archive append and the transcript rewrite', () => 
     });
 });
 
+describe('the RUNTIME trim, which is the one that actually happens', () => {
+    let hub = null;
+    // Every other suite here seeds an oversized transcript and lets the boot trim fire. That is the rare
+    // path -- it only happens after a run that predates the cap. In production the trim fires from
+    // record(), mid-conversation, once the cache drifts CACHE_SLACK past the cap. Same function, but
+    // "same function" is an inference, and the whole reason this bug survived a review is that the
+    // dangerous line looked safe in isolation.
+    //
+    // Seeded 100 short of the trigger so the boot canNOT trim (the hub records a handful of sys lines of
+    // its own on the way up, which is also why the margin is 100 and not 1), then driven over the line
+    // one recorded chat at a time.
+    const SEEDED = CACHE_CAP + CACHE_SLACK - 100;
+    const seed = [];
+    for (let i = 0; i < SEEDED; i++) {
+        seed.push({ ts: new Date(Date.UTC(2025, 10, 1) + i * 1000).toISOString(), kind: 'chat', from: 'jarvis', text: 'livenonce ' + i + ' ' + PAD });
+    }
+    before(async () => {
+        if (SKIP) return;
+        hub = await createScratchHub();
+        writeFileSync(join(hub.DATA, 'transcript.jsonl'), seed.map(ser).join('\n') + '\n');
+        await hub.start('runtime trim hub');
+    });
+    after(() => { if (hub) hub.dispose(); });
+
+    test('ARCHIVE: a trim triggered by record() archives too, and loses nothing', { skip: SKIP }, async () => {
+        const archPath = join(hub.DATA, ARCHIVE_FILE);
+        assert.equal(existsSync(archPath), false,
+            'the boot trim already fired, so this suite is retesting the boot path instead of the runtime one');
+
+        // POST /send to human is the cheapest thing that reaches record(): it needs no registered
+        // session, and an unknown `from` is simply labelled jarvis.
+        let posts = 0;
+        for (; posts < 400 && !existsSync(archPath); posts++) {
+            await hub.post('/send', { from: 'probe', to: 'human', text: 'drive the cache over the cap ' + posts });
+        }
+        assert.ok(existsSync(archPath), 'recorded ' + posts + ' lines past the cap and the archive was never created');
+        assert.ok(posts > 1, 'the archive appeared before any line was recorded, so the boot trim did this');
+
+        // Byte-identical, oldest-first, in order -- and a PREFIX of the seed, which is the shape that
+        // says "the front was moved" rather than "something was written".
+        const arch = lines(archPath);
+        assert.deepEqual(arch, seed.slice(0, arch.length).map(ser), 'the runtime trim archived something other than the oldest lines, in order');
+        assert.ok(arch.length > CACHE_SLACK, 'expected the trim to drop the slack in one go, got ' + arch.length);
+
+        // The claim that matters: after a runtime trim, every seeded line is STILL findable -- some from
+        // the cache, the rest from the archive. Before the fix this number would be arch.length short.
+        const r = await hub.get('/search?q=livenonce&limit=1');
+        assert.equal(r.total, SEEDED, 'lines went missing across a runtime trim: found ' + r.total + ' of ' + SEEDED);
+        assert.ok(r.archive.lines >= arch.length, 'the search did not read the archive the runtime trim just wrote');
+
+        // And the cache really did shrink, so the total above is genuinely spanning both halves.
+        const shown = await hub.get('/transcript?limit=0');
+        assert.ok(shown.length <= CACHE_CAP, 'the cache was not capped: ' + shown.length);
+    });
+});
+
 describe('an archive that cannot be written', () => {
     let hub = null;
     const TOTAL = CACHE_CAP + CACHE_SLACK + 200;
