@@ -30,6 +30,7 @@ function lift(name) {
     throw new Error('unbalanced braces reading ' + name);
 }
 const searchCountLabel = new Function(lift('searchCountLabel') + '\nreturn searchCountLabel;')();
+const searchReachNote = new Function(lift('searchReachNote') + '\nreturn searchReachNote;')();
 // fmtWhen delegates the clock part to fmtHM, so both come across.
 const fmtWhen = new Function(lift('fmtHM') + '\n' + lift('fmtWhen') + '\nreturn fmtWhen;')();
 
@@ -92,6 +93,35 @@ test('searchCountLabel -- THE POINT: a truncated set never implies it was everyt
 
 test('searchCountLabel -- zero matches says so instead of "0 matches"', () => {
     assert.equal(searchCountLabel(0, 0, false), 'no matches');
+});
+
+// searchReachNote covers the same honesty rule one level deeper. GET /search scans the transcript
+// archive under a byte bound (foxtrot's change), so archive.capped means `total` is a FLOOR, not a
+// total -- there is history the server never opened. Silence there would have the box report "23
+// matches" over a corpus it only partly read, which is exactly what the endpoint refuses to do when it
+// 400s a blank q.
+test('searchReachNote -- an uncapped scan says nothing at all', () => {
+    assert.equal(searchReachNote(false, '2025-06-03T08:15:00.000Z'), '');
+    assert.equal(searchReachNote(undefined, undefined), '', 'a hub with no archive block is silent, not alarming');
+});
+
+test('searchReachNote -- THE POINT: a capped scan admits there may be more, and says where it stopped', () => {
+    const note = searchReachNote(true, '2025-06-03T08:15:00.000Z');
+    assert.match(note, /not searched/, 'it must say the history was not searched');
+    assert.match(note, /2025-06-03/, 'and name the boundary, or "partial reach" is unactionable');
+    assert.match(note, /more matches/, 'and warn that the count is a floor');
+});
+
+test('searchReachNote -- capped with an unusable boundary still warns, minus the date', () => {
+    for (const bad of [null, undefined, '', 'garbage', 12345, {}, '2025-6-3']) {
+        const note = searchReachNote(true, bad);
+        assert.match(note, /not searched/, 'still warns for boundary ' + JSON.stringify(bad));
+        // "contains no well-formed date" is TOO WEAK -- it lets through "stopped at ." and "stopped at
+        // 12345". A probe removing the shape guard survived that version. The real claim is that an
+        // untrustworthy boundary takes the DATELESS wording, so pin that branch directly.
+        assert.doesNotMatch(note, /stopped at/, 'must not quote a boundary it cannot trust: ' + JSON.stringify(bad));
+        assert.doesNotMatch(note, /\d{4}-\d{2}-\d{2}/, 'and invents no date for ' + JSON.stringify(bad));
+    }
 });
 
 test('fmtWhen -- a hit from today is just the time, exactly as the chat shows it', () => {

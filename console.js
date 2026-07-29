@@ -402,7 +402,11 @@ let searchRendered = '';    // signature of what is already in #chat. renderChat
                             // so an unchanged result set must NOT be re-rendered.
 const qboxEl = document.getElementById('qbox');
 const qexitEl = document.getElementById('qexit');
-function searchSig() { return searchMeta ? searchMeta.q + String.fromCharCode(31) + searchMeta.total + String.fromCharCode(31) + searchMeta.shown : ''; }
+// Only has to answer "is this exact result set already on screen", for the 1.5s poll's benefit.
+// It needs no capped/oldest component: runSearch is the ONLY writer of searchMeta and it clears
+// searchRendered on the next line, so a changed envelope always forces a rebuild anyway. A probe
+// that dropped those two fields survived, which is what proved them dead rather than defensive.
+function searchSig() { const U = String.fromCharCode(31); return searchMeta ? [searchMeta.q, searchMeta.total, searchMeta.shown].join(U) : ''; }
 async function runSearch() {
     const q = (qboxEl.value || '').trim();
     if (!q) { exitSearch(); return; }
@@ -419,7 +423,13 @@ async function runSearch() {
     } catch { uiToast('Search failed - could not reach the hub.', 'error'); return; }
     if (r && r.error) { uiToast(r.error, 'error'); return; }
     searchHits = Array.isArray(r.results) ? r.results : [];
-    searchMeta = { q, total: r.total || 0, shown: searchHits.length, truncated: !!r.truncated };
+    // r.archive is foxtrot's additive envelope (transcript archive beyond the in-memory cache).
+    // Read defensively: it is absent on any hub predating that change.
+    const arch = r.archive || {};
+    searchMeta = {
+        q, total: r.total || 0, shown: searchHits.length, truncated: !!r.truncated,
+        capped: !!arch.capped, oldest: arch.oldestScannedTs || null,
+    };
     searchRendered = '';
     qexitEl.style.display = 'inline-block';
     renderChat();
@@ -439,12 +449,26 @@ function searchCountLabel(shown, total, truncated) {
     if (truncated) return 'newest ' + shown + ' of ' + total;
     return total + (total === 1 ? ' match' : ' matches');
 }
+// The transcript archive is scanned under a byte bound, so `archive.capped` means `total` is a FLOOR:
+// there is history the server never read. Same honesty rule as the truncated count, one level deeper --
+// without this the box reports "23 matches" over a corpus it only partly searched, which is the exact
+// thing /search refuses to do when it 400s a blank q. Pure, so it is unit-tested.
+// ADDITIVE: a hub without the archive sends no `archive` block, and then this is silently a no-op.
+function searchReachNote(capped, oldestScannedTs) {
+    if (!capped) return '';
+    const day = String(oldestScannedTs == null ? '' : oldestScannedTs).slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(day)
+        ? 'Older history was not searched: the scan stopped at ' + day + '. There may be more matches before then.'
+        : 'Older history was not searched, so there may be more matches than shown.';
+}
 function renderSearch() {
     const sig = searchSig();
     if (sig === searchRendered) return;   // already on screen -- do not stomp the scroll position
     searchRendered = sig;
     const m = searchMeta;
+    const reach = searchReachNote(m.capped, m.oldest);
     const head = '<div class="shead"><span class="scount">' + esc(searchCountLabel(m.shown, m.total, m.truncated)) + '</span> for <b>' + esc(m.q) + '</b>'
+        + (reach ? '<span class="scap" title="' + escAttr(reach) + '">&#9888; partial reach</span>' : '')
         + '<span class="sexit" data-sexit="1" title="back to the live chat">&#10005; back to chat</span></div>';
     // Each hit is its own bubble: results are newest-first and non-adjacent, so the chat's
     // "merge consecutive lines from one sender" grouping would join unrelated matches.

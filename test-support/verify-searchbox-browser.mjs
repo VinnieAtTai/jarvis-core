@@ -177,7 +177,31 @@ try {
         ok(await page.isVisible('#chat'), "typing 'r' in the box does not flip to RAW view");
         ok((await page.inputValue('#qbox')) === 'rt', 'and the characters land in the box');
 
-        // 10. A tab click means "show me that chat", not "stay in results".
+        // 10. archive.capped -- `total` is a floor, so the box must admit partial reach. foxtrot's
+        //     archive change is on a separate branch, so the response is intercepted here rather than
+        //     waiting on a merge: this asserts MY rendering against the envelope shape it agreed to.
+        await search('widget');
+        ok((await page.locator('.scap').count()) === 0, 'no partial-reach warning when the hub sends no archive block');
+        await page.route('**/search?*', async (route) => {
+            const resp = await route.fetch();
+            const body = await resp.json();
+            body.archive = { searched: true, capped: true, oldestScannedTs: '2025-06-03T08:15:00.000Z' };
+            await route.fulfill({ response: resp, body: JSON.stringify(body), headers: { ...resp.headers(), 'content-type': 'application/json' } });
+        });
+        await page.fill('#qbox', 'widget');
+        await page.press('#qbox', 'Enter');
+        await page.waitForSelector('.scap', { timeout: 8000 });
+        ok(true, 'a capped archive scan renders the partial-reach warning');
+        const tip = await page.getAttribute('.scap', 'title');
+        ok(/2025-06-03/.test(tip || ''), 'and its tooltip names where the scan stopped', String(tip));
+        ok((await page.textContent('.scount')).trim() === 'newest 50 of 60', 'the count still renders alongside it');
+        await page.unroute('**/search?*');
+        await page.fill('#qbox', 'widget');
+        await page.press('#qbox', 'Enter');
+        await page.waitForFunction(() => document.querySelectorAll('.scap').length === 0, null, { timeout: 8000 });
+        ok(true, 'and the warning clears once the hub stops reporting a cap');
+
+        // 11. A tab click means "show me that chat", not "stay in results".
         await search('widget');
         const tab = page.locator('#stabs [data-tab]').first();
         if (await tab.count()) { await tab.click(); ok(await gone(), 'switching tabs leaves search'); }
