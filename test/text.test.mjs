@@ -2,7 +2,7 @@
 // No server boot, no I/O — these import the real functions the hub uses.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { clk, remTitle, parseReminder, parseScheduleText, shortTitle, summarizeBoard, permSig, permLabel, canon, orderedTasks, projectForMission } from '../jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, shortTitle, summarizeBoard, permSig, permLabel, canon, orderedTasks, projectForMission, shouldNudgeSchedulePull } from '../jarvis-text.mjs';
 
 const minutesFromNow = iso => (Date.parse(iso) - Date.now()) / 60000;
 
@@ -235,4 +235,73 @@ test('projectForMission — returns the FIRST project when several link the same
         { name: 'second', missionId: 'm_shared' },
     ];
     assert.equal(projectForMission(projects, 'm_shared').name, 'first');
+});
+
+// ---- shouldNudgeSchedulePull: who gets asked to fetch the day's meetings, and how often --------
+// The hub cannot reach Google, so the day's schedule only arrives if a Calendar-capable session goes
+// and gets it. These pin the two things that make an automatic ask safe rather than annoying: it goes
+// to a session that can actually act on it, and it goes out once.
+const TODAY = 'Tue Jul 28 2026';
+const HUB = 'd:/claude/jarvis-core';
+const nudge = (o = {}) => shouldNudgeSchedulePull({
+    scheduleDate: 'scheduleDate' in o ? o.scheduleDate : 'Mon Jul 27 2026',
+    nudgedFor: o.nudgedFor,
+    today: 'today' in o ? o.today : TODAY,
+    sessionCwd: 'cwd' in o ? o.cwd : HUB,
+    hubCwd: o.hub || HUB,
+    isSubWorker: o.isSubWorker,
+});
+
+test('shouldNudgeSchedulePull — a stale schedule asks the session in the hub own checkout', () => {
+    assert.equal(nudge(), true);
+    // Never pulled at all is the same stale, not a special case (this was the state on a fresh boot).
+    assert.equal(nudge({ scheduleDate: undefined }), true);
+    assert.equal(nudge({ scheduleDate: null }), true);
+});
+
+test('shouldNudgeSchedulePull — a schedule already pulled today asks nobody', () => {
+    assert.equal(nudge({ scheduleDate: TODAY }), false);
+});
+
+test('shouldNudgeSchedulePull — ONCE a day: a session registering after the ask is not asked again', () => {
+    // The fleet case: several sessions can register within seconds of each other, and the chore is
+    // one chore. `nudgedFor` is persisted with the schedule, so this holds across a hub restart too.
+    assert.equal(nudge({ nudgedFor: TODAY }), false);
+    // ...and yesterday's ask does not silence today's.
+    assert.equal(nudge({ nudgedFor: 'Mon Jul 27 2026' }), true);
+});
+
+test('shouldNudgeSchedulePull — a worker in ANOTHER repo is never asked', () => {
+    // A TMS worker has no Calendar access; asking it burns a turn it cannot act on, and because the
+    // ask is once-a-day it would burn the whole day's pull with it.
+    assert.equal(nudge({ cwd: 'd:/code/tms' }), false);
+    assert.equal(nudge({ cwd: '' }), false);
+    assert.equal(nudge({ cwd: null }), false);
+    // Two UNKNOWN paths are not the same directory. Without this an unregistered cwd on both sides
+    // compares equal-as-empty and every such session gets asked.
+    assert.equal(shouldNudgeSchedulePull({ scheduleDate: 'Mon Jul 27 2026', today: TODAY, sessionCwd: '', hubCwd: '' }), false);
+    // A bare call must not throw its way into blocking a register.
+    assert.equal(shouldNudgeSchedulePull(), false);
+    assert.equal(shouldNudgeSchedulePull(undefined), false);
+});
+
+test('shouldNudgeSchedulePull — a SUB-WORKER is left alone, even in the hub own checkout', () => {
+    // Sub-workers are spawned for one named job and usually isolated in a worktree whose cwd is
+    // remapped back to the repo at register, so they look exactly like a brain here. The chore
+    // belongs to a coordinator; handing it to a delegated build is how the build gets distracted.
+    assert.equal(nudge({ isSubWorker: true }), false);
+    assert.equal(nudge({ isSubWorker: false }), true);
+});
+
+test('shouldNudgeSchedulePull — matches through Windows path spelling, or the ask never fires at all', () => {
+    // Sessions store the path they booted in (backslashes); the hub knows its own as it was resolved.
+    // The same class of mismatch that made resolveRepo miss d:\\code\\tms would silently disable this.
+    for (const spelling of ['D:\\claude\\jarvis-core', 'd:\\claude\\jarvis-core\\', 'D:/CLAUDE/Jarvis-Core']) {
+        assert.equal(nudge({ cwd: spelling }), true, spelling);
+    }
+});
+
+test('shouldNudgeSchedulePull — no notion of today means no notion of stale', () => {
+    assert.equal(nudge({ today: '' }), false);
+    assert.equal(nudge({ today: null }), false);
 });

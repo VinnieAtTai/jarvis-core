@@ -9,7 +9,7 @@ import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
 import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // What code is actually RUNNING, resolved once at load and stated out loud.
@@ -1019,6 +1019,29 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
     // board looks odd" and "the board looks odd because the repo captured this session", which is
     // exactly the diagnosis that cost several sessions before.
     if (autoBound) record({ kind: 'sys', text: 'auto-bound ' + cs + ' to ' + (proj || pproj) + ' as ' + autoBound + ' (inferred from cwd ' + cwdKey(cwd) + ')' });
+    // THE MORNING SCHEDULE PULL, asked rather than done. The hub cannot reach Google itself, so the
+    // day's meetings only appear if a Calendar-capable session goes and gets them — which until now
+    // depended on a human, or a worker, remembering. The decision is a pure helper; what lives here is
+    // the state it cannot see. Best-effort throughout: a schedule file that will not load or a queue
+    // that will not append must never cost somebody their registration.
+    try {
+        const sch = loadSchedule();
+        const today = new Date().toDateString();
+        if (shouldNudgeSchedulePull({ scheduleDate: sch.date, nudgedFor: sch.nudgedFor, today, sessionCwd: cwd, hubCwd: HERE, isSubWorker: !!pproj })) {
+            // Stamp BEFORE queueing, so a failure to deliver cannot leave the day un-stamped and turn
+            // the next register into a second ask.
+            sch.nudgedFor = today;
+            saveSchedule(sch);
+            busAppend({
+                from: 'jarvis', to: uid, kind: 'msg',
+                text: 'The hub schedule is stale (' + (sch.date ? 'dated ' + sch.date : 'never pulled') + ', today is ' + today
+                    + ') and the hub holds no Google credentials, so it cannot refresh itself. If you have Calendar access, list the'
+                    + ' events for today and POST /schedule with them, then tell Chris what is on and flag any collisions.'
+                    + ' If you have no Calendar access, say so in one line and drop it - nobody else will be asked today.',
+            });
+            record({ kind: 'sys', text: 'schedule stale (' + (sch.date || 'never pulled') + '); asked ' + cs + ' to pull today' });
+        }
+    } catch { }
     // Hand every worker the running build. This is the cheapest place to kill the "merged means
     // deployed" error for good: a session learns what code it is talking to before it does any work.
     const out = { uid, callsign: cs, build: BUILD };

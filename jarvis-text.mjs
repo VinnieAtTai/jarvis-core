@@ -78,6 +78,40 @@ export function parseScheduleText(text) {
     return { date: new Date().toDateString(), events, announced: {} };
 }
 
+// Should this registering session be ASKED to pull the day's schedule?
+//
+// The hub holds no Google credentials, so it cannot refresh the schedule itself -- a session with
+// Calendar access has to, and a human who has to remember to ask is a human whose calendar goes five
+// days stale (it did, on 2026-06-23). What the hub CAN do is ask, once a day, of a session that
+// plausibly has that access.
+//
+// The capability test is the working directory: a session booted in the hub's OWN checkout is a JARVIS
+// brain, sharing the config that gives it Calendar in the first place. A TMS worker is not, and
+// nudging one wastes a turn it cannot act on.
+//
+// ONCE a day, deliberately: `nudgedFor` is persisted beside the schedule, so a hub restart cannot
+// re-ask and a fleet registering together cannot turn one chore into six. The cost is a day's pull
+// lost if the session asked turns out to have no Calendar access -- accepted, because
+// jarvis-checkout sessions all carry the same MCP config, so that is a config failure rather than a
+// bad draw, and it announces itself in the log instead of quietly repeating.
+//
+// A SUB-WORKER is never asked. It was spawned for one named job and is usually isolated in a
+// worktree; interrupting it with a chore is how a delegated build turns into a distracted one. The
+// pull belongs to a brain, so it goes to a coordinator or a standalone session.
+//
+// Pure: every fact is passed in. `today` is a day STAMP compared for equality, never parsed -- the
+// caller supplies whatever it already stores (toDateString), so the comparison cannot disagree with
+// the file it is about. Options object rather than positional args: five of the six values are
+// strings, and a mis-ordered pair would read as a working call.
+export function shouldNudgeSchedulePull({ scheduleDate, nudgedFor, today, sessionCwd, hubCwd, isSubWorker } = {}) {
+    if (!today) return false;                       // no notion of "today" -> no notion of stale
+    if (scheduleDate === today) return false;       // already pulled
+    if (nudgedFor === today) return false;          // already asked
+    if (isSubWorker) return false;                  // busy on a delegated job
+    const a = cwdKey(sessionCwd);
+    return !!a && a === cwdKey(hubCwd);
+}
+
 // ---- worklist shape helpers ----------------------------------------------------------------
 // Pure (no I/O) helpers for the on-disk worklist. migrateWork is injectable: the caller passes
 // its own makeTask/newTaskId so the id/time generation stays in jarvis-core, keeping this module
