@@ -1,4 +1,5 @@
-// Unit tests for the two pure helpers behind the CONSOLE SEARCH BOX in console.js.
+// Gate-level tests for the CONSOLE SEARCH BOX in console.js: the two pure helpers behind it, plus a
+// source-level pin on the one structural claim the feature rests on (see THE REUSE PIN below).
 //
 // GET /search shipped without a UI and Chris's reaction was "Where's the search?!", so the box is
 // the half that matters. Almost all of it is DOM work the test suite cannot reach; these two are the
@@ -36,6 +37,42 @@ const fmtWhen = new Function(lift('fmtHM') + '\n' + lift('fmtWhen') + '\nreturn 
 // the same wall-clock time whatever zone the test runs in. Writing "2026-06-03T14:32:00Z" literally
 // would make these assertions pass only in UTC.
 const iso = (y, m, d, h, mi) => new Date(y, m, d, h, mi).toISOString();
+
+// ---------------------------------------------------------------------------------------------
+// THE REUSE PIN. Found by tango at merge review, and worth spelling out because the gap was
+// invisible: the headline claim about this feature is that search renders hits with the CHAT's own
+// bubble markup, so the two cannot drift. tango repointed renderSearch's call at a function that does
+// not exist and the ENTIRE GATE STAYED GREEN -- the claim was load-bearing and completely unpinned.
+// test-support/verify-searchbox-browser.mjs does cover it, but that needs a system Chrome and sits
+// outside test/ on purpose, so it is not the gate. These four assertions put the claim in the gate.
+//
+// Structural assertions over source text are usually a smell. Here the thing being protected IS
+// structure, and there is no runtime hook for it: console.js cannot be imported, only lifted from.
+const RENDER_SEARCH = lift('renderSearch');
+const RENDER_CHAT = lift('renderChat');
+const CHAT_BUBBLE = lift('chatBubble');   // lift() asserts, so a renamed DEFINITION fails right here
+
+test('reuse -- the search view builds its hits with chatBubble, not markup of its own', () => {
+    assert.match(RENDER_SEARCH, /\bchatBubble\s*\(/,
+        'renderSearch must call chatBubble -- if that call is renamed or repointed, search and chat drift apart silently');
+});
+
+test('reuse -- the live chat goes through the SAME builder, so there is only one to maintain', () => {
+    assert.match(RENDER_CHAT, /\bchatBubble\s*\(/,
+        'renderChat must call chatBubble too; re-inlining the markup here is exactly what drift looks like');
+});
+
+test('reuse -- chatBubble is the one place bubble markup lives', () => {
+    assert.match(CHAT_BUBBLE, /class="bubble/, 'chatBubble is meant to own the bubble markup');
+    assert.match(CHAT_BUBBLE, /class="row /, 'and the row wrapper with it');
+});
+
+test('reuse -- neither caller hand-rolls a bubble of its own', () => {
+    for (const [name, body] of [['renderSearch', RENDER_SEARCH], ['renderChat', RENDER_CHAT]]) {
+        assert.doesNotMatch(body, /class="bubble/, name + ' must not build bubble markup itself -- that is the drift this pins');
+        assert.doesNotMatch(body, /class="row /, name + ' must not build the row wrapper itself either');
+    }
+});
 
 test('searchCountLabel -- an untruncated result set states its own size', () => {
     assert.equal(searchCountLabel(2, 2, false), '2 matches');
