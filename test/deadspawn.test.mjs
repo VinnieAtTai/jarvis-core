@@ -95,11 +95,92 @@ test('DEAD SPAWN: junk in or around the stash cannot break the sweep', () => {
 
 // --- diagnoseSpawnLog ---------------------------------------------------------------------------
 
-test('DEAD SPAWN: the folder-trust prompt is readable through the TUI escape soup', () => {
-    // This is the shape the real logs have: the phrase is on screen but wrapped inside a box, so a
-    // naive substring search over the raw bytes finds nothing.
+// A VERBATIM capture of a worker that died on the folder-trust prompt Claude Code actually shows:
+// callsign hotel, 2026-07-30, launched into an untrusted temp directory. Generated from the log file
+// and checked byte-identical -- do NOT retype it and do not tidy it up.
+//
+// It is verbatim because the fixture it replaces was INVENTED, and that is the whole defect. The old
+// one said `Do you trust the files in this folder?` inside a box, which is the pre-2026-07 wording;
+// the signature was written to match the fixture, the fixture agreed with it forever, and neither
+// had anything to do with the bytes on disk. So the test passed for months while the sweep reported
+// `No reason in the log` for every real trust death -- an assumption pinned in place of reality.
+//
+// What makes it the hard case, and what the paraphrase quietly dropped: the words are NOT separated
+// by spaces. Every gap is an ESC[1C cursor-forward and each sentence starts with an absolute ESC
+// cursor move, so the readable sentence exists only once something renders it -- the substring
+// `Quick safety check` does not occur anywhere in these bytes. The flattener is the entire subject.
+const REAL_TRUST_LOG =
+      '\x1b[?9001h\x1b[?1004h\x1b[?25l\x1b[2J\x1b[m\x1b[H\x1b]0;claude\x07\x1b[?25h\x1b[?2004h\x1b[?1004h'
+    + '\x1b[?2031h\x1b[?25l\x1b[>0q\x1b[38;2;255;193;7m\r\n'
+    + '\u2500'.repeat(140)
+    + '\x1b[1m\x1b[3;2HAccessing\x1b[1Cworkspace:\x1b[m\x1b[1m'
+    + '\x1b[5;2HC:\\Users\\vinni\\AppData\\Local\\Temp\\claude\\deadspawn-probe\x1b[22m\x1b[7;2HQuick'
+    + '\x1b[1Csafety\x1b[1Ccheck:\x1b[1CIs\x1b[1Cthis\x1b[1Ca\x1b[1Cproject\x1b[1Cyou\x1b[1Ccreated'
+    + '\x1b[1Cor\x1b[1Cone\x1b[1Cyou\x1b[1Ctrust?\x1b[1C(Like\x1b[1Cyour\x1b[1Cown\x1b[1Ccode,\x1b[1Ca'
+    + '\x1b[1Cwell-known\x1b[1Copen\x1b[1Csource\x1b[1Cproject,\x1b[1Cor\x1b[1Cwork\x1b[1Cfrom\x1b[8;2Hyour'
+    + '\x1b[1Cteam).\x1b[1CIf\x1b[1Cnot,\x1b[1Ctake\x1b[1Ca\x1b[1Cmoment\x1b[1Cto\x1b[1Creview'
+    + '\x1b[1Cwhat\'s\x1b[1Cin\x1b[1Cthis\x1b[1Cfolder\x1b[1Cfirst.\x1b[10;2HClaude\x1b[1CCode\'ll\x1b[1Cbe'
+    + '\x1b[1Cable\x1b[1Cto\x1b[1Cread,\x1b[1Cedit,\x1b[1Cand\x1b[1Cexecute\x1b[1Cfiles\x1b[1Chere.'
+    + '\x1b[38;2;153;153;153m\x1b[12;2HSecurity\x1b[1Cguide\x1b[38;2;177;185;249m\x1b[14;2H>'
+    + '\x1b[38;2;153;153;153m\x1b[1C1.\x1b[38;2;177;185;249m\x1b[1CYes,\x1b[1CI\x1b[1Ctrust\x1b[1Cthis'
+    + '\x1b[1Cfolder\x1b[38;2;153;153;153m\x1b[15;4H2.\x1b[m\x1b[1CNo,\x1b[1Cexit\x1b[38;2;153;153;153m'
+    + '\x1b[17;2HEnter\x1b[1Cto\x1b[1Cconfirm\x1b[1C\u00b7\x1b[1CEsc\x1b[1Cto\x1b[1Ccancel';
+
+test('DEAD SPAWN: the folder-trust prompt is readable through the REAL escape soup', () => {
+    // Pre-fix this returned null, and the sweep said `No reason in the log` about this exact capture.
+    assert.match(diagnoseSpawnLog(REAL_TRUST_LOG), /folder-trust prompt/);
+    // ...and the fixture really is the hard case. If either of these fails, the capture has been
+    // replaced by something easier and the assertion above has quietly stopped meaning anything.
+    assert.ok(!/trust the files/i.test(REAL_TRUST_LOG),
+        'the capture carries the OLD wording, so it is not a capture of the current prompt');
+    assert.ok(!/Quick safety check/.test(REAL_TRUST_LOG),
+        'the words are space-separated in the capture, so nothing here exercises the flattener');
+    assert.match(REAL_TRUST_LOG, /Quick\x1b\[1Csafety/,
+        'the ESC[1C word gaps have been edited out of the capture');
+});
+
+test('DEAD SPAWN: the pre-2026-07 trust wording still reads (an old Claude Code is still a Claude Code)', () => {
+    // Kept deliberately: workers do not all run the same build, and dropping the old phrasing to fix
+    // the new one would just move the silence somewhere harder to find.
     const log = ESC + '[2J' + ESC + '[H' + ESC + '[1m\u2502  Do you ' + ESC + '[0mtrust the\n\u2502  files in this folder?\n';
     assert.match(diagnoseSpawnLog(log), /folder-trust prompt/);
+});
+
+test('DEAD SPAWN: each trust phrasing stands on its OWN, so one rewording cannot mute the diagnosis', () => {
+    // FOUND BY MUTATION PROBE: deleting either current phrasing from the signature killed nothing,
+    // because the real capture happens to carry both of them. The union is redundant deliberately --
+    // that redundancy is the entire guard against the next rewording -- but until this test existed it
+    // was an accident of one fixture rather than a promise, and a later `simplification` down to a
+    // single phrase would have stayed green while removing the guard.
+    for (const only of [
+        'Is this a project you created or one you trust?',
+        '1. Yes, I trust this folder',
+        'Do you trust the files in this folder?',
+    ]) {
+        assert.match(diagnoseSpawnLog(ESC + '[2J' + only + '\n'), /folder-trust prompt/,
+            'this phrasing no longer reads on its own: ' + only);
+    }
+});
+
+test('DEAD SPAWN: a prompt nobody has worded yet still reads as a prompt, not as silence', () => {
+    // THE GUARD, and the reason it exists is one directory up in this file's history: the trust
+    // signature was keyed to a sentence, the sentence changed, and the diagnosis went quiet without
+    // one test going red. The next rewording would do it again. An unrecognised question wearing the
+    // keypress chrome is still a worker waiting for a key nobody can press, so it must answer.
+    const reworded = ESC + '[7;2HIs' + ESC + '[1Cthis' + ESC + '[1Csomething' + ESC + '[1Cnobody'
+        + ESC + '[1Chas' + ESC + '[1Cworded' + ESC + '[1Cthis' + ESC + '[1Cway' + ESC + '[1Cyet?'
+        + ESC + '[14;2H1.' + ESC + '[1CYes' + ESC + '[15;4H2.' + ESC + '[1CNo'
+        + ESC + '[17;2HEnter' + ESC + '[1Cto' + ESC + '[1Cconfirm' + ESC + '[1C\u00b7' + ESC + '[1CEsc'
+        + ESC + '[1Cto' + ESC + '[1Ccancel';
+    assert.match(diagnoseSpawnLog(reworded), /interactive prompt/);
+});
+
+test('DEAD SPAWN: the prompt SHAPE never outranks a cause that is actually named', () => {
+    // The real capture carries the keypress chrome too, so the ordering is load-bearing: let the
+    // generic answer win and every trust death regresses from a named cause to `an interactive
+    // prompt`, which is a worse note than the one this feature shipped with.
+    assert.match(diagnoseSpawnLog(REAL_TRUST_LOG), /folder-trust prompt/);
+    assert.match(diagnoseSpawnLog('The system cannot find the file specified.\nEnter to confirm'), /angle bracket/);
 });
 
 test('DEAD SPAWN: the cmd.exe redirection death is named for what it is', () => {
@@ -139,9 +220,14 @@ test('DEAD SPAWN: the note carries everything needed to go and look', () => {
     assert.ok(!/[^\x20-\x7e]/.test(note), 'curl.exe mangles non-ASCII into tofu; the note must stay plain');
 });
 
-test('DEAD SPAWN: with no reason in the log the note still names the file to open', () => {
+test('DEAD SPAWN: an unrecognised log says so HONESTLY, and still names the file to open', () => {
+    // It used to say `No reason in the log`, and that turned out to be a claim rather than a fact:
+    // the log that exposed the stale trust signature held a complete folder-trust prompt while the
+    // note insisted there was no reason in it. What is true is narrower -- nothing in there matched a
+    // signature we know -- and the difference decides whether the reader opens the file or gives up.
     const note = deadSpawnNote(spawnAt('kilo', 'd:/repo'), null, T0 + 90000);
-    assert.match(note, /No reason in the log/);
+    assert.match(note, /No known signature in the log/);
+    assert.ok(!/No reason in the log/.test(note), 'the note still claims the log holds no reason');
     assert.match(note, /worker-kilo\.log/);
 });
 
@@ -153,7 +239,16 @@ const registered = (hub, cs) => hub.waitFor(cs + ' to register', async () => {
     return row && row.alive ? row : null;
 }, 60000);
 const GOOD_CLAUDE = '@echo off\r\nnode "%~dp0stub-worker.mjs"\r\n';
-const DYING_CLAUDE = '@echo off\r\necho Do you trust the files in this folder?\r\nexit /b 1\r\n';
+// The CURRENT folder-trust wording, not the historical one. This stub used to echo `Do you trust the
+// files in this folder?`, which is the pre-2026-07 phrasing -- so the integration run was matching
+// through the backward-compatibility alternative and never exercised the prompt that actually kills
+// spawns today. Same defect as the unit fixture had, one layer further down, and it is why the
+// end-to-end test stayed green while the diagnosis was dead in production.
+const DYING_CLAUDE = '@echo off\r\n'
+    + 'echo Quick safety check: Is this a project you created or one you trust?\r\n'
+    + 'echo   1. Yes, I trust this folder\r\n'
+    + 'echo   2. No, exit\r\n'
+    + 'exit /b 1\r\n';
 
 test('DEAD SPAWN: the hub notices a worker that never registers, and says why',
     { skip: SKIP, timeout: 300000 }, async (t) => {
@@ -189,7 +284,7 @@ test('DEAD SPAWN: the hub notices a worker that never registers, and says why',
         // read as a missing feature rather than a racing test.)
         const deadLog = join(hub.DATA, 'worker-' + D + '.log');
         await hub.waitFor(D + ' to reach the trust prompt and exit',
-            () => existsSync(deadLog) && /trust the files/.test(readFileSync(deadLog, 'utf8')), 30000);
+            () => existsSync(deadLog) && /Is this a project you created/.test(readFileSync(deadLog, 'utf8')), 30000);
 
         // ---- 3. ...while a HEALTHY worker comes up in the same directory inside the same window ---
         // This is routine (two workers on one repo) and it is what killed the first cut of the
@@ -247,4 +342,96 @@ test('DEAD SPAWN: the hub notices a worker that never registers, and says why',
             assert.equal(sysLines(hub, new RegExp(cs + ' never registered')).length, 0,
                 'a healthy registered worker (' + cs + ') was reported dead');
         }
+
+        // ---- 8. THE SESSION THAT ASKED IS TOLD ---------------------------------------------------
+        // Every observable above reports to the HUMAN -- sys line, /roster row, spoken headline. The
+        // session that DISPATCHED the worker learned nothing, and it is the one that cannot act: a
+        // coordinator sitting on its poll loop cannot tell `delegate still working` from `delegate never
+        // existed`, and the design that keeps managers thin is precisely what stops it noticing.
+        //
+        // THREE doomed spawns in ONE sweep, because there are three separate decisions here and a
+        // single dispatch cannot tell them apart -- the first cut of this step pointed two dispatches at
+        // the same session, and deleting the whole `from` mechanism still passed it by falling through
+        // to the project fallback:
+        //   S1  signed with `from`, no project      -> only the signature can reach its dispatcher, and
+        //                                              the dispatcher is NOT a coordinator
+        //   S2  signed, dispatcher then RETIRES     -> the recipient must be re-resolved, not trusted
+        //   S3  unsigned, nested under the project  -> only the project fallback can reach anybody
+        // They die in the same window, so all three cost one wait.
+        const lead = await hub.post('/register', { cwd: hub.REPO, purpose: 'the dispatch coordinator', project: 'dispatch' });
+        const plain = await hub.post('/register', { cwd: hub.REPO, purpose: 'a plain session that delegates' });
+        // Deliberately NOT nested under `dispatch`: a retiring sub-worker already sends its coordinator
+        // a `retired` message of its own, and that correct behaviour would land in the counts below and
+        // read as a duplicate notification. It measured 3-instead-of-2 on the first run.
+        const goner = await hub.post('/register', { cwd: hub.REPO, purpose: 'a dispatcher that retires first' });
+        for (const r of [lead, plain, goner]) assert.ok(r && r.uid, 'a probe session could not register: ' + JSON.stringify(r));
+
+        writeFileSync(join(hub.BIN, 'claude.cmd'), DYING_CLAUDE);
+        // S1 signs with a CALLSIGN and S2 with a uid, so both halves of what `from` accepts are under
+        // test. /spawn is generous here on purpose -- POST /send already is -- because a coordinator that
+        // types its own callsign should not be silently downgraded to an unattributed spawn.
+        const S1 = await hub.post('/spawn', { cwd: hub.REPO, purpose: 'delegate of a plain session', from: plain.callsign });
+        const S2 = await hub.post('/spawn', { cwd: hub.REPO, purpose: 'delegate whose dispatcher retires', parentProject: 'dispatch', from: goner.uid });
+        const S3 = await hub.post('/spawn', { cwd: hub.REPO, purpose: 'delegate nobody signed for', parentProject: 'dispatch' });
+        for (const r of [S1, S2, S3]) assert.ok(r && r.callsign, '/spawn refused a dispatch: ' + JSON.stringify(r));
+
+        // S2's dispatcher goes away INSIDE the window -- the case a uid stashed at spawn time gets
+        // wrong, and it is not a rare one: a spawn is declared dead ~100s after launch in production.
+        const bye = await hub.post('/retire', { uid: goner.uid, summary: 'retired before its delegate was declared dead', successor: false });
+        assert.ok(bye && bye.ok !== false, '/retire refused: ' + JSON.stringify(bye));
+
+        for (const cs of [S1.callsign, S2.callsign, S3.callsign]) {
+            await hub.waitFor(cs + ' to be swept as never registered',
+                () => sysLines(hub, new RegExp(cs + ' never registered')).length > 0, 60000);
+        }
+
+        // Delivered to the inbox each session is ALREADY sitting on -- the same channel a delegate's own
+        // report arrives on. That is the point: nothing new to watch and no board to poll.
+        const msgsFor = async (uid) => {
+            const r = await hub.get('/poll?uid=' + uid + '&cursor=0');
+            return (r.events || []).filter(e => e.kind === 'msg');
+        };
+        const leadBox = await hub.waitFor('the coordinator to hear about both dispatches nested under it',
+            async () => { const m = await msgsFor(lead.uid); return m.length >= 2 ? m : null; }, 40000);
+        const plainBox = await hub.waitFor('the plain dispatcher to hear about its own',
+            async () => { const m = await msgsFor(plain.uid); return m.length >= 1 ? m : null; }, 40000);
+        const named = (box, cs) => box.find(m => String(m.text || '').includes(cs)) || null;
+
+        // 1. `from` reaches the session that asked -- and it does not have to be a coordinator. Nothing
+        // else could have reached this one: S1 carried no project and no parentProject at all.
+        const one = named(plainBox, S1.callsign);
+        assert.ok(one, 'a plain session that signed its dispatch with `from` was never told: '
+            + JSON.stringify(plainBox.map(m => m.text)));
+
+        // 2. RESOLVED AT SWEEP TIME, not stashed and trusted. S2's dispatcher retired inside the window,
+        // so the uid recorded at spawn time now belongs to a session nothing will ever poll again --
+        // busing the report at it would read as delivered and be seen by nobody. The live coordinator of
+        // the project it was nested under has to catch it instead.
+        assert.ok(named(leadBox, S2.callsign), 'a dispatch whose dispatcher retired was addressed to the corpse: '
+            + JSON.stringify(leadBox.map(m => m.text)));
+
+        // 3. an UNSIGNED dispatch -- the console + button, a voice spawn -- still reaches the coordinator
+        // whose worker it was going to be.
+        assert.ok(named(leadBox, S3.callsign), 'an unsigned dispatch reached nobody: '
+            + JSON.stringify(leadBox.map(m => m.text)));
+
+        // ...and nothing leaked sideways. A delegation report on a session that delegated nothing is a
+        // new kind of noise, not a fix.
+        assert.equal(named(plainBox, S3.callsign), null, 'a session was told about a dispatch that was not its');
+        assert.equal(named(plainBox, S2.callsign), null, 'a session was told about a dispatch that was not its');
+
+        // The message has to carry WHY and that the name is reusable, or the coordinator goes and greps
+        // for both -- which is the busy-work this removes.
+        assert.match(one.text, /folder-trust prompt/, 'the notification does not say WHY: ' + one.text);
+        assert.match(one.text, /freed/, 'the notification does not say the callsign is reusable: ' + one.text);
+        assert.match(one.text, new RegExp('worker-' + S1.callsign + '\\.log'),
+            'the notification does not point at the evidence: ' + one.text);
+
+        // ONCE each, same discipline as step 5. The sweep ticks every few seconds forever, and a report
+        // that is sent but not cleared turns one dead worker into an endless drip on a coordinator's
+        // inbox -- strictly worse than the silence it replaced.
+        await sleep(8000);
+        const about = (box) => box.filter(m => [S1, S2, S3].some(x => String(m.text || '').includes(x.callsign)));
+        assert.equal(about(await msgsFor(lead.uid)).length, 2, 'the coordinator was told more than once');
+        assert.equal(about(await msgsFor(plain.uid)).length, 1, 'the plain dispatcher was told more than once');
     });

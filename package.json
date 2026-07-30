@@ -23,6 +23,7 @@
         "test:cursorgap": "set JARVIS_INTEGRATION=1&& node --test test/cursorgap.test.mjs",
         "test:archive": "set JARVIS_INTEGRATION=1&& node --test test/archive.test.mjs",
         "test:deadspawn": "set JARVIS_INTEGRATION=1&& node --test test/deadspawn.test.mjs",
+        "test:rosterrow": "set JARVIS_INTEGRATION=1&& node --test test/rosterrow.test.mjs",
         "test:integration": "set JARVIS_INTEGRATION=1&& node --test",
         "verify:searchbox": "node test-support/verify-searchbox-browser.mjs",
         "verify:coordchip": "node test-support/verify-coordchip-browser.mjs",
