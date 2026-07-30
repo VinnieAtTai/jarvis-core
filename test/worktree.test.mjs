@@ -313,6 +313,13 @@ test('orphanWorktrees -- the AGE floor: a brand-new tree is spared even when its
     const at = (ms, extra) => orphanWorktrees([{ path: p, createdAt: ms, branch: 'jarvis/verify' }], {}, T0, { ...KEYS, ...extra });
     assert.deepEqual(at(T0 - 180000), [], 'three minutes old, the age oscar\'s tree died at');
     assert.deepEqual(at(T0 - 600000), [p], 'ten minutes old is fair game');
+    // Exactly on the floor, which is the one input neither of the two above reaches: 3 minutes is
+    // comfortably under and 10 comfortably over, so nothing pinned whether the comparison is < or
+    // <=. Both spellings pass every other assertion here -- bravo mutation-probed <= and it was the
+    // one survivor of nine. The floor is EXCLUSIVE: at the TTL the hub can already know its own mint
+    // failed, so the tree is fair game. One millisecond of a 5-minute safety margin either way is not
+    // the point; an unpinned boundary that no fixture reaches is.
+    assert.deepEqual(at(T0 - 300000), [p], 'exactly at the floor is collected -- the floor is exclusive');
     // Injectable like staleMs, so a caller can tighten or widen the floor without editing this file.
     assert.deepEqual(at(T0 - 180000, { minAgeMs: 60000 }), [p]);
     // Epoch millis or an ISO string: a caller holding a stat has the first, one reading a record has
