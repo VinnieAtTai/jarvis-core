@@ -218,6 +218,61 @@ try {
         ok(stored.includes(RUNON), 'and so is the un-separated one (NO MIGRATION -- the renderer adapted, the cards did not)');
         ok(stored.includes(SHORT), 'and the short one');
 
+        // 13. THE CARET IS BIG ENOUGH TO HIT, AND COST NOTHING TO MAKE SO. Measured, because a CSS
+        //     padding change has no unit test that can honestly fail -- assert the rendered geometry
+        //     or admit there is no pin at all. Before the fix the carets were 12.6x18 on the rail and
+        //     a task row and 12.6x14 on the doing-line (177 sq px, the smallest interactive target on
+        //     the card -- the copy chip is 315 and the speaker button 349). Reverting the padding pair
+        //     in console.css puts them back under 300 and fails the first check here.
+        //
+        //     The second check is the one that matters more. The enlargement is only free if the glyph
+        //     does not move: padding grows the hit box, the equal negative margin hands the space back
+        //     to layout. If someone later drops the margin and keeps the padding, the carets stay
+        //     comfortable and every row silently grows -- which is why the footprint is pinned too, and
+        //     pinned against the ROW, not against a remembered number that would rot.
+        const caretGeom = await page.evaluate((c) => {
+            const one = (sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return null;
+                const r = el.getBoundingClientRect(), st = getComputedStyle(el);
+                const n = (v) => parseFloat(v) || 0;
+                return {
+                    area: r.width * r.height,
+                    // margin box -- what actually occupies space in the row
+                    mw: r.width + n(st.marginLeft) + n(st.marginRight),
+                    mh: r.height + n(st.marginTop) + n(st.marginBottom),
+                };
+            };
+            // A row that HAS a caret, and a row that does not, as the layout-shift control. Measuring
+            // the caret against its own row cannot work: the caret is a flex item, so a taller caret
+            // makes its row taller and the comparison passes no matter what. The caret-less short card
+            // is the only honest reference on the page.
+            const rowsWith = [...document.querySelectorAll(c + '.witem')].filter(r => r.querySelector('.hlmore'));
+            const rowsWithout = [...document.querySelectorAll(c + '.witem')].filter(r => !r.querySelector('.hlmore'));
+            const h = (el) => el ? el.getBoundingClientRect().height : 0;
+            return {
+                rail: one('#mission .hlmore'),
+                row: one(c + '.witem .hlmore'),
+                doing: one(c + '.bdoing .hlmore'),
+                // the SHORTEST row that carries a caret, so a legitimately wrapped row cannot mask a shift
+                withCaretH: rowsWith.length ? Math.min(...rowsWith.map(h)) : 0,
+                withoutCaretH: rowsWithout.length ? Math.min(...rowsWithout.map(h)) : 0,
+            };
+        }, CARD);
+        for (const [where, g] of Object.entries({ rail: caretGeom.rail, 'task row': caretGeom.row, 'doing-line': caretGeom.doing })) {
+            ok(g && g.area >= 300, 'the ' + where + ' caret is a comfortable click target',
+                g ? Math.round(g.area) + ' sq px, want >= 300' : 'caret not found');
+        }
+        // A row carrying a caret must be exactly as tall as one that carries none. Written this way
+        // after the first version SURVIVED its mutant: it compared the caret to its own row, and since
+        // the caret is a flex item its row grows with it, so the check could not fail. Dropping the
+        // negative margin and keeping the padding now fails here -- which is the whole point, because
+        // that mutant leaves the carets comfortable and silently inflates every row on the board.
+        ok(caretGeom.withCaretH > 0 && caretGeom.withoutCaretH > 0
+            && Math.abs(caretGeom.withCaretH - caretGeom.withoutCaretH) <= 0.5,
+            'and it costs the row no height -- a row with a caret is as tall as one without',
+            'with ' + caretGeom.withCaretH.toFixed(1) + 'px vs without ' + caretGeom.withoutCaretH.toFixed(1) + 'px');
+
         ok(pageErrors.length === 0, 'still no uncaught page errors after the whole walkthrough', pageErrors.join(' | '));
         if (consoleErrors.length) notes.push('console.error output (may be pre-existing): ' + consoleErrors.slice(0, 4).join(' | '));
     } finally {
