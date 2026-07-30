@@ -785,6 +785,35 @@ function missionIdOfCard(b, boards) {
     const owner = (boards || []).find(x => x && String(x.callsign || '').toLowerCase() === key);
     return (owner && owner.projectContext && owner.projectContext.missionId) || null;
 }
+// What ROLE a rail row plays under its mission: 'coord' (the brain), 'sub' (hangs off it), or
+// 'worker' (belongs to no mission — unreachable on the rail, since a row only gets here by matching
+// one). Hoisted + named so the gate can lift it, same as missionIdOfCard above.
+//
+// THE RULE, and it is a judgement call: a row is the coordinator when it carries its OWN project card
+// — NOT when it currently happens to have sub-workers under it. Role is a property of how the session
+// is BOUND, not of how many children exist this second. Sub-workers spawn and retire constantly, so a
+// has-children rule would flash the chip on and off on a panel Chris keeps pinned, and would leave a
+// lone coordinator unlabelled at exactly the moment there is no indentation to hint at a hierarchy
+// either. "Has children" is also the one thing the rail already says out loud: that is what the indent
+// and the arrow are for. So the chip answers a question the rail cannot otherwise answer.
+//
+// Deliberately the exact negation of the old inline `sub` flag, so nesting cannot drift from labelling:
+// the same predicate that made this row a PARENT is the one that calls it the coordinator.
+function railRole(b) {
+    if (!b) return 'worker';
+    if (b.projectContext && b.projectContext.missionId) return 'coord';
+    return b.parentProject ? 'sub' : 'worker';
+}
+// The COORD chip's tooltip: the role in words, the project it coordinates, and the session driving it.
+// Pure + named so the gate can lift it — the project title is operator-supplied text landing in a
+// title attribute, so its escaping is asserted rather than assumed.
+function coordTip(b) {
+    const pc = (b && b.projectContext) || null;
+    const proj = (pc && (pc.title || pc.name)) || String((b && b.callsign) || 'this project').toUpperCase();
+    const who = (b && b.worker) ? String(b.worker).toUpperCase() : '';
+    return 'COORDINATOR of ' + proj + (who ? ', run by session ' + who : '')
+        + ' -- it holds the project context and dispatches the sub-workers indented under it.';
+}
 // Mission rail: the pinned, always-visible objectives panel (#mission, separate from #work).
 // Phase rows toggle done on click; doc chips open via the document-level data-open listener.
 // There is deliberately NO close control — a mission is closed only by the voice gate.
@@ -802,15 +831,32 @@ function renderMissions(list, boards) {
     const workersFor = (mid) => _boards.filter(b => b && b.uid && missionIdOfCard(b, _boards) === mid)
         .sort((a, b) => (a.parentProject ? 1 : 0) - (b.parentProject ? 1 : 0));
     const workerRow = (b) => {
+        const role = railRole(b);
         const cs = String(b.callsign || '').toUpperCase();
         const idle = b.alive === false;
         const doing = b.needsYou ? 'NEEDS YOU' : (b.doing || (idle ? 'quiet' : 'standing by'));
         // A sub-worker is indented under its coordinator so the rail shows the hierarchy rather than
         // one flat list — the coordinator is the brain, the rest hang off it.
-        const sub = !!(b.parentProject && !(b.projectContext && b.projectContext.missionId));
-        return '<div class="mworker" style="display:flex;align-items:baseline;gap:6px;font-size:11px;padding:2px 0' + (sub ? ' 2px 12px' : '') + ';color:' + (idle ? '#6b7a89' : '#9bb0c4') + '">'
+        const sub = role === 'sub';
+        // WHO is driving this row. A coordinator's row is keyed by the PROJECT ('primeng'), so the
+        // session actually running it appeared nowhere on the rail — Chris asked "isn't oscar the
+        // coordinator?" of a row that never said oscar. b.worker carries it, and the board card already
+        // prints that same field in this same .cworker style (see the chead build below). Coordinator
+        // rows ONLY: a sub-worker's own callsign already IS b.callsign, so printing both there would
+        // render LIMA twice.
+        const who = (role === 'coord' && b.worker)
+            ? '<span class="cworker">&#183; ' + esc(String(b.worker).toUpperCase()) + '</span>' : '';
+        // ...and WHAT ROLE it plays, so the brain is identifiable from the rail's structure instead of
+        // from whatever the session happened to type into its doing-line — which is the whole defect:
+        // at the moment Chris looked, the coordinator's line said "working: bulk-operations guard fix"
+        // and read as a third peer.
+        const chip = role === 'coord'
+            ? '<span class="coordchip" title="' + escAttr(coordTip(b)) + '">COORD</span>' : '';
+        return '<div class="mworker ' + role + (idle ? ' idle' : '') + '" style="display:flex;align-items:baseline;gap:6px;font-size:11px;padding:2px 0' + (sub ? ' 2px 12px' : '') + ';color:' + (idle ? '#6b7a89' : '#9bb0c4') + '">'
             + (sub ? '<span style="color:#3d5568;font-size:10px">&#8627;</span>' : '')
             + '<span style="font-weight:bold;color:' + (idle ? '#6b7a89' : '#c9b98a') + ';letter-spacing:.5px">' + esc(cs) + '</span>'
+            + who
+            + chip
             + activityIndicator(b)
             + '<span style="opacity:.9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(doing) + '</span>'
             + '</div>';

@@ -20,7 +20,8 @@
         "test:search": "set JARVIS_INTEGRATION=1&& node --test test/search.test.mjs",
         "test:archive": "set JARVIS_INTEGRATION=1&& node --test test/archive.test.mjs",
         "test:integration": "set JARVIS_INTEGRATION=1&& node --test",
-        "verify:searchbox": "node test-support/verify-searchbox-browser.mjs"
+        "verify:searchbox": "node test-support/verify-searchbox-browser.mjs",
+        "verify:coordchip": "node test-support/verify-coordchip-browser.mjs"
     },
     "dependencies": {
         "node-pty": "^1.1.0",
