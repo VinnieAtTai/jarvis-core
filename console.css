@@ -108,7 +108,18 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,"Segoe UI Emoji","S
 .expander{cursor:pointer;color:#5db4d9 !important;text-decoration:none}
 /* Headline / detail. The caret is the ONLY affordance saying a line has been shortened, so it stays
    visible at rest rather than appearing on hover -- a hidden one reads as "that is the whole card". */
-.hlmore{flex:none;cursor:pointer;color:#5db4d9;font-size:12px;opacity:.75;padding:0 3px;user-select:none;text-decoration:none}
+/* The padding/negative-margin pair is a HIT-BOX enlargement, not a size change: the padding grows
+   the clickable area, the equal negative margin gives the space straight back to layout, so the
+   footprint and the glyph are byte-for-byte what they were. Measured in real Chrome before and
+   after -- 12.6x14 (177 sq px) to 22.6x26 (588) on the tightest surface, with every row y, the card
+   height and the rail height unmoved. It has to be BOTH values: this class lands in two different
+   formatting contexts -- blockified as a flex item in .witem and on the rail, plain inline inside
+   .bdoing -- so padding alone would grow the flex rows while doing nothing for layout inline.
+   Why bother: at 12.6px wide it was the smallest interactive target on the card by a wide margin
+   (copy chip 315 sq px, speaker button 349). That is under the 24px WCAG 2.5.8 minimum, but the
+   criterion exempts an inline target constrained by line-height -- so this is comfort, not a
+   conformance fix, and the record should not claim otherwise. */
+.hlmore{flex:none;cursor:pointer;color:#5db4d9;font-size:12px;opacity:.75;padding:6px 8px;margin:-6px -5px;user-select:none;text-decoration:none}
 .hlmore:hover{opacity:1}
 /* flex-basis:100% drops the detail onto its own full-width line inside .witem's wrapping flex row,
    the same way .wnote does; line-through on a done row must not bleed into it. */
