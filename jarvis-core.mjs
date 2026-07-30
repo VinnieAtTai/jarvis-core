@@ -1353,7 +1353,7 @@ function retireSession(uid, summary, opts = {}) {
         let psucc = null;
         const held = opts.successor && s.cwd && s.purpose ? coordinatorHeld(s.project) : null;
         if (opts.successor && s.cwd && s.purpose && !held) {
-            try { psucc = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec, undefined, s.project, undefined, undefined, s.branch); } catch { psucc = null; }
+            try { psucc = spawnWorker(resolveRepo(s.cwd), s.purpose, { model: opts.model, handoff: rec, project: s.project, inheritBranch: s.branch }); } catch { psucc = null; }
         } else if (held) {
             const who = held.callsign || held.uid;
             record({ kind: 'sys', text: 'no successor for ' + s.project + ': ' + who + ' is already ' + (held.kind === 'live' ? 'coordinating it' : 'booting as its coordinator') + '; the project card keeps the unfinished work' });
@@ -1395,7 +1395,7 @@ function retireSession(uid, summary, opts = {}) {
         // commit the predecessor just made — including the WIP we committed above — on a branch
         // nobody is working on, which is the same "work quietly stranded" failure the WIP commit
         // exists to prevent.
-        try { succCs = spawnWorker(resolveRepo(s.cwd), s.purpose, opts.model, rec, undefined, undefined, undefined, s.parentProject, s.branch); }
+        try { succCs = spawnWorker(resolveRepo(s.cwd), s.purpose, { model: opts.model, handoff: rec, parentProject: s.parentProject, inheritBranch: s.branch }); }
         catch { succCs = null; }
     }
     if (succCs) {
@@ -1526,7 +1526,7 @@ function reviveMissionCoordinator(proj) {
         return null;
     }
     let cs = null;
-    try { cs = spawnWorker(resolveRepo(cwd), proj.title || proj.name, undefined, null, undefined, proj.name); }
+    try { cs = spawnWorker(resolveRepo(cwd), proj.title || proj.name, { project: proj.name }); }
     catch { cs = null; }
     if (cs) {
         // No bookkeeping to do here: spawnWorker already put this callsign in pendingBind bound to
@@ -2277,8 +2277,17 @@ const SPAWN_SWEEP_MS = Math.min(15000, Math.max(2000, Math.round(SPAWN_TIMEOUT_M
 // can SHOW the failure instead of everyone grepping the transcript for a gap. Deliberately in memory
 // and capped: the durable, searchable copy is the sys line, this is only the live view.
 const deadSpawns = [];
-function watchSpawn(cs, cwd, repoKey, log) {
-    pendingSpawns.set(cs, { cs, cwd: cwd || '', repoKey: repoKey || '', log: log || null, at: Date.now() });
+// `dispatch` is what makes a death reportable to the session that caused it: {spawnedBy, forProject}.
+// BOTH are stored, and neither is trusted later without re-checking -- see notifyDeadSpawnDispatcher.
+// spawnedBy is the uid that asked; forProject is the project this worker was being nested under, kept
+// as the fallback for a dispatch nobody signed (the console + button, a voice spawn) and as the way
+// to reach a SUCCESSOR coordinator when the original dispatcher retires inside the window.
+function watchSpawn(cs, cwd, repoKey, log, dispatch) {
+    pendingSpawns.set(cs, {
+        cs, cwd: cwd || '', repoKey: repoKey || '', log: log || null, at: Date.now(),
+        spawnedBy: (dispatch && dispatch.spawnedBy) || null,
+        forProject: (dispatch && dispatch.forProject) || null,
+    });
 }
 // The tail of a worker's log, which is where the answer has actually been every time one of these
 // died. pty-host truncates this file as it starts, so whatever is in it belongs to THIS spawn.
@@ -2305,6 +2314,48 @@ function readLogTail(path, maxBytes = 65536) {
 // too -- so all four go together here, or a dead TRUSTED spawn would lend its tier, or its project
 // binding, to whoever gets the name. The worktree is released but never torn down: it is evidence,
 // and the orphan sweep already owns collecting it.
+// TELL THE SESSION THAT ASKED. Everything else about a dead spawn was already surfaced -- a sys
+// line, a /roster row, a spoken headline -- and all three go to the HUMAN. The coordinator that
+// dispatched the worker learned nothing at all: it just never heard back, which is indistinguishable
+// from a delegate still working, and the manager-stays-thin design means it is sitting on its poll
+// loop rather than watching a board. So it waits forever on a worker that does not exist.
+//
+// THE RECIPIENT IS RESOLVED HERE, NOT AT SPAWN TIME, and that is the whole care in this function.
+// A spawn is declared dead ~100 seconds after launch, which is comfortably long enough for the
+// dispatcher to have retired and been replaced -- and a uid captured at spawn time and trusted now
+// would be a message addressed to a corpse: bused to a session nothing will ever poll again, so it
+// reads as delivered and is never seen. Same hazard the sub-worker retire notify guards, and the
+// same rule the store learned the hard way: verify state at the moment you ACT, not at the moment
+// you were told.
+//
+// Order of preference:
+//   1. the uid that asked, if it is still a session that can poll;
+//   2. else the LIVE coordinator of the project the worker was being nested under -- which covers a
+//      successor that inherited the delegation, and covers a dispatch nobody signed (the console
+//      button, a voice spawn) where the project's coordinator is the session actually affected;
+//   3. else nobody. The human has already been told three ways; inventing a recipient would only
+//      put a delegation report on a session that never delegated anything.
+function notifyDeadSpawnDispatcher(e, reason) {
+    // Not aliveNow(): a bused event WAITS on the cursor, so a momentarily quiet session still gets
+    // it the next time it polls. `ended` is the real disqualifier -- a retired uid is never polled
+    // again, so that and only that makes the message unreadable.
+    const reachable = uid => !!(uid && roster.sessions[uid] && !roster.sessions[uid].ended);
+    let to = reachable(e.spawnedBy) ? e.spawnedBy : null;
+    if (!to && e.forProject) {
+        const pc = coordinatorHeld(e.forProject);
+        // kind === 'live' matters: a BOOTING coordinator has not registered, so there is no uid an
+        // event could be addressed to yet.
+        if (pc && pc.kind === 'live' && reachable(pc.uid)) to = pc.uid;
+    }
+    if (!to) return;
+    busAppend({
+        from: 'jarvis', to, kind: 'msg',
+        text: 'the worker you dispatched (' + e.cs + ') never came up, so nothing is coming back from it: '
+            + (reason || 'no known signature in its log') + '. It was launching in ' + (e.cwd || 'an unknown directory')
+            + '. Its callsign and reservations are already freed, so re-dispatch if you still need the work.'
+            + (e.log ? ' Evidence: ' + e.log + '.' : ''),
+    });
+}
 function sweepDeadSpawns() {
     if (!pendingSpawns.size) return;
     const now = Date.now();
@@ -2319,10 +2370,21 @@ function sweepDeadSpawns() {
         deadSpawns.unshift({ callsign: e.cs, cwd: e.cwd, repoKey: e.repoKey, log: e.log, reason: reason || null, at: new Date(e.at).toISOString() });
         if (deadSpawns.length > 10) deadSpawns.length = 10;
         enqueueSay(e.cs + ' never came up. Details in chat.', 'jarvis');
+        // Its OWN try: a notification that cannot be delivered must not cost the remaining entries
+        // their report. pendingSpawns.delete has already happened above, so a throw here would lose
+        // every later death in this pass silently -- and silence is the bug being fixed.
+        try { notifyDeadSpawnDispatcher(e, reason); } catch (err) { logCrash('dead-spawn-notify-failed', err); }
     }
 }
 setInterval(() => { try { sweepDeadSpawns(); } catch (e) { logCrash('dead-spawn-sweep-failed', e); } }, SPAWN_SWEEP_MS).unref();
-function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, parentProject, inheritBranch) {
+// WHY AN OPTIONS BAG rather than a tenth parameter. This took NINE positionals, and two call
+// sites had already reached `spawnWorker(a, b, c, d, undefined, undefined, undefined, e, f)` -- at
+// which point nobody can tell tier from project from meeting without counting commas, and the
+// `undefined` runs are load-bearing punctuation. Every one of these is optional and independent of
+// the others, which is the shape an object is for. `spawnedBy` is the new one: WHO ASKED for this
+// worker, so that if the launch dies before it registers there is somebody to tell.
+function spawnWorker(repo, purpose, opts = {}) {
+    const { model, handoff, tier, project, meeting, parentProject, inheritBranch, spawnedBy } = opts || {};
     const cs = assignCallsign();
     pendingPins.set(cs, Date.now());
     const effTier = (tier || repo.tier) === 'trusted' ? 'trusted' : null;
@@ -2377,7 +2439,7 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
     // answer "The system cannot find the file specified" and the worker never registered at all. The
     // rest of the boot text has always been angle-bracket free, and safePurpose above strips the same
     // class from the one part a human controls. Placeholders go in quotes instead.
-    if (project) boot += ' You DELEGATE the heavy work rather than doing it yourself. To dispatch a sub-worker: POST http://127.0.0.1:' + PORT + '/spawn {"cwd":"the repo path","purpose":"one short speakable line","parentProject":"' + project + '"} - the response carries the new callsign, and it is parentProject that nests the worker under ' + project + ' instead of minting an unrelated session. Brief it with POST http://127.0.0.1:' + PORT + '/send {"from":"your uid","to":"its callsign","text":"goals, paths, constraints"} - send goals and paths, never file contents it can read itself. When it retires, its one-line summary auto-appends to the ' + project + ' project log AND arrives as a message on your poll loop, so you get the outcome back without watching for it. The discipline that makes this worth doing: delegate the HEAVY work (long builds, wide sweeps, deep research) and stay THIN and responsive. A coordinator that disappears into a twenty-minute turn cannot be reached, cannot re-plan, and has become the bottleneck it was meant to remove.';
+    if (project) boot += ' You DELEGATE the heavy work rather than doing it yourself. To dispatch a sub-worker: POST http://127.0.0.1:' + PORT + '/spawn {"cwd":"the repo path","purpose":"one short speakable line","parentProject":"' + project + '","from":"your uid"} - the response carries the new callsign, and it is parentProject that nests the worker under ' + project + ' instead of minting an unrelated session. Always include "from": a spawn can die before it ever registers, and "from" is how the hub knows to tell YOU rather than leaving you waiting on a worker that does not exist. Brief it with POST http://127.0.0.1:' + PORT + '/send {"from":"your uid","to":"its callsign","text":"goals, paths, constraints"} - send goals and paths, never file contents it can read itself. When it retires, its one-line summary auto-appends to the ' + project + ' project log AND arrives as a message on your poll loop, so you get the outcome back without watching for it. The discipline that makes this worth doing: delegate the HEAVY work (long builds, wide sweeps, deep research) and stay THIN and responsive. A coordinator that disappears into a twenty-minute turn cannot be reached, cannot re-plan, and has become the bottleneck it was meant to remove.';
     // If this project drives a mission, the human talks to the MISSION (not to you by callsign), so a
     // message can land on the durable mission thread while no coordinator is live — the very message
     // that auto-revived you. Tell the coordinator to catch up on that thread the instant it registers;
@@ -2415,7 +2477,7 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
         worktree: wt ? { path: wt.path, branch: wt.branch, base: wt.base, repoCwd: repo.cwd, repoKey: repo.key } : null,
     };
     if (CONSOLELESS && spawnWorkerConsoleless(cs, runRepo, boot, model, hookSettings, hostMeta)) {
-        watchSpawn(cs, runRepo.cwd, repo.key, join(DATA, 'worker-' + cs + '.log'));
+        watchSpawn(cs, runRepo.cwd, repo.key, join(DATA, 'worker-' + cs + '.log'), { spawnedBy, forProject: subOf || boundTo });
         record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + runRepo.cwd + ' (' + repo.key + ')' + (wt ? ' [worktree ' + wt.branch + ']' : '') + ' [console-less]' });
         return cs;
     }
@@ -2450,7 +2512,7 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
         c2.unref();
     });
     child.unref();
-    watchSpawn(cs, runRepo.cwd, repo.key, null);
+    watchSpawn(cs, runRepo.cwd, repo.key, null, { spawnedBy, forProject: subOf || boundTo });
     record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + runRepo.cwd + ' (' + repo.key + ')' + (wt ? ' [worktree ' + wt.branch + ']' : '') });
     return cs;
 }
@@ -2738,7 +2800,7 @@ function handleUtterance(rawText, typed) {
         const model = /cheap|haiku|fast/.test(adj) ? 'haiku' : undefined;
         const tier = /trusted|autonomous/.test(adj) ? 'trusted' : undefined;
         const purpose = (parts[1] || repo.defaultPurpose || repo.key).trim();
-        const cs = spawnWorker(repo, purpose, model, undefined, tier);
+        const cs = spawnWorker(repo, purpose, { model, tier });
         enqueueSay('Launching ' + cs + ' in ' + repo.key + ' for ' + purpose + (model ? ', on ' + model : '') + (tier ? ', trusted' : '') + '. It will check in shortly.', 'jarvis');
         return;
     }
@@ -3160,10 +3222,46 @@ async function handleRequest(req, res) {
         return json(res, 200, { ok: true, uid, callsign: s.callsign, tier });
     }
     if (key === 'GET /roster') {
+        // A row here has to be able to answer WHAT THIS SESSION IS DOING, because that is what this
+        // endpoint gets asked. It answered only who and where: no doing, no context, no project, no
+        // parentProject, no worktree, no branch -- and those fields were ABSENT rather than empty,
+        // which is the worse failure, because a reader cannot tell `not reported` from `not
+        // projected`. Measured cost, 2026-07-30: a coordinator checked on its own sub-worker through
+        // /roster, saw no `doing` line, and told Chris the worker was idle. It had posted /health five
+        // times, the most recent two minutes earlier. The coordinator's OWN row showed no context
+        // either despite two posts of its own -- which is what proves the endpoint was the liar and
+        // not the workers.
+        //
+        // None of this is a new fact. Every field below already lives on the roster row, and GET
+        // /board has been projecting them for months -- the board had to reach in here to get them,
+        // because `doing` and `context` are properties of a SESSION however you slice the UI. The
+        // expressions are deliberately spelled the same way /board spells them, so the two endpoints
+        // cannot drift into giving different answers about one session; a roster-vs-board diff is
+        // already something sessions do, and it has already produced one false defect report.
         const live = liveCallsigns().map(cs => {
             const uid = liveUidOf(cs);
             const s = roster.sessions[uid];
-            return { callsign: cs, uid, purpose: s.purpose, cwd: s.cwd, started: s.started, lastSeen: s.lastSeen, alive: aliveNow(uid) };
+            return {
+                callsign: cs, uid, purpose: s.purpose, cwd: s.cwd, started: s.started,
+                lastSeen: s.lastSeen, alive: aliveNow(uid),
+                // Never-posted reads as null / '' rather than missing, exactly as on /board: a session
+                // that has not reported and a session the endpoint forgot to describe must not look
+                // the same, since that is the confusion this whole row is being widened to end.
+                context: s.ctx !== undefined ? s.ctx : null,
+                doing: s.doing || '',
+                // How the session is BOUND. registerSession keeps these mutually exclusive, so between
+                // them a reader can tell a coordinator from a sub-worker from a standalone session
+                // without a second fetch -- the other half of the same complaint, since a coordinator
+                // asking after `its` workers first has to know which ones are its.
+                project: s.project || null,
+                parentProject: s.parentProject || null,
+                // ISOLATION, and it has already been mis-read off this endpoint: with these absent, a
+                // sub-worker in its own worktree is indistinguishable from one sharing the human's
+                // checkout, and the roster was the wrong place to have to answer `git worktree list`.
+                // null means the session genuinely runs in cwd.
+                worktree: s.worktree || null,
+                branch: s.branch || null,
+            };
         });
         const retired = Object.entries(roster.sessions)
             .filter(([, s]) => s.ended)
@@ -3451,7 +3549,7 @@ async function handleRequest(req, res) {
         let cs = null;
         roster.handoffs = roster.handoffs || {};
         const handoff = roster.handoffs[handoffKey(h.cwd, h.purpose)] || null;
-        try { cs = spawnWorker(resolveRepo(h.cwd), h.purpose, b.model, handoff); } catch { cs = null; }
+        try { cs = spawnWorker(resolveRepo(h.cwd), h.purpose, { model: b.model, handoff }); } catch { cs = null; }
         if (!cs) {
             enqueueSay('I could not spin that back up, so it is still on hold. Try again.', 'jarvis');
             return json(res, 500, { error: 'spawn failed', stillHeld: true, key: h.key });
@@ -3861,7 +3959,15 @@ async function handleRequest(req, res) {
             held = coordinatorHeld(project);
             if (held) { parentProject = project; project = null; }
         }
-        const cs = spawnWorker(repo, purpose, b.model, handoff, b.tier, project, b.meeting, parentProject);
+        // WHO ASKED, so a launch that dies before registering can be reported back to them. Accepts a
+        // uid or a callsign, the same generosity POST /send already shows, because a coordinator that
+        // types its own callsign here should not be silently downgraded to an unattributed spawn. An
+        // absent or unknown `from` is not an error: the human spawns from the console and by voice, and
+        // the sweep falls back to the project's coordinator for exactly that case.
+        const asked = String(b.from || '').trim();
+        const spawnedBy = (roster.sessions[asked] && !roster.sessions[asked].ended)
+            ? asked : liveUidOf(asked.toLowerCase()) || null;
+        const cs = spawnWorker(repo, purpose, { model: b.model, handoff, tier: b.tier, project, meeting: b.meeting, parentProject, spawnedBy });
         const subOf = (!project && parentProject) ? parentProject : null;
         if (held) {
             record({ kind: 'sys', text: 'spawn: ' + parentProject + ' already has a coordinator (' + (held.callsign || held.uid) + ' is ' + (held.kind === 'live' ? 'live' : 'booting') + '), so ' + cs + ' launches as its sub-worker instead' });

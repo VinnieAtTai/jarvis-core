@@ -1410,10 +1410,29 @@ export function diagnoseSpawnLog(text) {
         .replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, ' ')
         .replace(/[^\x20-\x7e]+/g, ' ')
         .replace(/\s+/g, ' ');
-    if (/trust the files/i.test(flat)) return 'it stopped on Claude Code folder-trust prompt -- nobody can press Enter on a console-less worker';
+    // FOLDER TRUST, and its wording is NOT a constant. `trust the files` is the pre-2026-07
+    // phrasing and it had already aged into a no-op: measured against a real capture of the prompt
+    // Claude Code shows today it matches ZERO times, so a textbook trust death reported `No reason
+    // in the log` -- the one failure this whole feature exists to name, back to being silent. Three
+    // independent phrasings now, because the sentence is product copy and the next release can
+    // reword it again:
+    //   `trust the files`               pre-2026-07 wording, kept so an older Claude Code still reads
+    //   `is this a project you created` the current question
+    //   `trust this folder`             the current option label (`1. Yes, I trust this folder`)
+    if (/trust the files|is this a project you created|trust this folder/i.test(flat)) return 'it stopped on Claude Code folder-trust prompt -- nobody can press Enter on a console-less worker';
     if (/cannot find the file specified/i.test(flat)) return 'cmd.exe could not run the boot prompt -- a stray angle bracket in it is a redirection';
     if (/node-pty unavailable/i.test(flat)) return 'the worker host could not load node-pty';
     if (/invalid api key|please run \/login|\bnot logged in\b/i.test(flat)) return 'claude is not authenticated';
+    // ANY interactive prompt, recognised by SHAPE instead of by its sentence -- the guard against
+    // the failure above happening again. A phrase-keyed signature is one release away from going
+    // quiet, and when it goes quiet this function returns null and the note claims there is no
+    // reason in a log that plainly holds one. The keypress chrome is the part a console-less worker
+    // can never satisfy, which is also precisely the diagnosis, so it degrades honestly: a re-worded
+    // trust dialog, or a prompt nobody has seen yet, still comes back as an answer rather than
+    // silence. Ordered AFTER the named signatures so the specific cause always wins, and BEFORE the
+    // exit code for the reason the exit-code test already pins -- a worker stopped on a prompt and
+    // then killed shows both, and the prompt is the cause while the exit is only the symptom.
+    if (/enter to confirm|esc to cancel/i.test(flat)) return 'it stopped on an interactive prompt -- nobody can press a key on a console-less worker';
     const ex = [...flat.matchAll(/worker exited \((-?\d+)\)/gi)].pop();
     if (ex) return 'claude exited (code ' + ex[1] + ') before it registered';
     return null;
@@ -1428,6 +1447,10 @@ export function deadSpawnNote(entry, reason, now) {
     const age = secs === null ? '' : ' (' + secs + 's after launch)';
     return e.cs + ' never registered' + age + ': spawned in ' + (e.cwd || 'an unknown directory')
         + (e.repoKey ? ' (' + e.repoKey + ')' : '') + '. '
-        + (reason ? reason[0].toUpperCase() + reason.slice(1) : 'No reason in the log') + '.'
+        // `No known signature`, not `No reason`. The log almost always HOLDS the reason -- the one
+        // time this mattered it held a full folder-trust prompt -- and claiming there was no reason
+        // sent the reader away from the only evidence there is. Say what is actually true: nothing in
+        // there matched a signature we know, and the file is named immediately after this.
+        + (reason ? reason[0].toUpperCase() + reason.slice(1) : 'No known signature in the log') + '.'
         + (e.log ? ' Evidence: ' + e.log + '.' : '') + ' Callsign freed.';
 }
