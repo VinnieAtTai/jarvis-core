@@ -185,6 +185,21 @@ test('wedgeEscalateDue -- a condition never announced fires immediately', () => 
     assert.equal(wedgeEscalateDue({ count: 0, lastAt: NOW }, NOW), true);
 });
 
+test('wedgeEscalateDue -- the never-announced guard, pinned by the input that REACHES it', () => {
+    // Split from the test above because that one passes whether or not the guard exists: with
+    // {count: 0, lastAt: now}, WEDGE_ESCALATE_MS[0] is 0 and `now - lastAt >= 0` is true anyway, so
+    // deleting `|| !state.count` survives it untouched. It agrees with the table rather than checking
+    // the guard -- found by mutation probe, and it is the reason this second test exists.
+    //
+    // These are the shapes where guard and table DISAGREE. A ledger entry with no count indexes the
+    // table with NaN (Math.min(undefined, 4) is NaN), `WEDGE_ESCALATE_MS[NaN]` is undefined, and
+    // `>= undefined` is false -- so without the guard a never-announced condition goes SILENT rather
+    // than firing, which is the one failure mode this predicate exists to prevent.
+    assert.equal(wedgeEscalateDue({ lastAt: NOW }, NOW), true, 'count missing entirely');
+    assert.equal(wedgeEscalateDue({ count: 0 }, NOW), true, 'count 0 with no timestamp to compare');
+    assert.equal(wedgeEscalateDue({ count: null, lastAt: NOW }, NOW), true);
+});
+
 test('wedgeEscalateDue -- the interval WIDENS with each announcement rather than nagging flat', () => {
     const due = (count, sinceMs) => wedgeEscalateDue({ count, lastAt: NOW - sinceMs }, NOW);
     assert.equal(due(1, 59_000), false, '1 minute after the first line');
