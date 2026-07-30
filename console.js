@@ -192,6 +192,16 @@ function fixEscapedBreaks(s) {
     if (s.includes('\n') || !/\\[nt]/.test(s)) return s;
     return s.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
 }
+// One chat bubble's markdown. A bubble is a GROUP -- consecutive messages from the same sender --
+// so the repair above must run PER MESSAGE, before the join. Run AFTER the join it disables itself:
+// joining supplies the very real newline its guard reads as "this already has real breaks, leave it
+// alone". So a double-escaped message rendered fine when it happened to be alone and as a brick with
+// visible \n the moment it had a neighbour. That is what Chris photographed on 2026-07-30 -- 2 of 14
+// messages broke, and the 2 were the ones that had been grouped. The guard was never wrong; it was
+// being asked about a concatenation when it only ever reasoned about one message.
+function bubbleText(texts) {
+    return (texts || []).map(t => fixEscapedBreaks(String(t == null ? '' : t))).join('\n');
+}
 function richText(raw) {
     const lines = fixEscapedBreaks(String(raw == null ? '' : raw)).split('\n');
     const isFence = (l) => /^\s*```/.test(l);
@@ -385,11 +395,14 @@ function chatBubble(g, reactMap, _mission, _search) {
     // poll re-render and reload; a pinned bubble gets a subtle highlight class + filled pin.
     const _key = msgKey(g.who, g.ts), _pinned = pinnedMsgs.has(_key);
     const pinBtn = '<span class="pinbtn' + (_pinned ? ' on' : '') + '" data-pin="' + escAttr(_key) + '" title="' + (_pinned ? 'unpin this message' : 'pin / bookmark this message') + '">' + (_pinned ? '📌' : '📍') + '</span>';
+    // Repaired once, then shared by the render AND both copy buttons -- copying a brick out to an
+    // email is the same defect as reading one on screen, and three separate joins is how they drift.
+    const _md = bubbleText(g.texts);
     return '<div class="row ' + (me ? 'me' : 'them') + '" data-mkey="' + escAttr(_key) + '"><div class="bubble' + (_pinned ? ' pinned' : '') + '">' + chip
-        + richText(g.texts.join('\n'))
+        + richText(_md)
         + (g.img ? '<br><a href="' + g.img + '" target="_blank"><img src="' + g.img + '" class="thumb"></a>' : '')
         + '<span class="t">' + (_search ? fmtWhen(g.ts) : fmtHM(g.ts)) + '</span>'
-        + '<span class="copybtn" data-c="' + btoa(unescape(encodeURIComponent(g.texts.join('\n')))) + '" title="copy markdown">📋</span>' + '<span class="htmlbtn" data-copyhtml="' + b64(g.texts.join('\n')) + '" title="copy formatted — paste into email or docs with styling">html</span>' + pinBtn + reactBar + '</div></div>';
+        + '<span class="copybtn" data-c="' + btoa(unescape(encodeURIComponent(_md))) + '" title="copy markdown">📋</span>' + '<span class="htmlbtn" data-copyhtml="' + b64(_md) + '" title="copy formatted — paste into email or docs with styling">html</span>' + pinBtn + reactBar + '</div></div>';
 }
 // ---- Chat search ------------------------------------------------------------------------------
 // GET /search over the whole transcript, rendered into #chat in place of the live conversation.

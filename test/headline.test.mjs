@@ -124,6 +124,23 @@ test('splitHeadline -- one enormous token still yields a headline instead of a s
     assert.equal(r.truncated, true);
 });
 
+test('splitHeadline -- a SHORT word before a huge token still yields a headline, not two letters', () => {
+    // oscar's mutation probe found the gap this closes: `sp > max * 0.6` mutated to `sp > 0` killed
+    // nothing. The case above cannot reach that floor -- its path contains no space at all, so
+    // lastIndexOf returns -1 and BOTH the real floor and a broken one fall through to the hard cut.
+    //
+    // Reaching the floor needs a space that exists but lands early: a short leading word followed by
+    // one enormous token. Here lastIndexOf(' ', 40) is 3, so without the floor the whole headline
+    // collapses to "see..." -- and "BUG: see d:/some/very/long/path" is a shape half the real board
+    // already has, so this is live rather than theoretical.
+    const s = 'see d:/claude/.jarvis-wt/jarvis-bravo/test-support/verify-headline-browser.mjs for it';
+    assert.equal(s.lastIndexOf(' ', 40), 3, 'fixture must put the only early space at 3, or it proves nothing');
+    const r = splitHeadline(s, 40);
+    assert.ok(r.headline.length >= 40, 'collapsed to a stub: ' + JSON.stringify(r.headline));
+    assert.ok(!/^see\.\.\.$/.test(r.headline), 'the word-boundary floor is gone: ' + r.headline);
+    assert.equal(r.truncated, true);
+});
+
 test('splitHeadline -- a separated card whose FIRST clause is itself a paragraph still truncates', () => {
     // Both conditions at once: there is real detail AND the headline overflows. Neither may mask the
     // other -- the caret must appear and the headline must still be one readable line.
@@ -168,6 +185,9 @@ test('splitHeadline -- the console.js mirror agrees with jarvis-text.mjs on ever
         'Audited the queued lane against the code and found five shipped cards still sitting in queued which means the board has been lying',
         'This first clause rambles well past any sensible headline budget before it ever reaches one -- and then the detail',
         'C:/Users/vinni/AppData/Local/Temp/claude/deadspawn-probe/hotel-trust-prompt-capture.log is where it is',
+        // The word-boundary floor (oscar's survivor). In the SHARED table deliberately: the whole
+        // value of this table is that a floor fixed in one copy and not the other fails here.
+        'see d:/claude/.jarvis-wt/jarvis-bravo/test-support/verify-headline-browser.mjs for it',
     ];
     for (const f of fixtures) {
         assert.deepEqual(consoleSplit(f), splitHeadline(f), 'MIRROR DRIFT on ' + JSON.stringify(f)
