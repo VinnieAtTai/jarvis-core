@@ -415,7 +415,29 @@ test('HANDOFF: what happened to the in-flight work is stated in the RECORD, not 
         // FOUND BY MUTATION PROBE: without C, defaulting the verdict to 'none' survives, and that
         // mutant turns "nobody looked" into "nothing to look at" -- the more dangerous of the two.
         assertConsolelessPossible();
-        const hub = await createScratchHub({ worktrees: true, graceMs: 5000 });
+        // graceMs is the hub's READOPT window, and it is deliberately LONGER HERE THAN THIS TEST'S OWN
+        // TIMEOUT, so the hub's boot-reconcile pass cannot fire while the test runs. That pass is the
+        // writer behind this test's entire flake history. It buries every hostless session through the
+        // ORDINARY retire path -- and C's host is killed on purpose below, so at boot+grace the hub
+        // retires charlie itself, out from under the retire this test is about to make.
+        // Only a SPAWNED worker is exposed, which is why the test above can keep the short window:
+        // launch:'pty' with no live host is a PROVABLE ghost, and provable skips the two-minute
+        // warm-lastSeen reprieve that a session registering over plain HTTP gets.
+        // MEASURED, not reasoned. With grace forced to 3000 the pass lands between the kill and the
+        // retire and it reproduces every single run:
+        //     sys: boot reconcile: buried 1 ghost session(s) - charlie
+        //     C: retire -> {"error":"unknown or already retired uid"}, and the record on disk is the
+        //     hub's, summary "Gone by the time the hub came back"
+        // At 5000 that pass landed a few hundred ms after this test reached C, so it won by a margin
+        // measured in milliseconds: green alone, and about one full-suite run in three under load.
+        // Before the rig gave each stub its own handoff slot the SAME burial destroyed B's record
+        // instead, which is the "no handoff record filed for B" this test used to fail with -- one
+        // mechanism, two symptoms, and the slot fix moved it rather than removing it.
+        // DO NOT SHORTEN THIS BACK. A hub that buries a session whose host is dead is behaving
+        // correctly, and this test kills a host deliberately, so the only way it can own charlie's
+        // retire is for that one-shot pass to sit outside its runtime. 300000 is the timeout above,
+        // and the hub boots after the test starts, so boot+grace is always past the deadline.
+        const hub = await createScratchHub({ worktrees: true, graceMs: 300000 });
         t.after(() => hub.dispose());
         initRepo(hub.REPO);
         await hub.start('handoff worktree hub');
@@ -451,10 +473,18 @@ test('HANDOFF: what happened to the in-flight work is stated in the RECORD, not 
             return !existsSync(started.C.wt);
         }, 30000);
 
-        // Retire one at a time and read each record BEFORE the next retire lands. The rig's stub worker
-        // registers with its OWN fixed purpose, so all three sessions share one handoffKey(cwd, purpose)
-        // and the durable slot is overwritten on every retire -- read them all at the end and only the
-        // last one exists. (Not a defect in the key: three real jobs carry three purposes.)
+        // Retire one at a time and read each record before the next retire lands. That ordering is
+        // load-bearing but it was never sufficient on its own: it controls only the writes THIS test
+        // makes, and the hub is the other writer. The rig used to give every stub the same cwd and the
+        // same fixed purpose, so all three shared one handoffKey(cwd, purpose) and one durable slot;
+        // the hub's boot-reconcile pass then retired charlie (host killed above) into that shared slot
+        // and B's record was destroyed between B's retire and B's read. It read as a filing bug and
+        // was not one: three independent captures polled this endpoint 184 times over 20s and the
+        // record never appeared, while the one key on disk held from:charlie every time -- so a waitFor
+        // here would have hung for twenty seconds and still failed.
+        // Both halves are now closed and they are the same mechanism: each stub owns its own slot
+        // (purpose carries the callsign), and the grace window above keeps the hub's burial out of
+        // this test's runtime so the retire below is genuinely this test's to make.
         const recs = {};
         for (const k of ['A', 'B', 'C']) {
             const bye = await hub.post('/retire', {
@@ -464,6 +494,22 @@ test('HANDOFF: what happened to the in-flight work is stated in the RECORD, not 
             recs[k] = await hub.get('/handoff?cs=' + started[k].cs);
             assert.ok(recs[k] && !recs[k].none, 'no handoff record filed for ' + k + ': ' + JSON.stringify(recs[k]));
         }
+        // ...AND EVERY RECORD IS STILL THERE AFTER THE OTHER TWO RETIRED. The reads inside the loop
+        // prove each record was FILED; this pass proves the three durable slots are DISTINCT, which is
+        // the property the whole handoff channel rests on -- and the one that failed in PRODUCTION on
+        // 2026-07-30, where a coordinator and its own code sub-worker were issued one slot between them
+        // because they booted from the same purpose line, so a checkpoint by one destroyed the other's
+        // record and either successor could have booted holding the wrong job's briefing. The loop
+        // above is blind to that by construction: it reads each record before the next retire can
+        // overwrite it. A rig with one shared slot passes every assertion up to here and fails on the
+        // first line of this one, which is what makes the slot separation checked rather than assumed.
+        for (const k of ['A', 'B', 'C']) {
+            const again = await hub.get('/handoff?cs=' + started[k].cs);
+            assert.equal(again && again.from, started[k].cs,
+                'the record for ' + k + ' did not survive the other two retires, so they shared a durable'
+                + ' slot: ' + JSON.stringify(again));
+        }
+
         const [a, b, c] = [recs.A, recs.B, recs.C];
 
         // A: the WIP commit is named, and so is the branch it is sitting on.
