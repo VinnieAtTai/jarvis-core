@@ -1667,6 +1667,31 @@ function batonSentence(repo, L, now) {
 // is noticed at least as fast as one that boots and then goes silent.
 export const SPAWN_REGISTER_TIMEOUT_MS = 90000;
 
+// The dispatch stamped on a pending spawn: WHO asked for this worker, and WHICH PROJECT it was being
+// nested under. Both are needed because notifyDeadSpawnDispatcher prefers the asker and falls back to
+// the project's live coordinator -- see the ordering argument written out there.
+//
+// THIS EXISTS TO BE ONE SITE. It was inline at both watchSpawn calls in spawnWorker (the console-less
+// branch and the wt-new-tab branch), spelled identically, and that duplication was invisible to
+// probing: a mutation needle that included the log-path argument matched the console-less call ONLY, so
+// it passed the harness's one-hit guard and read as rigorous while the second branch had never been
+// touched by any needle at all. A needle that is unique only by accident leaves its twin unprobed. The
+// wt-new-tab branch shells out to wt.exe and is unreachable from a test, so collapsing the two callers
+// onto one expression is the only pin available -- and the source guard in test/deadspawn.test.mjs
+// asserts the collapse holds, which is what catches a THIRD site being added later.
+//
+// It takes subOf/boundTo ALREADY NORMALIZED rather than raw project/parentProject, deliberately:
+// spawnWorker derives those two for pendingBind, the boot text and hostMeta as well, and recomputing
+// them here would be a second source of truth for the same decision. All this owns is the choice
+// between them.
+export function spawnDispatch(spawnedBy, subOf, boundTo) {
+    // subOf wins, and in practice it cannot compete: spawnWorker sets subOf only when there is no
+    // project, so a worker is a sub-worker OR a coordinator and never both. The order is still written
+    // this way round on purpose -- if the two ever did arrive together, the nesting is the relationship
+    // a dead spawn should be reported against, because that is the coordinator who is waiting on it.
+    return { spawnedBy: spawnedBy || null, forProject: subOf || boundTo || null };
+}
+
 // Which pending spawns are overdue: launched more than `timeoutMs` ago with no session to show for
 // it. `pending` is the hub's spawned-but-not-registered stash ({cs, cwd, at} entries, `at` in ms),
 // `sessions` is roster.sessions.

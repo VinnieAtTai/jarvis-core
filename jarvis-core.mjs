@@ -11,7 +11,7 @@ import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
 import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
 import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap, isBatonQuestion, speakBaton } from './jarvis-text.mjs';
-import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote, reconstructHandoff } from './jarvis-text.mjs';
+import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote, reconstructHandoff, spawnDispatch } from './jarvis-text.mjs';
 import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, wedgeGraceMs, wedgeEscalateDue, cursorGap, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -2654,12 +2654,19 @@ function spawnWorker(repo, purpose, opts = {}) {
     if (wt) boot += ' You are in a DEDICATED git worktree at ' + wt.path + ' on branch ' + wt.branch + ' (forked from ' + wt.base + '). Commit freely here: you cannot see or touch other worktrees or Chris\'s own checkout, so nothing you do can collide with his work. Do NOT switch branches and do not go looking for the main checkout. On retire, commit everything - your branch is how your work merges back.';
     boot += ' Permissions: read-only and routine build commands (git status/diff/log, npm run lint, node --check, ls/cat/grep/rg, dotnet build/test) run WITHOUT asking the human; only risky or out-of-repo actions prompt. Favor those pre-approved commands, batch shell calls, and self-verify (run the lint gate yourself) instead of asking. If you fan out subagents, keep them to the same safe command set so they do not each trigger a prompt.' + (effTier ? ' You are a TRUSTED session: your non-risky actions are auto-approved — work autonomously and only surface genuine decisions.' : '');
     const hookSettings = repo.permissionMode === 'bypassPermissions' ? null : join(DATA, 'perm-settings.json');
+    // ONE dispatch for BOTH launch branches below. It used to be spelled out inline at each watchSpawn
+    // call, identically, and that is precisely what made it unprobeable: a needle carrying the log-path
+    // argument matched the console-less call only, passed the harness's one-hit guard, and left the
+    // wt-new-tab branch untouched by any needle ever written. The wt branch shells out to wt.exe and no
+    // test can reach it, so sharing one expression is the pin. test/deadspawn.test.mjs guards the
+    // collapse, so a third launch path cannot quietly reintroduce the divergence.
+    const dispatch = spawnDispatch(spawnedBy, subOf, boundTo);
     const hostMeta = {
         project: boundTo, parentProject: subOf,
         worktree: wt ? { path: wt.path, branch: wt.branch, base: wt.base, repoCwd: repo.cwd, repoKey: repo.key } : null,
     };
     if (CONSOLELESS && spawnWorkerConsoleless(cs, runRepo, boot, model, hookSettings, hostMeta)) {
-        watchSpawn(cs, runRepo.cwd, repo.key, join(DATA, 'worker-' + cs + '.log'), { spawnedBy, forProject: subOf || boundTo });
+        watchSpawn(cs, runRepo.cwd, repo.key, join(DATA, 'worker-' + cs + '.log'), dispatch);
         record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + runRepo.cwd + ' (' + repo.key + ')' + (wt ? ' [worktree ' + wt.branch + ']' : '') + ' [console-less]' });
         return cs;
     }
@@ -2694,7 +2701,7 @@ function spawnWorker(repo, purpose, opts = {}) {
         c2.unref();
     });
     child.unref();
-    watchSpawn(cs, runRepo.cwd, repo.key, null, { spawnedBy, forProject: subOf || boundTo });
+    watchSpawn(cs, runRepo.cwd, repo.key, null, dispatch);
     record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + runRepo.cwd + ' (' + repo.key + ')' + (wt ? ' [worktree ' + wt.branch + ']' : '') });
     return cs;
 }
