@@ -188,6 +188,8 @@ export function sweepAbandonedScratch(olderThanMs = 3600000) {
  * opts.graceMs   JARVIS_READOPT_GRACE_MS for the hub (default 5000; the real default is 90s).
  * opts.worktrees pass true to leave worktree isolation ON (default OFF -- it is a separate subject).
  * opts.env       extra env for the hub, applied last. Cannot override the safety forcings below.
+ * opts.staleSchedule  pass true to leave DATA without a schedule, so the stale-schedule nudge
+ *                can fire. Only test/schedulenudge.test.mjs wants that; see the seed below.
  */
 export async function createScratchHub(opts = {}) {
     const nodeModules = resolveNodeModules();
@@ -201,6 +203,21 @@ export async function createScratchHub(opts = {}) {
     // and spawns real workers into the real roster. Refuse to be that rig.
     const ambientData = process.env.JARVIS_DATA || (process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'jarvis') : REPO_ROOT);
     if (DATA === ambientData) throw new Error('scratch data dir resolved to the LIVE data dir (' + DATA + ')');
+
+    // Seed a schedule dated TODAY so the stale-schedule nudge cannot fire in a rig. registerSession
+    // buses a Calendar errand to the FIRST session whose cwd matches the hub's own checkout, and a
+    // scratch hub otherwise starts with no schedule at all -- so any test registering with
+    // process.cwd()/REPO_ROOT silently got one kind:msg on a bus it believed it owned, which turned
+    // that session's first /poll from a 700ms park into a 2ms immediate return. Measured, and it is
+    // a FALSE PASS rather than a flake: it depends on register order and a fresh DATA dir, both
+    // fixed per run, so it never flaps and never announces itself.
+    //
+    // Seeding kills the PRECONDITION instead of the cwd, which is the only fix that reaches every
+    // caller: shouldNudgeSchedulePull returns false at its scheduleDate === today line whatever cwd
+    // a session registers with. The per-test alternative (register in the scratch repo dir) cannot
+    // cover test/delegate.test.mjs, which uses REPO_ROOT deliberately -- see its own comment on why.
+    if (!opts.staleSchedule) writeFileSync(join(DATA, 'schedule.json'),
+        JSON.stringify({ date: new Date().toDateString(), events: [], announced: {} }, null, 1));
 
     writeFileSync(join(BIN, 'claude.cmd'), '@echo off\r\nnode "%~dp0stub-worker.mjs"\r\n');
     writeFileSync(join(BIN, 'stub-worker.mjs'), STUB_WORKER);
