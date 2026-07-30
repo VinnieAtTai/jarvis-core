@@ -1107,8 +1107,13 @@ function gapNotice(uid, cursor) {
     if (!n && !gone) return null;
     const text = 'poll cursor gap: you polled at ' + gap.to + ' but your last poll returned ' + gap.from
         + ', so ' + (gap.to - gap.from) + ' event(s) were never delivered to you'
+        // The uid is in this URL deliberately. /poll reads uid FIRST and answers 404 `unknown uid`,
+        // so the uid-less form this notice printed for months was advice that could not work -- handed
+        // to the one worker already known to have lost an event, which is the worst possible reader for
+        // it. A recovery instruction that 404s is worse than none: the worker follows it, gets an error,
+        // and concludes the event is unrecoverable.
         + (n ? ' and ' + n + ' of them ' + (n === 1 ? 'is' : 'are') + ' addressed to you. Read '
-            + (n === 1 ? 'it' : 'them') + ' with GET /poll?cursor=' + gap.from + '.' : '.')
+            + (n === 1 ? 'it' : 'them') + ' with GET /poll?uid=' + uid + '&cursor=' + gap.from + '.' : '.')
         + (gone ? ' ' + gone + ' index(es) from ' + gap.from + ' have already been trimmed off the bus and are gone for good.' : '')
         + ' Relaunch your loop with the EXACT cursor the poll printed, never a number you inferred.';
     record({ kind: 'sys', text: (roster.sessions[uid] ? roster.sessions[uid].callsign : uid) + ' skipped ' + (gap.to - gap.from) + ' event(s) at cursor ' + gap.from + ' (' + n + ' addressed to it)' });
@@ -4093,8 +4098,9 @@ async function handleRequest(req, res) {
         record({ kind: 'msg', from: label, to: toCs, text });
         // A RECEIPT, not just an ack: ok:true alone only ever proved the recipient RESOLVED. `cursor`
         // is the bus index the message landed at, so a sender can say WHERE it is rather than guess
-        // (GET /poll?cursor=<it> returns it), and `to` closes the other half -- that it resolved to
-        // the session the sender MEANT, not merely to some live one. The to:'human' branch above gets
+        // (GET /poll?uid=<uid>&cursor=<it> returns it -- uid is required), and `to` closes the other
+        // half -- that it resolved to the session the sender MEANT, not merely to some live one. The
+        // to:'human' branch above gets
         // no cursor on purpose: it records to the transcript and never touches the bus, so there is
         // no index to name and inventing one would be the exact false receipt this set out to fix.
         return json(res, 200, { ok: true, cursor: at, to: toCs, uid: toUid });

@@ -251,6 +251,20 @@ test('DEAD SPAWN: an exit code is the fallback, never the headline', () => {
     assert.match(diagnoseSpawnLog('[pty-host] node-pty unavailable: no binding\n'), /node-pty/);
 });
 
+test('DEAD SPAWN: each auth phrasing stands on its OWN, so a collapsed union cannot go quiet', () => {
+    // SCOPE, stated plainly because this test is easy to over-read: it pins the three phrasings
+    // INDEPENDENTLY, so a later `simplification` down to one alternative goes red instead of quietly
+    // narrowing what the diagnoser can still see. It does NOT prove the wording is current. Nobody
+    // has ever captured a real auth death, and these strings come from the same memory the signature
+    // does -- so they are deliberately NOT dressed up as a captured fixture, because a fixture
+    // agreeing with the code is the exact trap the trust signature fell into. See the provenance
+    // note in jarvis-text.mjs.
+    for (const only of ['Invalid API key', 'Please run /login', 'You are not logged in']) {
+        assert.match(diagnoseSpawnLog(ESC + '[2J' + only + '\n'), /not authenticated/,
+            'this auth phrasing no longer reads on its own: ' + only);
+    }
+});
+
 test('DEAD SPAWN: a log with no known signature says so instead of inventing one', () => {
     assert.equal(diagnoseSpawnLog('something nobody has seen before\n'), null);
     assert.equal(diagnoseSpawnLog(ESC + '[2J' + ESC + '[H'), null, 'escape codes alone are not a diagnosis');

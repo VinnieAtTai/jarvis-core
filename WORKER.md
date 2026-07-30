@@ -79,8 +79,9 @@ dead for the whole turn. The ping prevents that; the poll loop stays your inbox.
   down the whole time and the human cannot reach you to redirect or stop you.
   Use the EXACT N it printed, never a number you inferred: a cursor advanced past an event makes
   that event unreachable through `/poll` forever — no error, and both ends keep reading healthy.
-  That has already cost one delegate's whole report. To recover one, `GET /poll?cursor=<the missed
-  index>` directly. The hub now watches for this: if you come back with a cursor higher than the one
+  That has already cost one delegate's whole report. To recover one, `GET /poll?uid=<your uid>&cursor=
+  <the missed index>` directly -- the uid is NOT optional, `/poll` reads it first and answers 404
+  `unknown uid` without it. The hub now watches for this: if you come back with a cursor higher than the one
   it handed you AND something addressed to you was inside the gap, your next poll returns a `gap`
   event naming the exact index to re-read. It stays silent when the skipped indices held nothing of
   yours, so a `gap` event always means you really lost something.
@@ -123,8 +124,9 @@ dead for the whole turn. The ping prevents that; the poll loop stays your inbox.
 - Another session: `POST /send {"from":"<uid>","to":"<callsign>","text":"..."}`. The reply is a
   RECEIPT: `{"ok":true,"cursor":6389,"to":"kilo","uid":"s_0007"}`. `to` and `uid` are who it
   actually resolved to — check them when you typed the callsign by hand. `cursor` is the bus index
-  the message landed at, so you can say WHERE it is instead of guessing: `GET /poll?cursor=6389`
-  returns it. Quote that number when you chase a message, and never call a send failed without it.
+  the message landed at, so you can say WHERE it is instead of guessing:
+  `GET /poll?uid=<your uid>&cursor=6389` returns it -- uid is required, /poll 404s without it.
+  Quote that number when you chase a message, and never call a send failed without it.
   A `to:"human"` send carries no `cursor` — it goes to the transcript, not the event bus.
 - Screenshots: when the human says take a screenshot, the HUB captures instantly and you
   receive the path as a `screenshot` event — you do not need to do anything to get it. For a
