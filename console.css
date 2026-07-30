@@ -159,6 +159,32 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,"Segoe UI Emoji","S
    brain must not read as the authoritative one. */
 .mworker.idle .coordchip{color:#5b7385;background:#0d1420;border-color:#1f2c3a}
 .mworker.idle .cworker{color:#5b6a7d}
+/* MERGE LANE chips (the commit baton, finally visible). Same sizing family as .tchip/.coordchip so the
+   card title and the rail row stay one visual system. TWO states, and the colours are the message:
+   .holder is GREEN because it is a clearance -- this session may merge, right now -- and .waiter is the
+   console's plain grey because being queued is not a problem, it is the feature working. Neither is
+   amber or red: a serialized lane is normal operation, not an alarm, and borrowing the DEAF amber would
+   make a healthy queue read as a fault. */
+.batonchip{font:bold 9px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;letter-spacing:.5px;border-radius:3px;padding:0 4px;cursor:help;white-space:nowrap;vertical-align:middle}
+.batonchip.holder{color:#5dd97c;background:#0c1c13;border:1px solid #2c5c3a}
+.batonchip.waiter{color:#9bb0c4;background:#141b22;border:1px solid #2a3a4a}
+/* MEASURED, and it corrects what this comment first claimed. Both faces contain a space ("LANE #2"), so
+   the .cworker trap above looks like it should apply -- but it does not. The rail row's doing-line carries
+   overflow:hidden, which makes its flex automatic-minimum-size ZERO, so it absorbs every pixel of pressure
+   on its own and the chip is never asked to give up width at all. Two mutation probes proved it: deleting
+   `.mworker .batonchip{flex:none}` changed nothing at 1280, 800 OR 600px, so the rule was written on a
+   guess and has been removed rather than left as decoration. white-space:nowrap above stays for a
+   different reason -- it is a property of the CHIP (its own two-word face must never wrap to two lines
+   inside a 9px box), not a flex floor -- and it is likewise not what holds the width. */
+/* A holder whose session has gone quiet dims with its row -- and that is the case worth seeing, because
+   a lane held by a dead worker is exactly what the 5-minute reap exists to clean up. */
+.mworker.idle .batonchip.holder{color:#4e7a5e;background:#0d1420;border-color:#1f2c3a}
+.mworker.idle .batonchip.waiter{color:#5b6a7d;background:#0d1420;border-color:#1f2c3a}
+/* The waiting strip under a holder's board card: the queue in service order. Indented with the same
+   hierarchy arrow the rail uses for a sub-worker, because it says the same thing -- these hang off the
+   row above. */
+.blane{font-size:11px;color:#7a8a9c;margin:2px 0;letter-spacing:.3px}
+.blane .blq{color:#c9b98a;font-weight:bold}
 .mission .mitem+.mitem{margin-top:11px;padding-top:11px;border-top:1px solid #1f2c3a}
 #stabs{display:flex;gap:5px;flex-wrap:wrap;align-items:center;padding:0 0 8px;border-bottom:1px solid #1f2c3a;margin-bottom:2px}
 .stab{background:#16202c;border:1px solid #1f2c3a;color:#9bb0c4;border-radius:6px;padding:4px 12px;cursor:pointer;font:bold 12px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;letter-spacing:1px}

@@ -16,6 +16,7 @@
         "test:spawnslot": "set JARVIS_INTEGRATION=1&& node --test test/spawnslot.test.mjs",
         "test:schedulenudge": "set JARVIS_INTEGRATION=1&& node --test test/schedulenudge.test.mjs",
         "test:baton": "set JARVIS_INTEGRATION=1&& node --test test/batonhttp.test.mjs",
+        "test:batonvoice": "set JARVIS_INTEGRATION=1&& node --test test/batonvoicehttp.test.mjs",
         "test:delegate": "set JARVIS_INTEGRATION=1&& node --test test/delegate.test.mjs",
         "test:search": "set JARVIS_INTEGRATION=1&& node --test test/search.test.mjs",
         "test:send": "set JARVIS_INTEGRATION=1&& node --test test/send.test.mjs",
@@ -23,7 +24,8 @@
         "test:deadspawn": "set JARVIS_INTEGRATION=1&& node --test test/deadspawn.test.mjs",
         "test:integration": "set JARVIS_INTEGRATION=1&& node --test",
         "verify:searchbox": "node test-support/verify-searchbox-browser.mjs",
-        "verify:coordchip": "node test-support/verify-coordchip-browser.mjs"
+        "verify:coordchip": "node test-support/verify-coordchip-browser.mjs",
+        "verify:batonchip": "node test-support/verify-batonchip-browser.mjs"
     },
     "dependencies": {
         "node-pty": "^1.1.0",
