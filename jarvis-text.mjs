@@ -214,6 +214,73 @@ export function handoffKey(cwd, purpose) {
     return cwdKey(cwd) + String.fromCharCode(10) + p;
 }
 
+// "on the job 4h 28m (start -> end)" for the line above. Private: it exists for that one line, and a
+// half-open or clock-skewed pair returns null rather than printing a negative duration nobody can act
+// on -- an unparseable span is a missing line, never a wrong one.
+function jobSpan(from, to) {
+    const a = Date.parse(from), z = Date.parse(to);
+    if (!Number.isFinite(a) || !Number.isFinite(z) || z < a) return null;
+    const secs = Math.round((z - a) / 1000);
+    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+    return 'on the job ' + (h ? h + 'h ' + m + 'm' : m ? m + 'm' : secs + 's')
+        + ' (' + new Date(a).toISOString() + ' -> ' + new Date(z).toISOString() + ')';
+}
+
+// THE HANDOFF A PREDECESSOR NEVER WROTE. The console's relaunch button is POST /retire
+// {successor:true} carrying a fixed summary and nothing else, so retireSession files a record whose
+// `notes` is the empty string -- and the successor's boot prompt then sends it to GET /handoff for a
+// briefing that says nothing at all. Measured 2026-07-30: tango was relaunched, and zulu inherited a
+// board card plus a WIP commit on an inherited branch with nothing anywhere pointing at either.
+//
+// Every fact needed was already on the session row and nobody was assembling it. This assembles it
+// from OBSERVED state only -- never an inference about what the work MEANT, because meaning is
+// precisely what a missing checkpoint cannot be reconstructed from, and a plausible guess would read
+// as authoritative while being invented. The single judgement it makes is the last line: on an
+// inherited branch the predecessor's commits ARE the record it failed to write, so the successor is
+// sent to that diff before anything else.
+//
+// Attached to EVERY handoff record, not only the noteless ones. A checkpoint is written mid-flight, so
+// even a diligent predecessor's notes predate the WIP commit teardownWorktree makes on the way out --
+// and that is the one fact whose absence strands work.
+//
+// `opts.wip` is teardownWorktree's verdict on the predecessor's worktree: 'committed' (it had
+// uncommitted work and it landed on the branch), 'stranded' (it would not commit, the tree was kept),
+// 'none' (clean), or absent/'unknown' (the tree was already gone, so nothing is claimed either way).
+export function reconstructHandoff(session, board, opts = {}) {
+    const s = session || {}, b = board || {}, o = opts || {};
+    const cs = s.callsign || 'the previous session';
+    const out = [];
+    out.push(String(s.handoff || '').trim()
+        ? 'AUTO-RECONSTRUCTED STATE -- read it alongside the notes your predecessor wrote. Every line here was observed as it retired, so this half is current even where a mid-flight checkpoint has gone stale.'
+        : 'AUTO-RECONSTRUCTED STATE -- your predecessor left NO notes, so the hub assembled this from what it could observe. Treat it as evidence, not as a briefing: nothing here tells you what the work MEANT.');
+    const span = jobSpan(s.started, s.ended);
+    out.push('predecessor: ' + cs + (o.uid ? ' (' + o.uid + ')' : '') + (span ? ', ' + span : ''));
+    if (s.purpose) out.push('its purpose: ' + s.purpose);
+    // The `doing` line off POST /health. Its ABSENCE earns a line of its own: it means no self-report
+    // exists anywhere, so a successor does not go hunting for one that was never written.
+    const doing = String(s.doing || '').trim();
+    const ctx = Number.isFinite(Number(s.ctx)) ? Math.round(Number(s.ctx)) : null;
+    out.push(doing
+        ? 'last said it was doing: "' + doing + '"' + (ctx === null ? '' : ' (its own context was ' + ctx + ' percent full)')
+        : 'it never posted a doing line, so no self-report of its state exists anywhere -- do not go hunting for one.');
+    // ISOLATION, and this is the line whose absence stranded tango's WIP commit. The successor
+    // continues the same branch; until something says so it has no reason to go and look at it.
+    if (s.branch) {
+        out.push('branch: ' + s.branch + (s.base ? ' (forked from ' + s.base + ')' : '')
+            + ' -- you continue ON IT in a fresh worktree, so its commits are already beneath you.');
+        if (o.wip === 'committed') out.push('in-flight work: it had UNCOMMITTED changes at retire and they were committed to ' + s.branch + ' as a WIP commit. That commit is work nobody has described.');
+        else if (o.wip === 'stranded') out.push('in-flight work: it had uncommitted changes that would NOT commit, so its worktree was KEPT at ' + (s.worktree || 'its old path') + ' as evidence. Go and look before you redo anything.');
+        else if (o.wip === 'none') out.push('in-flight work: none -- its worktree was clean at retire, so everything it did is already in commits.');
+    }
+    const n = lane => (Array.isArray(b[lane]) ? b[lane].length : 0);
+    out.push('board carried over: ' + n('working') + ' working + ' + n('queued') + ' queued'
+        + (n('review') || n('done') ? ' (and ' + n('review') + ' in review, ' + n('done') + ' done)' : ''));
+    out.push(s.branch
+        ? 'FIRST MOVE: git log --oneline ' + (s.base || 'main') + '..' + s.branch + ' -- on an inherited branch that diff IS the handoff it did not write. Read it before you touch anything.'
+        : 'FIRST MOVE: git log --oneline -20 and git status in ' + (s.cwd || 'the working directory') + ' -- it shared this checkout, so recent commits there may be its work.');
+    return out.join('\n');
+}
+
 // The auto-successor rule for POST /retire: spawn a successor when work remains, but let an
 // explicit request override either way. `requested` is the body's `successor` field (may be
 // undefined); `hasWork` is whether the retiring board still has working+queued tasks.
