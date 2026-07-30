@@ -25,6 +25,7 @@
         "test:deadspawn": "set JARVIS_INTEGRATION=1&& node --test test/deadspawn.test.mjs",
         "test:handoff": "set JARVIS_INTEGRATION=1&& node --test test/handoff.test.mjs",
         "test:rosterrow": "set JARVIS_INTEGRATION=1&& node --test test/rosterrow.test.mjs",
+        "test:forget": "set JARVIS_INTEGRATION=1&& node --test test/forget.test.mjs",
         "test:wedge": "set JARVIS_INTEGRATION=1&& node --test test/wedge.test.mjs test/wedgechip.test.mjs test/wedgeannounce.test.mjs",
         "test:integration": "set JARVIS_INTEGRATION=1&& node --test",
         "verify:searchbox": "node test-support/verify-searchbox-browser.mjs",
