@@ -11,7 +11,7 @@
 // with no error anywhere. Run with `npm test` (node --test) -- no server boot, no git, no I/O.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees } from '../jarvis-text.mjs';
+import { worktreeRoot, worktreeBase, worktreePlan, shouldIsolate, orphanWorktrees, worktreeRemoval } from '../jarvis-text.mjs';
 
 // --- worktreeRoot: worktrees must live OUTSIDE every repo --------------------------------------
 
@@ -256,4 +256,173 @@ test('orphanWorktrees -- the staleness window is injectable (same 2-minute defau
     const sessions = { s_1: { worktree: p, ended: null, lastSeen: ago(60000) } };
     assert.deepEqual(orphanWorktrees([p], sessions, T0), [], 'one minute old is still live');
     assert.deepEqual(orphanWorktrees([p], sessions, T0, { staleMs: 30000 }), [p]);
+});
+
+// --- orphanWorktrees: the three gates that need no session at all -------------------------------
+//
+// Every claim above this line is made BY A SESSION -- a live host pid, a pending mint, a heartbeat.
+// These cover the case those all miss: a directory in use by something the roster has never heard of,
+// which is how the sweep came to delete a manager's live gate out from under a running probe.
+
+const WT = 'd:/claude/.jarvis-wt';
+const KEYS = { keys: ['jarvis'] };
+// As old and as unclaimed as a directory can be, so nothing but the gates under test is protecting it.
+const aged = (path, branch) => ({ path, createdAt: T0 - 3600000, branch });
+
+test('orphanWorktrees -- THE INCIDENT: a manager\'s hand-made verify tree is not the hub\'s to delete', () => {
+    // Measured on the live hub 2026-07-30. oscar cut d:/claude/.jarvis-wt/oscar-verify by hand to gate
+    // a merge candidate, with a mutation probe running inside it. Nothing claimed it: the hub never
+    // minted it (no pendingWorktree entry), a bound coordinator's own roster row carries worktree:null,
+    // and there was no host pid for a directory no session had ever named. So the sweep collected it
+    // mid-probe and counted it in "collected 4 orphaned worktrees". The house standard guarantees a
+    // repeat rather than making this bad luck: gate a merge candidate in a throwaway tree, THEN ask for
+    // the restart that deploys it, so every manager aims the boot sweep at the tree its own gate runs
+    // in. Two gates catch it here, exactly as they would in life -- foreign name, detached HEAD.
+    const verify = WT + '/oscar-verify';
+    const dead = WT + '/jarvis-india';
+    const dirs = [aged(verify, 'HEAD'), aged(dead, 'jarvis/india')];
+    assert.deepEqual(orphanWorktrees(dirs, {}, T0, KEYS), [dead], 'the live tree survives, the dead one still goes');
+    // And the behaviour it replaces, so the regression stays visible instead of theoretical: measured
+    // the old way -- bare paths, no gates -- that same live tree is collected.
+    assert.deepEqual(orphanWorktrees(dirs.map(d => d.path), {}, T0), [verify, dead]);
+});
+
+test('orphanWorktrees -- the NAME gate: a foreign name is spared at any age, on any branch', () => {
+    // Isolated deliberately: this tree is an hour old and sits on a jarvis/ branch, so the age floor and
+    // the branch gate both wave it through and its NAME is the only thing that can save it. worktreePlan
+    // mints <repoKey>-<callsign>, so a name that cannot be spelled that way was put there by a human.
+    assert.deepEqual(orphanWorktrees([aged(WT + '/oscar-verify', 'jarvis/oscar')], {}, T0, KEYS), []);
+    // The gate must not slide into a blanket refusal -- a sweep that collects nothing is its own bug --
+    // so every name the hub really does mint stays collectable: the -2/-3 collision suffix, and the two
+    // fallback keys worktreePlan uses when a spawn's cwd matches no configured repo.
+    for (const base of ['jarvis-india', 'jarvis-romeo-2', 'jarvis-x99', 'adhoc-kilo', 'repo-kilo']) {
+        assert.deepEqual(orphanWorktrees([aged(WT + '/' + base, 'jarvis/india')], {}, T0, KEYS), [WT + '/' + base], base);
+    }
+    // A repo key reaches the directory name the way worktreePlan spells it -- lowercased, stripped to
+    // [a-z0-9], truncated at 12 -- so this gate has to spell it identically or it rejects real trees.
+    const p = WT + '/jarviscore-kilo';
+    assert.deepEqual(orphanWorktrees([aged(p, 'jarvis/kilo')], {}, T0, { keys: ['Jarvis-Core'] }), [p]);
+});
+
+test('orphanWorktrees -- the AGE floor: a brand-new tree is spared even when its name is perfect', () => {
+    // The case the name gate cannot reach: a manager who names their gate tree exactly like a minted
+    // one, which is the likely mistake given the minted siblings sitting next to it in the same folder.
+    // The floor is the window in which the hub cannot yet know its OWN mint has failed -- the
+    // pendingWorktree TTL, 5 minutes -- so under it nothing is collected whatever it is called.
+    const p = WT + '/jarvis-verify';
+    const at = (ms, extra) => orphanWorktrees([{ path: p, createdAt: ms, branch: 'jarvis/verify' }], {}, T0, { ...KEYS, ...extra });
+    assert.deepEqual(at(T0 - 180000), [], 'three minutes old, the age oscar\'s tree died at');
+    assert.deepEqual(at(T0 - 600000), [p], 'ten minutes old is fair game');
+    // Exactly on the floor, which is the one input neither of the two above reaches: 3 minutes is
+    // comfortably under and 10 comfortably over, so nothing pinned whether the comparison is < or
+    // <=. Both spellings pass every other assertion here -- bravo mutation-probed <= and it was the
+    // one survivor of nine. The floor is EXCLUSIVE: at the TTL the hub can already know its own mint
+    // failed, so the tree is fair game. One millisecond of a 5-minute safety margin either way is not
+    // the point; an unpinned boundary that no fixture reaches is.
+    assert.deepEqual(at(T0 - 300000), [p], 'exactly at the floor is collected -- the floor is exclusive');
+    // Injectable like staleMs, so a caller can tighten or widen the floor without editing this file.
+    assert.deepEqual(at(T0 - 180000, { minAgeMs: 60000 }), [p]);
+    // Epoch millis or an ISO string: a caller holding a stat has the first, one reading a record has
+    // the second, and a floor that silently ignored either shape would be no floor at all.
+    assert.deepEqual(at(new Date(T0 - 180000).toISOString()), []);
+});
+
+test('orphanWorktrees -- the BRANCH gate: a tree the hub did not mint is not on a jarvis/ branch', () => {
+    // The last hole the other two leave between them: a hand-made tree named like a minted one AND older
+    // than the floor. A merge-gate tree is cut at a candidate COMMIT, so it reads HEAD -- detached --
+    // which is exactly what the incident logged ("branch HEAD kept"). Every tree the hub mints is on a
+    // jarvis/ branch (worktreePlan creates one, or continues a predecessor's), so the two separate
+    // cleanly, and the caller already reads this branch to name the teardown -- the gate is free.
+    const p = WT + '/jarvis-verify';
+    assert.deepEqual(orphanWorktrees([aged(p, 'HEAD')], {}, T0, KEYS), []);
+    assert.deepEqual(orphanWorktrees([aged(p, 'main')], {}, T0, KEYS), [], 'nor is a hand-made tree on a real branch');
+    assert.deepEqual(orphanWorktrees([aged(p, 'jarvis/verify')], {}, T0, KEYS), [p]);
+    // The successor case, where the two halves legitimately disagree: a worker continuing its
+    // predecessor's branch sits in a directory named for ITSELF, and both readings must still be minted.
+    assert.deepEqual(orphanWorktrees([aged(WT + '/jarvis-sierra', 'jarvis/bravo')], {}, T0, KEYS), [WT + '/jarvis-sierra']);
+});
+
+test('orphanWorktrees -- an UNMEASURED gate falls through rather than sparing everything', () => {
+    // One failed stat must not switch the sweep off. A dead tree still has to be collectable when the
+    // filesystem will not say when it was created, or git will not say what it is checked out on; the
+    // gates the caller CAN measure still apply.
+    const p = WT + '/jarvis-india';
+    assert.deepEqual(orphanWorktrees([{ path: p, createdAt: null, branch: '' }], {}, T0, KEYS), [p]);
+    assert.deepEqual(orphanWorktrees([{ path: p, createdAt: 'not a date', branch: null }], {}, T0, KEYS), [p]);
+    assert.deepEqual(orphanWorktrees([p], {}, T0, KEYS), [p], 'a bare path string, as an older caller passes');
+    assert.deepEqual(orphanWorktrees([{ path: p }], {}, T0, { keys: [] }), [p], 'no keys: the name gate is off, not inverted');
+    // And a session claim still outranks all three -- these gates are extra protection for the trees no
+    // session can vouch for, never a replacement for the claims that already worked.
+    assert.deepEqual(orphanWorktrees([aged(p, 'jarvis/india')], {}, T0, { ...KEYS, claimed: [p] }), []);
+});
+
+// --- worktreeRemoval: the sys line has to say what actually happened ----------------------------
+
+const REM = { cs: 'oscar', path: 'd:/claude/.jarvis-wt/oscar-verify', branch: 'HEAD' };
+
+test('worktreeRemoval -- THE INCIDENT: a FAILED remove that emptied the directory must not read as kept', () => {
+    // Measured on the live hub 2026-07-30: the sweep logged "worktree remove FAILED for a dead session
+    // at d:/claude/.jarvis-wt/oscar-verify; branch HEAD kept" while that path on disk was an EMPTY
+    // directory -- contents gone, no .git file, absent from `git worktree list`. git deletes the
+    // checkout recursively and then drops the administrative .git/worktrees/<id> entry whether or not
+    // that delete finished, so a non-zero exit means partly destroyed and deregistered, never
+    // untouched. A successor reads "kept" as work still sitting there to recover, which is what makes
+    // this worse than logging nothing at all.
+    const r = worktreeRemoval({ ok: false, existedBefore: true, exists: true, intact: false, ...REM });
+    assert.equal(r.destroyed, true);
+    assert.equal(r.litter, true, 'a shell of it is still on disk and somebody has to be told');
+    assert.equal(r.state, 'removed', 'kept would send a successor looking for a checkout that is gone');
+    assert.match(r.text, /DESTROYED, not kept/);
+    assert.doesNotMatch(r.text, /STILL THERE|still a checkout|still registered/);
+});
+
+test('worktreeRemoval -- git exiting 0 or non-zero cannot outrank the filesystem, in either direction', () => {
+    // ok:true over a gutted tree is the junction case measured 2026-07-27 -- exits 0, deletes every real
+    // file, then leaves the directory. ok:false over a gone one is its mirror. Each used to be logged as
+    // its opposite, because the old line branched on the exit code before it looked at the disk.
+    const junction = worktreeRemoval({ ok: true, existedBefore: true, exists: true, intact: false, ...REM });
+    assert.deepEqual([junction.state, junction.destroyed, junction.litter], ['removed', true, true]);
+    const goneAnyway = worktreeRemoval({ ok: false, existedBefore: true, exists: false, intact: false, ...REM });
+    assert.deepEqual([goneAnyway.state, goneAnyway.destroyed, goneAnyway.litter], ['removed', true, false]);
+    assert.match(goneAnyway.text, /ERROR/);
+    assert.match(goneAnyway.text, /the directory is gone/);
+});
+
+test('worktreeRemoval -- only an intact checkout earns the words that promise one', () => {
+    // The single verdict a successor may read as "your predecessor's tree is still waiting for you":
+    // the directory is there AND git still resolves it as a worktree. Nothing was collected.
+    const failed = worktreeRemoval({ ok: false, existedBefore: true, exists: true, intact: true, ...REM });
+    assert.deepEqual([failed.state, failed.destroyed, failed.litter], ['kept', false, false]);
+    assert.match(failed.text, /FAILED/);
+    assert.match(failed.text, /STILL THERE/);
+    // The happy path is by far the most common line in the log, so it is pinned verbatim: this change
+    // is about the failures, and churning the wording nobody complained about buys nothing.
+    const clean = worktreeRemoval({ ok: true, existedBefore: true, exists: false, intact: false, cs: 'india', path: 'd:/code/.jarvis-wt/broker-india', branch: 'jarvis/india' });
+    assert.deepEqual([clean.state, clean.destroyed, clean.litter], ['removed', true, false]);
+    assert.equal(clean.text, 'worktree for india removed; branch jarvis/india kept for merge');
+});
+
+test('worktreeRemoval -- a directory that was already gone was not destroyed by us', () => {
+    // Retire after a tree somebody deleted by hand. Calling that a destruction files a data loss that
+    // never happened; calling it "kept" is the original bug. It is neither, so it says so.
+    const r = worktreeRemoval({ ok: false, existedBefore: false, exists: false, intact: false, ...REM });
+    assert.deepEqual([r.state, r.destroyed, r.litter], ['removed', false, false]);
+    assert.match(r.text, /already gone/);
+});
+
+test('worktreeRemoval -- THE INVARIANT: no verdict claims survival and destruction at once', () => {
+    // The bug was a TEXT that disagreed with the facts, so the text is pinned to the flags across every
+    // combination of the four observables rather than trusting four hand-written cases to stay in step
+    // with the wording. This is the assertion that fails if someone edits a message carelessly later.
+    for (const ok of [true, false]) for (const existedBefore of [true, false]) for (const exists of [true, false]) for (const intact of [true, false]) {
+        const r = worktreeRemoval({ ok, existedBefore, exists, intact, ...REM });
+        const s = JSON.stringify({ ok, existedBefore, exists, intact });
+        assert.ok(r.text.length > 20, s);
+        assert.equal(r.state === 'kept', Boolean(exists && intact), s);
+        assert.equal(r.litter, Boolean(r.destroyed && exists), s);
+        if (r.state === 'kept') assert.equal(r.destroyed, false, s);
+        if (r.destroyed) assert.doesNotMatch(r.text, /STILL THERE|nothing was collected/, s);
+        else assert.doesNotMatch(r.text, /DESTROYED|destroyed anyway/, s);
+        assert.match(r.text, /; branch HEAD kept( for merge)?$/, s + ' -- the branch survives every outcome and the line always names it');
+    }
 });
