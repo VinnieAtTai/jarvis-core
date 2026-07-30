@@ -1341,6 +1341,100 @@ export function batonReap(lane, seenAt, now, staleMs = BATON_STALE_MS) {
     };
 }
 
+// —— "Who holds the merge lane?" — the spoken half of the same question ————————————————————————————
+// The console chips (batonRole/batonTip in console.js) answer this when Chris is LOOKING at the board.
+// The question he actually asks is spoken, hands-off, usually while reading something else, and the
+// answer has to arrive as one sentence he can hear. Same lesson as chat search: the plumbing existing
+// is not the feature. The predicate and the sentence live here, pure, so they can be pinned by the
+// gate; handleSpeech in jarvis-core.mjs owns the `if` and the enqueueSay, as it does for every intent.
+
+// One participant's spoken name. Callsigns are NATO words, so they read aloud correctly as-is; a uid
+// (s_0416) is the fallback and is deliberately NOT prettified -- if it ever surfaces, it means a lane
+// entry lost its callsign, and hearing the raw uid is the signal.
+const batonSpokenName = (e) => (e && (e.cs || e.uid)) || 'someone';
+const capFirst = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+
+// Is this utterance ASKING about the merge lane?
+//
+// The gate is tight on purpose, and the reason is not politeness. handleSpeech runs its intent ladder
+// BEFORE routing speech on to the focused worker, so a false positive does not merely answer the wrong
+// question -- it SWALLOWS a sentence Chris meant for a session, and neither end is told. Three rules,
+// each earning its keep:
+//   1. an explicit lane/baton noun must appear at all;
+//   2. a COMMAND verb disqualifies -- "hand the baton to kilo" and "who holds the baton" are different
+//      intents and only the second belongs to this branch;
+//   3. the interrogative must lead the utterance (after the optional "jarvis" address the rest of the
+//      ladder also strips). That last rule is what stops "romeo, what's your status on the merge lane"
+//      being eaten by the hub instead of reaching romeo -- the same anchoring every other intent gets
+//      from handleSpeech's own `after()` prefix.
+// The bare noun said on its own is allowed too ("jarvis, merge lane" / "merge lane status"), because
+// that is how someone asks a machine they trust.
+export function isBatonQuestion(text) {
+    const s = String(text == null ? '' : text).toLowerCase()
+        .replace(/[?!.,\s]+$/g, '').trim()
+        .replace(/^(?:hey\s+)?jarvis[\s,.!]+/, '');
+    if (!/\b(?:merge lane|merge queue|commit baton|baton)\b/.test(s)) return false;
+    if (/\b(?:take|takes|taking|grab|grabs|claim|claims|request|requests|release|releases|releasing|drop|drops|hand|hands|give|gives|pass|force|cancel|steal|reclaim|revoke)\b/.test(s)) return false;
+    // "what's YOUR status on the merge lane" is addressed to whoever is in focus, not to the hub -- and
+    // with no callsign in front, leading-interrogative anchoring alone cannot tell the two apart. A
+    // second-person possessive is the tell. Only `your`, deliberately not a bare `you`: "do you know who
+    // has the baton" is a hub question, and a false negative here merely falls through to the focused
+    // session, while a false positive eats the sentence outright.
+    if (/\byours?\b/.test(s)) return false;
+    if (/^(?:the\s+)?(?:merge lane|merge queue|commit baton|baton)(?:\s+(?:status|update|state))?$/.test(s)) return true;
+    // Leading interrogatives, plus the polite openers ("can you tell me who holds...") -- Chris uses
+    // those. "tell" is deliberately NOT in the set: "tell romeo the merge lane is his" leads with it and
+    // is an instruction to a worker, and a command verb is not always there to veto it.
+    return /^(?:who|whose|what|what's|whats|which|where|is|are|does|do|did|can|could|would|any|anyone|anybody|how many|status of)\b/.test(s);
+}
+
+// The spoken answer, from the batons store ({ repoKey: lane }) and an injected `now`. One sentence per
+// lane that has anything to say; lanes nobody is in are skipped rather than announced as free, because
+// reading out eight idle repos is how a headline becomes a list.
+//
+// Pure, and `now` is an argument for the same reason the rest of this section takes one: the duration is
+// the most useful thing in the sentence ("holds it, for eleven minutes" is the shape of a stuck merge),
+// and a helper that read the clock itself could not be tested for it.
+export function speakBaton(lanes, now) {
+    const store = lanes && typeof lanes === 'object' ? lanes : {};
+    const parts = [];
+    for (const key of Object.keys(store).sort()) {
+        const L = normalizeLane(store[key]);
+        if (!L.holder && !L.queue.length) continue;
+        parts.push(batonSentence(key, L, now));
+    }
+    // The honest empty answer. Every lane free is the NORMAL state, and it is also the answer to the
+    // question, so it gets said rather than swallowed.
+    if (!parts.length) return 'Nobody holds a merge lane. Everyone is clear to merge.';
+    return parts.join(' ');
+}
+
+// Whole minutes between an ISO stamp and `now`, or null if either is unreadable or the stamp is in the
+// future. Null means "say nothing about the duration" -- a wrong number spoken with confidence is worse
+// than an unqualified sentence.
+function batonMinutes(iso, now) {
+    const a = Date.parse(String(iso == null ? '' : iso));
+    const b = typeof now === 'string' ? Date.parse(now) : Number(now);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) return null;
+    return Math.floor((b - a) / 60000);
+}
+
+function batonSentence(repo, L, now) {
+    const q = L.queue.map(batonSpokenName);
+    if (!L.holder) {
+        // A queue with no holder is a lane mid-reap, not a deadlock. Saying which it is stops Chris
+        // going to break something that is about to fix itself.
+        return 'The ' + repo + ' merge lane is free with ' + (q.length === 1 ? 'one worker' : q.length + ' workers')
+            + ' queued. It should grant on the next sweep.';
+    }
+    const m = batonMinutes(L.holder.takenAt, now);
+    const held = m === null ? '' : m < 1 ? ', just now' : m === 1 ? ', for a minute' : ', for ' + m + ' minutes';
+    const tail = !q.length ? 'Nobody is waiting.'
+        : q.length === 1 ? capFirst(q[0]) + ' is waiting behind it.'
+            : q.length + ' are waiting: ' + q.join(', ') + '.';
+    return capFirst(batonSpokenName(L.holder)) + ' holds the ' + repo + ' merge lane' + held + '. ' + tail;
+}
+
 // --- spawns that die before they register ------------------------------------------------------
 //
 // A spawn is INVISIBLE until it registers. POST /spawn answers with a callsign the instant the pty

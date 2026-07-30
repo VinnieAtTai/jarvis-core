@@ -10,7 +10,7 @@ import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
 import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
-import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap } from './jarvis-text.mjs';
+import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap, isBatonQuestion, speakBaton } from './jarvis-text.mjs';
 import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote } from './jarvis-text.mjs';
 import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
@@ -2626,6 +2626,13 @@ function handleUtterance(rawText, typed) {
             const uid = liveUidOf(cs);
             return cs + ', ' + roster.sessions[uid].purpose + (aliveNow(uid) ? '' : ', quiet') + (cs === focus ? ', focused' : '');
         }).join('. ') + '.', 'jarvis');
+        return;
+    }
+    // "Who holds the merge lane?" -- spoken. The console chips answer it when he is looking at the
+    // board; this answers it when he is not. isBatonQuestion does its own anchoring (see jarvis-text),
+    // so it is deliberately NOT wrapped in after().
+    if (isBatonQuestion(lower)) {
+        enqueueSay(speakBaton(loadBatons(), Date.now()), 'jarvis');
         return;
     }
     if (after(/(?:what'?s?|read|when'?s?) (?:my |the )?next (?:meeting|event|thing)\b/) || after(/what'?s? next\b/)) {
