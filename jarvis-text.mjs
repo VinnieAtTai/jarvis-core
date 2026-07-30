@@ -304,9 +304,13 @@ export function reconstructHandoff(session, board, opts = {}) {
     const s = session || {}, b = board || {}, o = opts || {};
     const cs = s.callsign || 'the previous session';
     const out = [];
+    // WHO WROTE THIS, stated in-band rather than left to the field name, because the reader is a MODEL:
+    // a successor that mistakes reconstructed facts for a predecessor's judgement will trust them
+    // further than they deserve, and the whole design depends on that distinction staying legible even
+    // when the block is quoted, truncated or pasted somewhere else.
     out.push(String(s.handoff || '').trim()
-        ? 'AUTO-RECONSTRUCTED STATE -- read it alongside the notes your predecessor wrote. Every line here was observed as it retired, so this half is current even where a mid-flight checkpoint has gone stale.'
-        : 'AUTO-RECONSTRUCTED STATE -- your predecessor left NO notes, so the hub assembled this from what it could observe. Treat it as evidence, not as a briefing: nothing here tells you what the work MEANT.');
+        ? 'ASSEMBLED BY THE HUB FROM OBSERVABLE FACTS -- not written by your predecessor. Read it alongside the notes it did leave. Every line here was observed as it retired, so this half is current even where a mid-flight checkpoint has gone stale.'
+        : 'ASSEMBLED BY THE HUB FROM OBSERVABLE FACTS -- not written by your predecessor, which left NO notes at all. Treat it as evidence rather than a briefing: it says what the hub could see, never what the work MEANT.');
     const span = jobSpan(s.started, s.ended);
     out.push('predecessor: ' + cs + (o.uid ? ' (' + o.uid + ')' : '') + (span ? ', ' + span : ''));
     if (s.purpose) out.push('its purpose: ' + s.purpose);
@@ -325,6 +329,10 @@ export function reconstructHandoff(session, board, opts = {}) {
         if (o.wip === 'committed') out.push('in-flight work: it had UNCOMMITTED changes at retire and they were committed to ' + s.branch + ' as a WIP commit. That commit is work nobody has described.');
         else if (o.wip === 'stranded') out.push('in-flight work: it had uncommitted changes that would NOT commit, so its worktree was KEPT at ' + (s.worktree || 'its old path') + ' as evidence. Go and look before you redo anything.');
         else if (o.wip === 'none') out.push('in-flight work: none -- its worktree was clean at retire, so everything it did is already in commits.');
+        // NEVER SILENT on this line. An omission here reads as "there was no in-flight work", when what
+        // actually happened is that the worktree was already gone before the hub could look -- and the
+        // successor acts on the difference. Say which of the two it is, positively, every time.
+        else out.push('in-flight work: UNKNOWN -- its worktree was already gone when the hub went to check, so nobody looked. That is not the same as there having been none.');
     }
     const n = lane => (Array.isArray(b[lane]) ? b[lane].length : 0);
     out.push('board carried over: ' + n('working') + ' working + ' + n('queued') + ' queued'

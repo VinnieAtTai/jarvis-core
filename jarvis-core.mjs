@@ -1431,7 +1431,10 @@ function retireSession(uid, summary, opts = {}) {
     // Worktree teardown, AFTER the pty is dead so nothing is still writing into the tree: commit any
     // in-flight WIP to the worker's branch, drop the directory, keep the branch (it is the
     // deliverable). The successor spawned below inherits that branch and continues on it.
-    teardownWorktree(s, cs);
+    // Its verdict on the in-flight work feeds the handoff record below: the successor inherits this
+    // branch, so whether a WIP commit landed on it is the difference between reading the predecessor's
+    // real work and redoing it.
+    const torn = teardownWorktree(s, cs);
     // Free any merge lane this worker held (and take it out of any queue it was waiting in) BEFORE the
     // successor spawn below. A dead holder must never wedge the lane, and a retire is the one moment
     // we know for certain it is gone -- the stale sweep is only the backstop for workers that die
@@ -1441,9 +1444,19 @@ function retireSession(uid, summary, opts = {}) {
     const w = loadWork();
     const board = w.sessions[cs] || { working: [], queued: [], done: [], review: [] };
     // The handoff record: one-line summary + detailed notes + the FULL board snapshot (all lanes).
+    //
+    // `auto` is the half a predecessor cannot fail to leave. `notes` is only ever what a session WROTE,
+    // and a console relaunch writes nothing at all -- it is POST /retire {successor:true} with a fixed
+    // summary -- so this record used to travel with notes:"" and the successor's boot prompt sent it to
+    // GET /handoff for a briefing that was empty. It is filed ALONGSIDE notes and never folded into
+    // them: reconstructed facts and a predecessor's judgement are different kinds of thing, and the
+    // successor has to be able to tell which it is holding (the block says so on its own first line).
+    // Computed even when notes ARE present, because a checkpoint is written mid-flight and so predates
+    // the teardown above -- the WIP verdict is exactly what no checkpoint can know.
     const rec = {
         summary: s.summary || null,
         notes: s.handoff || '',
+        auto: reconstructHandoff(s, board, { uid, wip: torn && torn.wip }),
         board: { working: board.working || [], queued: board.queued || [], review: board.review || [], done: board.done || [] },
         from: cs, fromUid: uid, cwd: s.cwd, purpose: s.purpose,
         ts: s.ended,
@@ -1883,23 +1896,35 @@ function makeWorktree(repo, cs, inheritBranch) {
 // work, never stash it). The branch is the deliverable, awaiting merge. And if the commit does not
 // take — no git identity, a rejecting pre-commit hook — we LEAVE THE WORKTREE WHERE IT IS: a
 // stranded directory is recoverable by hand, a removed one with uncommitted work is gone forever.
+//
+// RETURNS { state, wip } -- state is 'removed' or 'kept' as before, and `wip` is the verdict on the
+// in-flight work: 'committed', 'stranded', 'none', or 'unknown' when the directory was already gone
+// so nothing was ever looked at. That verdict used to exist only as a sys line, which is a channel the
+// SUCCESSOR never reads -- and it is the fact that stranded tango's WIP commit where zulu could not
+// see it. reconstructHandoff states it in the handoff record instead. Every call site discards the
+// return value today, so widening it costs nothing.
 function teardownWorktree(s, cs) {
     if (!s || !s.worktree) return null;
     const wtPath = s.worktree, repoCwd = s.cwd || '', branch = s.branch || '?';
+    // 'unknown' until the status check actually runs, never 'none' by default: a missing directory and
+    // a clean one are different facts, and only one of them means nobody has to go and look.
+    let wip = 'unknown';
     try {
         if (existsSync(wtPath)) {
             const dirty = gitOut(wtPath, ['status', '--porcelain'], WT_TIMEOUT);
+            wip = 'none';
             if (dirty) {
                 gitOut(wtPath, ['add', '-A'], WT_TIMEOUT);
                 gitOut(wtPath, ['commit', '-m', 'WIP (' + cs + '): ' + (s.summary || s.purpose || 'in-flight work at retire')], WT_TIMEOUT);
                 if (gitOut(wtPath, ['status', '--porcelain'], WT_TIMEOUT)) {
                     record({ kind: 'sys', text: 'worktree for ' + cs + ' has UNCOMMITTED work that would not commit; KEPT at ' + wtPath + ' on ' + branch });
-                    return 'kept';
+                    return { state: 'kept', wip: 'stranded' };
                 }
                 record({ kind: 'sys', text: 'committed ' + cs + ' WIP to ' + branch });
+                wip = 'committed';
             }
         }
-        if (!repoCwd) { record({ kind: 'sys', text: 'worktree for ' + cs + ' has no home repo to remove it from; KEPT at ' + wtPath }); return 'kept'; }
+        if (!repoCwd) { record({ kind: 'sys', text: 'worktree for ' + cs + ' has no home repo to remove it from; KEPT at ' + wtPath }); return { state: 'kept', wip }; }
         const ok = gitOut(repoCwd, ['worktree', 'remove', wtPath, '--force'], WT_TIMEOUT) !== null;
         gitOut(repoCwd, ['worktree', 'prune'], WT_TIMEOUT);
         // git's exit code is not proof the directory is gone. Measured 2026-07-27 in a throwaway
@@ -1916,10 +1941,10 @@ function teardownWorktree(s, cs) {
             : gone
                 ? 'worktree for ' + cs + ' removed; branch ' + branch + ' kept for merge'
                 : 'git reported removing ' + cs + ' worktree but ' + wtPath + ' is STILL THERE (a junction or open handle inside blocks it, and git has already forgotten the worktree so prune cannot help); branch ' + branch + ' kept' });
-        return ok && gone ? 'removed' : 'kept';
+        return { state: ok && gone ? 'removed' : 'kept', wip };
     } catch (e) {
         try { record({ kind: 'sys', text: 'worktree teardown errored for ' + cs + ' (' + (e && e.message) + '); ' + wtPath + ' left in place' }); } catch { }
-        return 'kept';
+        return { state: 'kept', wip };
     }
 }
 // ---- restart resilience -------------------------------------------------------------------
@@ -2568,7 +2593,11 @@ function spawnWorker(repo, purpose, opts = {}) {
         roster.handoffs = roster.handoffs || {};
         roster.handoffs['cs:' + cs] = handoff;
         saveRoster();
-        boot += ' You are the SUCCESSOR to a prior session on this job, which left you a handoff. The moment you finish registering, GET http://127.0.0.1:' + PORT + '/handoff?cs=' + cs + ' to read its one-line summary and detailed notes, post one chat line to the human saying you have picked up the handoff, then resume that work where it left off — your task board already carries the unfinished items. Keep the poll loop running as your inbox.';
+        // "notes MAY be empty" is said out loud on purpose. A successor told to read notes, and handed
+        // an empty string, concluded there was nothing to pick up -- when the `auto` block beside it
+        // named the branch its predecessor's work was sitting on. Point at both fields and say which is
+        // which, so a noteless relaunch reads as "read the reconstructed facts" instead of "no context".
+        boot += ' You are the SUCCESSOR to a prior session on this job, which left you a handoff. The moment you finish registering, GET http://127.0.0.1:' + PORT + '/handoff?cs=' + cs + ' to read it, post one chat line to the human saying you have picked up the handoff, then resume that work where it left off — your task board already carries the unfinished items. That record has two halves: "notes" is what your predecessor WROTE and MAY BE EMPTY (a relaunch from the console leaves none), while "auto" is a block the hub assembled from what it observed - the branch you are continuing, its last reported state, and the commit diff that stands in for the notes it never wrote. Read auto whether or not notes has anything in it. Keep the poll loop running as your inbox.';
     } else {
         boot += ' Then wait for instructions on the poll loop.';
     }
@@ -4432,8 +4461,13 @@ async function handleRequest(req, res) {
         const w = loadWork();
         const board = w.sessions[s.callsign] || { working: [], queued: [] };
         roster.handoffs = roster.handoffs || {};
+        // `auto` on this record too, so "every handoff record carries an auto block" is an invariant a
+        // reader can rely on rather than a property of one code path. A live checkpoint knows less than
+        // a retire does -- no span, and the worktree has not been torn down, so the WIP verdict is
+        // absent and the block says UNKNOWN rather than implying there is nothing to look at.
         if (s.cwd) roster.handoffs[handoffKey(s.cwd, s.purpose)] = {
             summary: s.summary || null, notes: s.handoff || '',
+            auto: reconstructHandoff(s, board, { uid: b.uid }),
             board: { working: board.working || [], queued: board.queued || [] },
             from: s.callsign, fromUid: b.uid, cwd: s.cwd, purpose: s.purpose,
             ts: new Date().toISOString(),
