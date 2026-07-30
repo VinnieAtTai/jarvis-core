@@ -21,8 +21,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { createScratchHub, assertConsolelessPossible, sleep } from '../test-support/scratch-hub.mjs';
-import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote } from '../jarvis-text.mjs';
+import { createScratchHub, assertConsolelessPossible, sleep, REPO_ROOT } from '../test-support/scratch-hub.mjs';
+import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote, spawnDispatch } from '../jarvis-text.mjs';
 
 const SKIP = process.env.JARVIS_INTEGRATION
     ? false
@@ -93,6 +93,59 @@ test('DEAD SPAWN: junk in or around the stash cannot break the sweep', () => {
     assert.equal(overdueSpawns([spawnAt('kilo', 'd:/repo')], { s_1: { callsign: 'kilo', cwd: 'd:/repo' } }, T0 + 300000, 90000).length, 1);
 });
 
+// --- spawnDispatch, and the guard that it stays ONE site ----------------------------------------
+//
+// WHY THESE EXIST. `{ spawnedBy, forProject: subOf || boundTo }` was written out inline at BOTH
+// watchSpawn calls in spawnWorker. A mutation needle aimed at it included the log-path argument, so it
+// matched the console-less call only -- one hit, harness satisfied, verdict "probed" -- while the
+// wt-new-tab branch had never been touched by any needle in the project's history. That is the general
+// trap: a needle unique only by ACCIDENT leaves its twin unprobed, and the one-hit guard is built to
+// catch a needle matching too MUCH, never one matching one of N equivalent sites.
+//
+// The wt branch shells out to wt.exe, so no test can reach it. Collapsing both callers onto one shared
+// expression is therefore the only honest pin, and the source guard below is what keeps it collapsed.
+
+test('spawnDispatch -- a sub-worker is reported against the project it was nested under', () => {
+    // The coordinator waiting on that delegate is the session that needs to hear it died.
+    assert.deepEqual(spawnDispatch('s_0433', 'jarvis', null), { spawnedBy: 's_0433', forProject: 'jarvis' });
+});
+
+test('spawnDispatch -- a project coordinator is reported against its own project', () => {
+    assert.deepEqual(spawnDispatch('s_0433', null, 'primeng'), { spawnedBy: 's_0433', forProject: 'primeng' });
+});
+
+test('spawnDispatch -- unsigned and unbound both degrade to null rather than to a wrong recipient', () => {
+    // An unsigned dispatch is the console + button and a voice spawn, where forProject is the ONLY way
+    // to reach anybody; an unbound one reaches nobody, and inventing a recipient would put a delegation
+    // report on a session that delegated nothing.
+    assert.deepEqual(spawnDispatch(null, null, null), { spawnedBy: null, forProject: null });
+    assert.deepEqual(spawnDispatch(undefined, undefined, undefined), { spawnedBy: null, forProject: null });
+    assert.equal(spawnDispatch(null, 'jarvis', null).forProject, 'jarvis');
+    assert.equal(spawnDispatch('s_0433', null, null).forProject, null);
+});
+
+test('spawnDispatch -- nesting wins if the two ever arrive together', () => {
+    // spawnWorker makes them exclusive (subOf is set only when there is no project), so this cannot
+    // happen today. Pinned anyway: it is the tie-break the `subOf || boundTo` order encodes, and a
+    // later change that relaxed the exclusivity would otherwise silently pick the other one.
+    assert.equal(spawnDispatch('s_0433', 'jarvis', 'primeng').forProject, 'jarvis');
+});
+
+test('DEAD SPAWN: the dispatch is built ONCE, so no launch branch can go unprobed', () => {
+    // THE GUARD, and it is the only thing here that could have caught the original defect. It is a
+    // source-level assertion on purpose: what went wrong was not a wrong value, it was two places
+    // holding the same decision where a test could only ever reach one of them.
+    const core = readFileSync(join(REPO_ROOT, 'jarvis-core.mjs'), 'utf8');
+    const calls = [...core.matchAll(/^\s*watchSpawn\((.*)\);\s*$/gm)].map(m => m[1]);
+    assert.ok(calls.length >= 2, 'expected both launch branches to call watchSpawn, found ' + calls.length);
+    for (const args of calls) {
+        assert.match(args, /, dispatch$/,
+            'a watchSpawn call builds its own dispatch instead of sharing the one: watchSpawn(' + args + ')');
+    }
+    // ...and the decision itself has left core entirely, so there is nowhere for a copy to hide.
+    assert.equal(core.split('subOf || boundTo').length - 1, 0,
+        'the forProject fallback is back inline in jarvis-core.mjs; it belongs to spawnDispatch alone');
+});
 // --- diagnoseSpawnLog ---------------------------------------------------------------------------
 
 // A VERBATIM capture of a worker that died on the folder-trust prompt Claude Code actually shows:
