@@ -1080,13 +1080,20 @@ function busAppend(ev, debounceMs) {
     bus.push(e);
     appendFileSync(BUS, JSON.stringify(e) + '\n');
     trimBus(); // bound bus + bus.jsonl at runtime, mirroring record()->trimTranscript()
+    // The ABSOLUTE index this event landed at -- exactly the cursor GET /poll must be called with to
+    // read it back, since `?cursor=i` starts AT i while the cursor a poll RETURNS is one PAST its last
+    // event. Safe to compute after trimBus: busBase + bus.length is invariant across a trim (it moves
+    // events off the front and bumps busBase by the same count), so a trim can never shift an index
+    // already handed out. Returned so POST /send can give the sender a verifiable receipt.
+    const at = busBase + bus.length - 1;
     if (!debounceMs) {
         if (speechReleaseTimer) { clearTimeout(speechReleaseTimer); speechReleaseTimer = null; }
         releaseWaiters();
-        return;
+        return at;
     }
     if (speechReleaseTimer) clearTimeout(speechReleaseTimer);
     speechReleaseTimer = setTimeout(() => { speechReleaseTimer = null; releaseWaiters(); }, debounceMs);
+    return at;
 }
 function eventsFor(uid, cursor) {
     const events = [];
@@ -3467,6 +3474,10 @@ async function handleRequest(req, res) {
     }
     if (key === 'GET /transcript') {
         const lim = Number(u.searchParams.get('limit') || 60);
+        // 'msg' (worker-to-worker /send) is deliberately ABSENT. Those lines are recorded for SEARCH
+        // only: the console routes a worker-authored line by its `who`, so they would render in the
+        // SENDER's tab as if the sender had said them to Chris. Admitting it here needs console
+        // routing work first -- console.js consults `to` only for who==='you'.
         const kinds = { speech: 1, tts: 1, chat: 1, sys: 1, react: 1 };
         const evts = transcriptCache.filter(e => kinds[e.kind]).map(e => ({
             ts: e.ts,
@@ -3504,11 +3515,15 @@ async function handleRequest(req, res) {
     if (key === 'GET /search') {
         // Every kind record() can put in the transcript. Keep this in step with record()'s callers --
         // an unlisted kind is unreachable through `kinds` AND invisible to kinds=all.
-        const SEARCHABLE = ['speech', 'chat', 'tts', 'sys', 'task', 'react'];
+        const SEARCHABLE = ['speech', 'chat', 'tts', 'msg', 'sys', 'task', 'react'];
         // "chats" means the CONVERSATION. sys and task are machinery: measured on the live transcript
         // they are 2.4k lines of 5.4k, and formulaic ones -- every register, retire and board move --
         // so a common term hits hundreds of near-identical lines and buries the real hits under them.
-        const DEFAULT_KINDS = ['speech', 'chat', 'tts'];
+        // 'msg' (worker-to-worker /send) IS conversation and is in by default, which is the whole
+        // point of recording it: the incident behind it was a coordinator searching the default way
+        // for a delegate's report. Reachable-but-not-default would have left that path just as blind.
+        // Unlike sys/task it is also not formulaic -- these are briefs, reports and corrections.
+        const DEFAULT_KINDS = ['speech', 'chat', 'tts', 'msg'];
         const LIMIT_DEFAULT = 50, LIMIT_MAX = 200;
 
         const q = String(u.searchParams.get('q') || '');
@@ -3595,6 +3610,10 @@ async function handleRequest(req, res) {
             if (s && proj && s.project === proj.name) memberUids.add(uid);
         }
         const memberCs = new Set([...memberUids].map(uid => roster.sessions[uid].callsign).filter(Boolean));
+        // 'msg' (worker-to-worker /send) is deliberately ABSENT here too, and this is the one that
+        // matters most: a booting coordinator is told to treat the newest mission-chat messages as its
+        // live prompt, so admitting delegation briefs would feed a sub-worker's own instructions back
+        // to the coordinator as though the human had said them.
         const kinds = { speech: 1, tts: 1, chat: 1 };
         const evts = transcriptCache.filter(e =>
             kinds[e.kind] && (e.missionId === id || memberCs.has(e.from) || (e.to && memberCs.has(e.to)))
@@ -3752,8 +3771,27 @@ async function handleRequest(req, res) {
         }
         const toUid = roster.sessions[b.to] ? b.to : liveUidOf(String(b.to || '').toLowerCase());
         if (!toUid) return json(res, 404, { error: 'unknown recipient' });
-        busAppend({ from: b.from, to: toUid, kind: 'msg', text: String(b.text || '') });
-        return json(res, 200, { ok: true });
+        const text = String(b.text || '');
+        const toCs = roster.sessions[toUid].callsign;
+        const at = busAppend({ from: b.from, to: toUid, kind: 'msg', text });
+        // Worker-to-worker traffic belongs in the transcript too. Before this it reached the bus ONLY,
+        // so GET /search could never see it -- and a coordinator that searched chat for a delegate's
+        // report found nothing and told it the send had failed, the evidence void by construction.
+        // Recorded as kind 'msg', deliberately NOT 'chat': both transcript readers gate on kind (GET
+        // /transcript, GET /mission-chat) and neither lists 'msg', so the console chat feed and the
+        // mission conversation stay exactly as they were. The second one is not cosmetic -- a booting
+        // coordinator is told to treat the newest mission-chat as its live prompt, so a delegation
+        // brief landing there would come back at it as an instruction. Search reads these; no
+        // conversation does. `from`/`to` here are CALLSIGNS, the transcript's convention and what
+        // `who` and `from=` project, while the bus event above keeps the uid its routing needs.
+        record({ kind: 'msg', from: label, to: toCs, text });
+        // A RECEIPT, not just an ack: ok:true alone only ever proved the recipient RESOLVED. `cursor`
+        // is the bus index the message landed at, so a sender can say WHERE it is rather than guess
+        // (GET /poll?cursor=<it> returns it), and `to` closes the other half -- that it resolved to
+        // the session the sender MEANT, not merely to some live one. The to:'human' branch above gets
+        // no cursor on purpose: it records to the transcript and never touches the bus, so there is
+        // no index to name and inventing one would be the exact false receipt this set out to fix.
+        return json(res, 200, { ok: true, cursor: at, to: toCs, uid: toUid });
     }
     if (key === 'POST /say') {
         const b = await readBody(req);

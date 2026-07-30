@@ -100,7 +100,11 @@ test('SEARCH: substring, not word boundary -- a mid-word fragment hits', { skip:
 
 test('SEARCH: sys and task are EXCLUDED by default -- machinery must not bury the conversation', { skip: SKIP }, async () => {
     const r = await search('q=zqx%20alpha%20beta');
-    assert.deepEqual(r.kinds, ['speech', 'chat', 'tts']);
+    // Widened DELIBERATELY when worker-to-worker /send began recording as kind 'msg' (test/send.test.mjs):
+    // that traffic IS conversation, and the incident behind recording it was a coordinator searching the
+    // DEFAULT way for a delegate's report. sys and task stay out -- they are the formulaic machinery this
+    // test is actually about, and nothing here weakens that half.
+    assert.deepEqual(r.kinds, ['speech', 'chat', 'tts', 'msg']);
     assert.deepEqual(r.results.map(h => h.srcKind).sort(), ['chat', 'speech', 'tts']);
 });
 

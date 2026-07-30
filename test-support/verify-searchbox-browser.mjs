@@ -58,6 +58,10 @@ try {
     // an assertion rather than an assumption.
     lines.push({ ts: iso(daysAgo(1, 10, 0)), kind: 'sys', text: 'zephyr sys line that must NOT show' });
     lines.push({ ts: iso(daysAgo(1, 10, 1)), kind: 'task', from: 'alpha', text: 'zephyr task line that must NOT show' });
+    // A worker-to-worker /send, which the hub records as kind 'msg'. In the DEFAULT kinds (it is
+    // conversation), but in NEITHER transcript reader -- so search is the only place it surfaces, and
+    // the only place its rendering can be checked. Its own token, so no count above moves.
+    lines.push({ ts: iso(daysAgo(1, 13, 30)), kind: 'msg', from: 'foxtrot', to: 'golf', text: 'relaytest brief sent to a sub-worker' });
     // Three lines carrying "commit" and/or "baton"; exactly ONE carries both.
     lines.push({ ts: iso(daysAgo(3, 12, 0)), kind: 'chat', from: 'delta', text: 'the commit baton serializes merges' });
     lines.push({ ts: iso(daysAgo(3, 12, 1)), kind: 'chat', from: 'delta', text: 'baton alone on this line' });
@@ -123,6 +127,18 @@ try {
         ok(stamps.some(s => /^\d\d:\d\d$/.test(s.trim())), "today's hit shows a bare time", stamps.join(' | '));
         ok(stamps.some(s => /^[A-Z][a-z]{2} \d+ \d\d:\d\d$/.test(s.trim())), 'an older hit shows a date', stamps.join(' | '));
         ok(stamps.some(s => /^[A-Z][a-z]{2} \d+ \d{4} \d\d:\d\d$/.test(s.trim())), 'a hit from another year shows the year', stamps.join(' | '));
+
+        // 3b. A worker-to-worker `msg` hit renders like any other. It reaches the box through the
+        //     default kinds, so it must arrive labelled with the SENDER and not mistaken for Chris's
+        //     own line -- the projection gives it who=<sender callsign> exactly as a worker chat gets.
+        await page.fill('#qbox', 'relaytest');
+        await page.press('#qbox', 'Enter');
+        await page.waitForFunction(() => /1 match\b/.test(document.querySelector('.scount')?.textContent || ''), null, { timeout: 8000 });
+        ok((await page.locator('#chat .row').count()) === 1, 'a worker-to-worker msg hit renders as a row');
+        ok((await page.textContent('#chat')).includes('brief sent to a sub-worker'), 'and its text is in the DOM');
+        const relayWhos = (await page.locator('#chat .row .chip').allTextContents()).map(s => s.replace(/[^A-Z]/g, ''));
+        ok(relayWhos.includes('FOXTROT'), 'labelled with the SENDER callsign', relayWhos.join(','));
+        ok((await page.locator('#chat .row.me').count()) === 0, 'and never right-aligned as the human\'s own message');
 
         // 4. Terms are ANDed within one line.
         await page.fill('#qbox', 'commit baton');
