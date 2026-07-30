@@ -80,7 +80,10 @@ dead for the whole turn. The ping prevents that; the poll loop stays your inbox.
   Use the EXACT N it printed, never a number you inferred: a cursor advanced past an event makes
   that event unreachable through `/poll` forever — no error, and both ends keep reading healthy.
   That has already cost one delegate's whole report. To recover one, `GET /poll?cursor=<the missed
-  index>` directly.
+  index>` directly. The hub now watches for this: if you come back with a cursor higher than the one
+  it handed you AND something addressed to you was inside the gap, your next poll returns a `gap`
+  event naming the exact index to re-read. It stays silent when the skipped indices held nothing of
+  yours, so a `gap` event always means you really lost something.
   Handle ALL events in the batch in one turn (one combined response, not one per event).
   Never poll bare (a plain curl that returns empty wakes you for nothing). The hub holds
   rapid-fire speech for a few seconds so consecutive sentences arrive as one batch.
@@ -88,7 +91,8 @@ dead for the whole turn. The ping prevents that; the poll loop stays your inbox.
   (text is the path to a screen capture the hub took the INSTANT the human said take a
   screenshot — Read it as an image; it usually arrives in the same batch as the speech that
   asked for it, and your analysis should refer to that exact moment), `msg` (another
-  session), `baton` (the merge lane is yours — see step 4b), `retire-request` (wrap up, see
+  session), `baton` (the merge lane is yours — see step 4b), `gap` (your cursor skipped past
+  something addressed to you; the text names the index to re-read), `retire-request` (wrap up, see
   step 5), `retired` (you are done, stop polling).
 - An exit printing `{"error":"retired"}` means you were retired; stop, do not relaunch.
 - The heartbeat PING (not this loop) is what keeps you live — so even a long turn stays green.

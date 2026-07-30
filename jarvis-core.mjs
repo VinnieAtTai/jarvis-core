@@ -12,7 +12,7 @@ import { fetchRealUsage } from './usage.mjs';
 import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
 import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap } from './jarvis-text.mjs';
 import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote } from './jarvis-text.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, cursorGap, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // What code is actually RUNNING, resolved once at load and stated out loud.
@@ -1063,6 +1063,57 @@ function voiceMutedFrom(label) {
     const uid = liveUidOf(label);
     return !!(uid && roster.sessions[uid] && roster.sessions[uid].voiceMuted);
 }
+// The cursor the hub last HANDED each session, uid -> index. The baseline for cursorGap: a worker
+// relaunching its loop should come back with exactly this number.
+//
+// Deliberately in memory and NOT on the roster, which is what makes the detector safe rather than
+// merely correct. A hub restart wipes it, so the first poll after a boot has no baseline and can
+// never be read as a jump -- and a restart is precisely when a stale baseline would lie, because
+// roster persistence is throttled (5s) and a guardian tree-kill skips the shutdown path entirely,
+// so a persisted copy would routinely come back low. Low reads as a skip that never happened.
+// The cost of forgetting is one undetected gap across a restart; the cost of a stale baseline is a
+// worker chasing a message nobody lost. We take the first every time.
+const lastPollCursor = new Map();
+// How long /poll holds an idle request open. Env-overridable so a test can exercise the timeout exit
+// without sitting through the real 25s -- that exit is one of the four the baseline is stamped at.
+const POLL_HOLD_MS = Number(process.env.JARVIS_POLL_HOLD_MS) > 0 ? Number(process.env.JARVIS_POLL_HOLD_MS) : 25000;
+// THE single exit for every poll response. There are FOUR of them -- /poll's immediate return, its
+// long-poll timeout, releaseWaiters (outside the handler entirely), and the shutdown flush -- and a
+// baseline stamped at only some of them goes stale LOW, which is the false alarm above. Funnelling
+// them through here is what makes that structurally impossible instead of a thing to remember.
+function pollRespond(uid, res, out) {
+    lastPollCursor.set(uid, out.cursor);
+    json(res, 200, out);
+}
+// A worker jumped its cursor: build the notice that tells it exactly which index to ask for, or null
+// when there is nothing worth saying.
+//
+// Silent unless something addressed to THIS session was inside the jumped window. An absolute-index
+// gap on its own is meaningless -- the bus is shared, so most of what a worker skips over was never
+// its traffic, and saying so would be noise that trains workers to ignore the real thing.
+//
+// `gone` is the part of the window that has already been trimmed off the front of the bus (below
+// busBase). trimBus rewrites bus.jsonl to the retained events, so those are not recoverable from
+// disk either -- we cannot count them and must not imply they can be fetched.
+function gapNotice(uid, cursor) {
+    const gap = cursorGap(lastPollCursor.get(uid), cursor);
+    if (!gap) return null;
+    const gone = Math.max(0, Math.min(gap.to, busBase) - gap.from);
+    let n = 0;
+    for (let i = Math.max(0, gap.from - busBase); i < Math.min(bus.length, gap.to - busBase); i++) {
+        const e = bus[i];
+        if (e.to === uid || e.to === 'all') n++;
+    }
+    if (!n && !gone) return null;
+    const text = 'poll cursor gap: you polled at ' + gap.to + ' but your last poll returned ' + gap.from
+        + ', so ' + (gap.to - gap.from) + ' event(s) were never delivered to you'
+        + (n ? ' and ' + n + ' of them ' + (n === 1 ? 'is' : 'are') + ' addressed to you. Read '
+            + (n === 1 ? 'it' : 'them') + ' with GET /poll?cursor=' + gap.from + '.' : '.')
+        + (gone ? ' ' + gone + ' index(es) from ' + gap.from + ' have already been trimmed off the bus and are gone for good.' : '')
+        + ' Relaunch your loop with the EXACT cursor the poll printed, never a number you inferred.';
+    record({ kind: 'sys', text: (roster.sessions[uid] ? roster.sessions[uid].callsign : uid) + ' skipped ' + (gap.to - gap.from) + ' event(s) at cursor ' + gap.from + ' (' + n + ' addressed to it)' });
+    return { from: 'jarvis', to: uid, kind: 'gap', text, ts: new Date().toISOString() };
+}
 function releaseWaiters() {
     for (let i = pollWaiters.length - 1; i >= 0; i--) {
         const wt = pollWaiters[i];
@@ -1070,7 +1121,7 @@ function releaseWaiters() {
         if (out.events.length) {
             pollWaiters.splice(i, 1);
             clearTimeout(wt.timer);
-            json(wt.res, 200, out);
+            pollRespond(wt.uid, wt.res, out);
         }
     }
 }
@@ -3663,14 +3714,26 @@ async function handleRequest(req, res) {
         s.lastSeen = s.lastPoll = new Date().toISOString();
         s.pollCursor = cursor;
         saveRosterThrottled();
+        // Ask about the jump BEFORE stamping this cursor as the new baseline, and deliver the notice
+        // as an EVENT rather than a side field: the documented wrapper loop only exits on a non-empty
+        // `events` array, so a worker running it would never see a bare `{gap:...}` on the response.
+        const notice = gapNotice(uid, cursor);
         const out = eventsFor(uid, cursor);
-        if (out.events.length) return json(res, 200, out);
+        if (notice) out.events.unshift(notice);
+        if (out.events.length) return pollRespond(uid, res, out);
         const waiter = { uid, cursor, res, timer: null };
         waiter.timer = setTimeout(() => {
             const i = pollWaiters.indexOf(waiter);
             if (i >= 0) pollWaiters.splice(i, 1);
-            json(res, 200, { cursor: busBase + bus.length, events: [] });
-        }, 25000);
+            // Answer with the waiter's OWN cursor, never the bus head, because an idle timeout has
+            // delivered NOTHING and the head can have moved past events this waiter never got. The
+            // way that happens is routine, not exotic: human speech is bused with a 4s debounce, so
+            // an event addressed to this very waiter can be sitting at the head un-released when the
+            // hold expires. Handing back the head then tells the worker to skip the human's own words,
+            // and the hub's cursor is the one that skipped them -- so the gap detector above cannot
+            // see it either, because the baseline it compares against is this very number.
+            pollRespond(uid, res, { cursor, events: [] });
+        }, POLL_HOLD_MS);
         pollWaiters.push(waiter);
         req.on('close', () => {
             const i = pollWaiters.indexOf(waiter);
@@ -4588,7 +4651,11 @@ async function main() {
     }
     for (const wt of pollWaiters.splice(0)) {
         clearTimeout(wt.timer);
-        try { json(wt.res, 200, { cursor: busBase + bus.length, events: [] }); } catch { }
+        // Same rule as the idle timeout: this waiter is being answered with nothing, so it keeps its
+        // own cursor. Handing out the head here is worse than anywhere else -- the worker rides the
+        // restart out and comes back with whatever we said, and nothing after the restart can tell it
+        // what it skipped, because the baseline dies with this process.
+        try { pollRespond(wt.uid, wt.res, { cursor: wt.cursor, events: [] }); } catch { }
     }
     if (consolePage) await consolePage.evaluate(() => window.__shutdown()).catch(() => { });
     record({ kind: 'sys', text: 'jarvis core stopped' });

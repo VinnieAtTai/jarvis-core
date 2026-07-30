@@ -887,6 +887,34 @@ export function wedgeState(s, now, { graceMs = 300000, staleMs = 120000, pending
     return { minutes: Math.floor(deaf / 60000), pending };
 }
 
+// Did this session's poll cursor JUMP -- arrive at an index higher than the one the hub last handed
+// it? A worker is documented to relaunch its loop with the exact cursor its poll printed, so the two
+// should match. When the worker's is higher, every event in between was never delivered and is now
+// behind its cursor: /poll will never return it again, there is no error, and BOTH ENDS READ HEALTHY.
+// That is not hypothetical -- relaunching at 6390 after being returned 6388 silently destroyed a
+// delegate's entire board audit on 2026-07-29.
+//
+// `lastReturned` is the cursor the hub last RESPONDED with, which is always the bus head at that
+// moment -- never the cursor that was requested. So the comparison is against what we GAVE, and a
+// worker that re-reads an older index (the documented recovery) is deliberately not a jump.
+//
+// Returns null when there is nothing to report, else the half-open window { from, to } that was
+// jumped. Silent for:
+//   - a session we have handed nothing to yet (never polled, or a hub that booted since it last
+//     did): with no `lastReturned` there is no honest baseline, and inventing one manufactures a
+//     skip that never happened. A false alarm is worse than the silence this exists to fix -- it
+//     sends a worker chasing a message nobody lost, and its manager acts on the phantom.
+//   - cursor === lastReturned, the healthy case, by far the common one.
+//   - cursor < lastReturned, a deliberate re-read.
+// Pure: reads, mutates nothing. The window is only an index range -- whether anything inside it was
+// actually addressed to this session is the caller's to count, because the bus is SHARED and a gap
+// over other sessions' traffic costs this one nothing.
+export function cursorGap(lastReturned, cursor) {
+    if (!Number.isFinite(lastReturned) || !Number.isFinite(cursor)) return null;
+    if (cursor <= lastReturned) return null;
+    return { from: lastReturned, to: cursor };
+}
+
 // Parse a JSON request body, tolerating the single most common worker mistake: a Windows path
 // pasted into `curl -d` with un-escaped backslashes, e.g. {"cwd":"d:\claude\jarvis-core"}. That
 // is invalid JSON (\c, \j, \u<not-4-hex> are not valid escapes), so a strict JSON.parse throws and
