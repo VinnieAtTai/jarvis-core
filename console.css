@@ -106,6 +106,13 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,"Segoe UI Emoji","S
 .ndot{flex:none;color:#5db4d9;font-size:11px;cursor:pointer;user-select:none;opacity:.7}
 .wnote{flex-basis:100%;margin:2px 0 4px 18px;font-size:11px;color:#8aa0b4;border-left:2px solid #2a3a4a;padding-left:8px;white-space:pre-wrap;text-decoration:none}
 .expander{cursor:pointer;color:#5db4d9 !important;text-decoration:none}
+/* Headline / detail. The caret is the ONLY affordance saying a line has been shortened, so it stays
+   visible at rest rather than appearing on hover -- a hidden one reads as "that is the whole card". */
+.hlmore{flex:none;cursor:pointer;color:#5db4d9;font-size:12px;opacity:.75;padding:0 3px;user-select:none;text-decoration:none}
+.hlmore:hover{opacity:1}
+/* flex-basis:100% drops the detail onto its own full-width line inside .witem's wrapping flex row,
+   the same way .wnote does; line-through on a done row must not bleed into it. */
+.hldetail{flex-basis:100%;margin:3px 0 4px 18px;font-size:11px;line-height:1.45;color:#8aa0b4;border-left:2px solid #2a3a4a;padding-left:8px;white-space:pre-wrap;overflow-wrap:anywhere;text-decoration:none}
 .bdoing{font-size:11px;color:#9bb0c4;margin:0 0 2px}
 .needs{color:#fff;background:#a33;border-radius:4px;padding:0 5px;font-weight:bold;letter-spacing:1px}
 .nmlabel{color:#5db4d9;font-weight:bold;font-size:11px;letter-spacing:1px}

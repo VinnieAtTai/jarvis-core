@@ -716,6 +716,56 @@ function chipFor(text) {
     if (!c) return { chip: '', rest: text };
     return { chip: '<span class="tchip ' + c[2] + '" title="' + c[1] + '">' + c[0] + '</span>', rest: text.slice(m[0].length) };
 }
+// ---- Board readability: headline on the card, detail behind a click. ----------------------------
+// console.js is a classic browser script (console.html loads it with a plain <script src>), so it
+// cannot import from jarvis-text.mjs. splitHeadline below is therefore a MIRROR of the exported
+// function there, and test/headline.test.mjs runs both copies over one shared fixture table so the
+// two cannot drift apart unnoticed -- keep any edit in step across both files.
+function splitHeadline(text, max) {
+    const lim = max || 80;
+    const s = String(text == null ? '' : text).replace(/\r/g, '').trim();
+    const iSep = s.indexOf(' -- ');
+    const iNl = s.indexOf('\n');
+    let cut = -1, skip = 0;
+    if (iSep >= 0 && (iNl < 0 || iSep < iNl)) { cut = iSep; skip = 4; }
+    else if (iNl >= 0) { cut = iNl; skip = 1; }
+    let headline = cut >= 0 ? s.slice(0, cut).trim() : s;
+    const detail = cut >= 0 ? s.slice(cut + skip).trim() : '';
+    headline = headline.replace(/\s+--$/, '');
+    let truncated = false;
+    if (headline.length > lim) {
+        const sp = headline.lastIndexOf(' ', lim);
+        headline = headline.slice(0, sp > lim * 0.6 ? sp : lim).trim() + '...';
+        truncated = true;
+    }
+    return { headline, detail, truncated, hasMore: !!detail || truncated };
+}
+// The one surface every piece of agent-written prose goes through: a task line, a session's doing
+// line on the card, the same line on the mission rail, and a project's current-focus line. Returns
+// the pieces SEPARATELY because those four sites frame them differently -- a task row nests its text
+// inside .wtext alongside the row number and the category chip, the doing lines do not -- and a
+// single pre-baked blob of HTML would have to be unpicked at three of the four.
+//
+// Expanding shows the FULL stored string, not just the part after the separator. One rule instead of
+// two: a long unseparated card has no "detail" to show, so anything else would leave its expander
+// opening onto nothing. It also means what Chris sees expanded is exactly what the session wrote.
+//
+// `open` is passed in rather than read from boardExpand here, which keeps this pure enough for
+// test/headline.test.mjs to lift and assert on the real HTML. That test is the wiring proof: this
+// project has shipped helpers with no caller before (the "where is the search" failure), and a pure
+// function nobody calls is worse than no function at all.
+function headlineHtml(text, key, open, max) {
+    const p = splitHeadline(text, max);
+    const caret = p.hasMore
+        ? '<span class="hlmore" data-x="' + escAttr(key) + '" title="' + (open ? 'hide the detail' : 'show the full text') + '">'
+            + (open ? '&#9662;' : '&#8230;') + '</span>'
+        : '';
+    const body = (open && p.hasMore)
+        ? '<div class="hldetail">' + esc(String(text == null ? '' : text).replace(/\r/g, '')).split('\n').join('<br>') + '</div>'
+        : '';
+    return { text: esc(p.headline), caret: caret, body: body, hasMore: p.hasMore };
+}
+
 // Per-session activity glyph shown next to the callsign: a spinner while the session
 // is actively working, 💤 when it is idle or quiet (heartbeat gone stale). Driven by
 // the server's `alive` flag (lastSeen < 2 min) plus the session's `doing` phrase. A
@@ -946,6 +996,11 @@ function renderMissions(list, boards) {
         const lrole = batonRole(b);
         const lane = lrole
             ? '<span class="batonchip ' + lrole + '" title="' + escAttr(batonTip(b)) + '">' + esc(batonLabel(b)) + '</span>' : '';
+        // The rail's doing-line was the worst offender in the screenshot: the row is one nowrap flex
+        // line, so a paragraph-long `doing` was simply cut off mid-word by CSS with no way to read the
+        // rest. Headline here, full text one click down -- and the detail block is a SIBLING of the row
+        // rather than a child, because a block inside that flex line would be squeezed to nothing.
+        const dh = headlineHtml(doing, 'rdoing:' + b.callsign, boardExpand.has('rdoing:' + b.callsign), 60);
         return '<div class="mworker ' + role + (idle ? ' idle' : '') + '" style="display:flex;align-items:baseline;gap:6px;font-size:11px;padding:2px 0' + (sub ? ' 2px 12px' : '') + ';color:' + (idle ? '#6b7a89' : '#9bb0c4') + '">'
             + (sub ? '<span style="color:#3d5568;font-size:10px">&#8627;</span>' : '')
             + '<span style="font-weight:bold;color:' + (idle ? '#6b7a89' : '#c9b98a') + ';letter-spacing:.5px">' + esc(cs) + '</span>'
@@ -953,8 +1008,9 @@ function renderMissions(list, boards) {
             + chip
             + lane
             + activityIndicator(b)
-            + '<span style="opacity:.9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(doing) + '</span>'
-            + '</div>';
+            + '<span style="opacity:.9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + dh.text + '</span>' + dh.caret
+            + '</div>'
+            + (dh.body ? '<div style="padding-left:' + (sub ? 22 : 10) + 'px">' + dh.body + '</div>' : '');
     };
     const items = list.map(mn => {
         const phs = mn.phases || [], tot = phs.length, done = phs.filter(p => p.done).length;
@@ -988,6 +1044,16 @@ function renderMissions(list, boards) {
         + '<div class="mmsg">Say &ldquo;mission accomplished&rdquo; to close one.</div>';
 }
 if (missionEl) missionEl.onclick = (e) => {
+    // Expanders first: the rail now carries headline/detail carets on its worker rows, and they use
+    // the same boardExpand set and data-x contract as the board cards. Re-render through
+    // renderBoards (not renderMissions) because the rail is drawn from lastBoard as a whole.
+    const x = e.target.closest ? e.target.closest('[data-x]') : null;
+    if (x) {
+        const k = x.getAttribute('data-x');
+        if (boardExpand.has(k)) boardExpand.delete(k); else boardExpand.add(k);
+        if (lastBoard) renderBoards(lastBoard);
+        return;
+    }
     const t = e.target.closest ? e.target.closest('.mphase[data-mid]') : null;
     if (!t) return;
     fetch('/mission', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op: 'phase', id: t.getAttribute('data-mid'), index: Number(t.getAttribute('data-pi')) }) })
@@ -1177,7 +1243,8 @@ function renderBoards(d) {
             : '';
         const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + act + worker + ctx + watch + wedge + laneChip + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
         const purpose = b.purpose ? '<div class="cpurpose">' + esc(b.purpose) + '</div>' : '';
-        const doing = (b.needsYou || b.doing) ? '<div class="bdoing">' + (b.needsYou ? '<span class="needs">NEEDS YOU</span> ' : '') + esc(b.doing || '') + '</div>' : '';
+        const dh = headlineHtml(b.doing || '', 'doing:' + cs, boardExpand.has('doing:' + cs));
+        const doing = (b.needsYou || b.doing) ? '<div class="bdoing">' + (b.needsYou ? '<span class="needs">NEEDS YOU</span> ' : '') + dh.text + dh.caret + dh.body + '</div>' : '';
         const counts = (working.length || queued.length || review.length || done.length) ? '<div class="ccount">'
             + (working.length ? '<span class="cnum work">' + working.length + ' working</span>' : '')
             + (queued.length ? '<span class="cnum queue">' + queued.length + ' queued</span>' : '')
@@ -1192,7 +1259,8 @@ function renderBoards(d) {
         if (pc) {
             const openP = boardExpand.has('pctx:' + cs);
             const threadN = (pc.openThreads || []).length, logN = (pc.recentLog || []).length;
-            const focusLine = pc.currentFocus ? '<div style="color:#c9b98a">▸ ' + esc(pc.currentFocus) + '</div>' : '';
+            const fh = headlineHtml(pc.currentFocus || '', 'pcfocus:' + cs, boardExpand.has('pcfocus:' + cs));
+            const focusLine = pc.currentFocus ? '<div style="color:#c9b98a">▸ ' + fh.text + fh.caret + fh.body + '</div>' : '';
             const hasMore = !!(pc.summary || threadN || logN || (pc.docs || []).length);
             const cap = hasMore ? '<span class="pctoggle" data-x="pctx:' + esc(cs) + '" style="cursor:pointer;color:#6f8faf">'
                 + (openP ? '▾ less' : '▸ context' + (threadN ? ' · ' + threadN + ' open' : '') + (logN ? ' · ' + logN + ' log' : '')) + '</span>' : '';
@@ -1237,7 +1305,12 @@ function renderBoards(d) {
             // chip is derived from a leading TAG: and stripped from the visible text; data-t above
             // keeps the FULL original text so op matching is unaffected.
             const tc = chipFor(txt);
-            return '<div class="witem ' + list + '"' + dx + ' title="' + escAttr(txt) + '"><span class="wleft"><span class="wtext"><span class="wnum">' + num + '</span> ' + mark + ' ' + tc.chip + esc(tc.rest) + '</span>' + dot + '</span><span class="rowacts">' + acts + '</span>' + noteBody + '</div>';
+            // Headline only on the row; the full text opens under it. Split the CHIP-STRIPPED text so
+            // the headline is prose rather than "FEATURE:" plus a clause. Bare-string tasks carry no
+            // id, so the expander key falls back to the row's position - without that fallback every
+            // unmigrated task on a card shares the key 'hl:' and they all open together.
+            const hl = headlineHtml(tc.rest, 'hl:' + (id || cs + ':' + list + ':' + num), boardExpand.has('hl:' + (id || cs + ':' + list + ':' + num)));
+            return '<div class="witem ' + list + '"' + dx + ' title="' + escAttr(txt) + '"><span class="wleft"><span class="wtext"><span class="wnum">' + num + '</span> ' + mark + ' ' + tc.chip + hl.text + '</span>' + hl.caret + dot + '</span><span class="rowacts">' + acts + '</span>' + hl.body + noteBody + '</div>';
         };
         // Top 3 per lane + a "N more" expander; the done lane defaults to FULLY collapsed (history).
         const lane = (items, list, mark) => {
