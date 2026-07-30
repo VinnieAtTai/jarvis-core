@@ -22,47 +22,17 @@
 //     npm run test:delegate
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createScratchHub, assertConsolelessPossible, REPO_ROOT } from '../test-support/scratch-hub.mjs';
+import { createScratchHub, assertConsolelessPossible, REPO_ROOT, recordBootPrompts, bootPrompt } from '../test-support/scratch-hub.mjs';
 
 const SKIP = process.env.JARVIS_INTEGRATION
     ? false
     : 'set JARVIS_INTEGRATION=1 to run (spawns a real hub and ConPTYs; ~40 seconds)';
 
-// Capturing the boot prompt. It is deliberately never persisted: spawnWorkerConsoleless hands it to
-// pty-host in a config file that pty-host deletes the instant it has read it, specifically so
-// JARVIS_DATA does not accumulate every brief the hub has ever written. So catch it at the far end,
-// in the claude stub, which is the only place it comes to rest.
-//
-// It cannot be forwarded with %*. node-pty escapes the prompt's own quotes as \" when it builds the
-// command line; cmd.exe does not understand that escape, so the quote state unbalances and the &s in
-// the hub's URLs leak out as command separators. !CMDCMDLINE! under DELAYED expansion is substituted
-// AFTER the line has been parsed, so nothing inside it is ever re-interpreted -- and it has to be
-// delayed expansion rather than %CMDCMDLINE%, which is a cmd pseudo-variable that no child process
-// inherits (measured: the child sees it empty).
-//
-// The capture is byte-exact except for non-ASCII, which the console codepage folds. Hence ASCII-only
-// needles below -- the same rule the hub's own bodies follow.
-function recordBootPrompts(hub) {
-    writeFileSync(join(hub.BIN, 'claude.cmd'), [
-        '@echo off',
-        'setlocal enabledelayedexpansion',
-        '> "' + join(hub.DATA, 'boot-') + '%JARVIS_CALLSIGN%.txt" echo(!CMDCMDLINE!',
-        'endlocal',
-        'node "%~dp0stub-worker.mjs"',
-    ].join('\r\n') + '\r\n');
-}
-
-// The recorded prompt with node-pty's argv escaping undone, so needles read the way the prompt does.
-// Length-gated because the redirect above and this read are not synchronised: a zero-length or
-// half-written file means "not yet", not "no prompt".
-const bootPrompt = (hub, cs) => hub.waitFor('the boot prompt for ' + cs, () => {
-    const p = join(hub.DATA, 'boot-' + cs + '.txt');
-    if (!existsSync(p)) return null;
-    const t = readFileSync(p, 'utf8');
-    return t.length > 400 ? t.replace(/\\"/g, '"') : null;
-}, 60000);
+// recordBootPrompts / bootPrompt now live in test-support/scratch-hub.mjs, with the cmd.exe and
+// node-pty reasoning that goes with them -- promoted the moment the handoff rig became the second
+// caller, exactly as the note here said to do.
 
 const registered = (hub, cs) => hub.waitFor(cs + ' to register', async () => {
     const row = await hub.live(cs);

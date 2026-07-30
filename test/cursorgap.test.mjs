@@ -28,6 +28,8 @@
 //     npm run test:cursorgap
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { cursorGap } from '../jarvis-text.mjs';
 import { createScratchHub, sleep } from '../test-support/scratch-hub.mjs';
 
@@ -91,8 +93,8 @@ before(async () => {
     // LONGER than the hold is what pins the speech race deterministically instead of 16% of the time.
     hub = await createScratchHub({ env: { JARVIS_POLL_HOLD_MS: '700', JARVIS_SPEECH_DEBOUNCE: '4000' } });
     await hub.start('cursorgap hub');
-    A = await hub.post('/register', { cwd: process.cwd(), purpose: 'cursor gap probe' });
-    B = await hub.post('/register', { cwd: process.cwd(), purpose: 'cursor gap bystander' });
+    A = await hub.post('/register', { cwd: hub.REPO, purpose: 'cursor gap probe' });
+    B = await hub.post('/register', { cwd: hub.REPO, purpose: 'cursor gap bystander' });
     assert.ok(A && A.uid && B && B.uid, 'both probe sessions must register: ' + JSON.stringify([A, B]));
 });
 after(() => { if (hub) hub.dispose(); });
@@ -193,4 +195,122 @@ test('GAP: the human words survive an idle timeout -- the hub must not hand out 
     assert.ok((next.events || []).some(e => e.kind === 'speech' && /do not lose this sentence/.test(e.text)),
         'the timeout handed out a cursor PAST the human speech, which is now unreachable: '
         + JSON.stringify({ base: base.cursor, timedOut: timedOut.cursor, next }));
+});
+
+test('GAP: the SHUTDOWN flush keeps each waiter at its own cursor, so a restart cannot skip it',
+    { skip: SKIP, timeout: 120000 }, async (t) => {
+    // The fourth exit, and the one the design brief did not count. It answers every parked waiter on
+    // the way down, delivering nothing -- so handing back the bus head here is the same fault as the
+    // idle timeout, and WORSE: the worker rides the restart out and comes back with whatever we said,
+    // and the in-memory baseline that would have caught it died with the process.
+    //
+    // Its own hub, because the subject is the hub STOPPING. A long hold so the waiter cannot time out
+    // first and answer through the exit next door.
+    const sHub = await createScratchHub({ env: { JARVIS_POLL_HOLD_MS: '25000' } });
+    t.after(() => sHub.dispose());
+    await sHub.start('shutdown hub');
+    const W = await sHub.post('/register', { cwd: sHub.REPO, purpose: 'shutdown waiter' });
+    const O = await sHub.post('/register', { cwd: sHub.REPO, purpose: 'shutdown bystander' });
+    assert.ok(W && W.uid && O && O.uid, 'both sessions must register: ' + JSON.stringify([W, O]));
+
+    // Park at 0 so the expected answer is a single unambiguous number, then move the head with
+    // traffic for someone ELSE -- W stays parked (releaseWaiters only answers waiters with events),
+    // so head and W's cursor are provably different when the flush runs.
+    const parked = sHub.get('/poll?uid=' + W.uid + '&cursor=0');
+    await sleep(200);
+    const r = await sHub.post('/send', { from: W.uid, to: O.callsign, text: 'wsk advance the head' });
+    assert.equal(typeof r.cursor, 'number', 'setup: the bystander send must land on the bus: ' + JSON.stringify(r));
+
+    writeFileSync(join(sHub.DATA, 'commands.txt'), 'stop\n');   // the graceful path, not a tree-kill
+    const flushed = await parked;
+    assert.deepEqual(flushed.events, [], 'the shutdown flush delivers nothing, by definition');
+    assert.equal(flushed.cursor, 0,
+        'the flush handed out the bus head instead of the waiter own cursor, so this worker would come '
+        + 'back from the restart past an event it was never given: ' + JSON.stringify(flushed));
+});
+
+// --- the trimmed window ------------------------------------------------------------------------
+//
+// busBase is what keeps a cursor absolute across a trim, and trimBus REWRITES bus.jsonl to only the
+// retained events -- so indices below busBase are gone from disk too. They cannot be counted and must
+// not be offered as recoverable. Reaching that state honestly needs 5000+ events; the hub reads
+// busBase from DATA/bus.base at boot, so seeding it is the identical state for a hundredth of the cost.
+//
+// Getting a BASELINE below busBase is the part worth noticing: every other exit stamps the bus head,
+// so the idle timeout -- which now hands back the waiter's own cursor -- is the only way a session's
+// baseline can sit below the retained window. That is also exactly how a real worker gets there.
+const TRIM_BASE = 1000;
+let tHub = null;
+const pollT = (uid, cursor) => tHub.get('/poll?uid=' + uid + '&cursor=' + cursor);
+const newT = (purpose) => tHub.post('/register', { cwd: tHub.REPO, purpose });
+
+before(async () => {
+    if (SKIP) return;
+    tHub = await createScratchHub({ env: { JARVIS_POLL_HOLD_MS: '700' } });
+    writeFileSync(join(tHub.DATA, 'bus.base'), String(TRIM_BASE));
+    // Addressed to a uid no session will ever be assigned, so these seeds can never release a waiter
+    // or be counted as somebody's lost traffic.
+    writeFileSync(join(tHub.DATA, 'bus.jsonl'), [0, 1, 2].map(i => JSON.stringify({
+        from: 'jarvis', to: 's_nobody', kind: 'msg', text: 'seed ' + i, ts: '2026-07-30T00:00:00.000Z',
+    })).join('\n') + '\n');
+    await tHub.start('trimmed-bus hub');
+});
+after(() => { if (tHub) tHub.dispose(); });
+
+test('GAP: a window already TRIMMED away is still reported, and offers no index to re-read',
+    { skip: SKIP }, async () => {
+    const S = await newT('trimmed window probe');
+    const parked = await pollT(S.uid, TRIM_BASE - 10);
+    assert.equal(parked.cursor, TRIM_BASE - 10,
+        'setup: the idle timeout must hand back our own cursor, or there is no sub-busBase baseline');
+
+    const jumped = await pollT(S.uid, TRIM_BASE - 5);
+    const [gap] = gapsIn(jumped);
+    // Nothing addressed to S is countable here -- the whole window is below busBase -- so a detector
+    // that only asks "was any of MY traffic in it" goes silent on the one case where the loss is
+    // permanent. Staying quiet would be the worst possible place to stay quiet.
+    assert.ok(gap, 'a gap entirely below busBase was not reported at all: ' + JSON.stringify(jumped));
+    assert.match(gap.text, /gone for good/, 'the notice must say the indices are unrecoverable: ' + gap.text);
+    assert.doesNotMatch(gap.text, /GET \/poll\?cursor=/,
+        'nothing in this window is fetchable, so naming an index to re-read would be a lie: ' + gap.text);
+});
+
+test('GAP: `gone` counts the indices actually in the window, not the distance to busBase',
+    { skip: SKIP }, async () => {
+    // The clamp, min(gap.to, busBase). Only a window ENDING below busBase can catch a missing one:
+    // when the window straddles the boundary both spellings agree, which is why the straddle test
+    // below cannot substitute for this one.
+    const S = await newT('trim clamp probe');
+    const parked = await pollT(S.uid, TRIM_BASE - 10);            // baseline 990
+    assert.equal(parked.cursor, TRIM_BASE - 10, 'setup: baseline must be below busBase');
+    const jumped = await pollT(S.uid, TRIM_BASE - 5);             // window 990..995 -- FIVE indices
+    const [gap] = gapsIn(jumped);
+    assert.ok(gap, 'setup: the jump must be reported: ' + JSON.stringify(jumped));
+    assert.match(gap.text, new RegExp('\\b5 index\\(es\\) from ' + (TRIM_BASE - 10) + '\\b'),
+        'gone was measured to busBase (10) instead of to the end of the window (5): ' + gap.text);
+});
+
+test('GAP: a window straddling the trim boundary reports BOTH halves -- what is lost and what is not',
+    { skip: SKIP }, async () => {
+    // The realistic shape: a worker skips over the boundary, so part of what it missed is still on the
+    // bus and part is not. Both clauses have to appear, or the notice tells half the truth.
+    const S = await newT('straddle probe');
+    const P = await newT('straddle sender');
+    const parked = await pollT(S.uid, TRIM_BASE - 5);             // baseline 995
+    assert.equal(parked.cursor, TRIM_BASE - 5, 'setup: baseline must be below busBase');
+
+    const r = await tHub.post('/send', { from: P.uid, to: S.callsign, text: 'wsk straddle payload' });
+    assert.ok(r.cursor >= TRIM_BASE, 'setup: the send must land in the RETAINED part of the bus: ' + JSON.stringify(r));
+
+    const jumped = await pollT(S.uid, r.cursor + 1);              // window 995 .. past the message
+    const [gap] = gapsIn(jumped);
+    assert.ok(gap, 'the straddling jump was not reported: ' + JSON.stringify(jumped));
+    assert.match(gap.text, new RegExp('GET /poll\\?cursor=' + (TRIM_BASE - 5) + '\\b'),
+        'the recoverable half must still name an index: ' + gap.text);
+    assert.match(gap.text, new RegExp('\\b5 index\\(es\\) from ' + (TRIM_BASE - 5) + '\\b'),
+        'the trimmed half must still be counted: ' + gap.text);
+    // And the index it names really does produce the message, trimmed prefix or not.
+    const recovered = await pollT(S.uid, TRIM_BASE - 5);
+    assert.ok((recovered.events || []).some(e => e.text === 'wsk straddle payload'),
+        'the index the notice named did not return the message: ' + JSON.stringify(recovered));
 });

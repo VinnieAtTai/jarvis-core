@@ -268,6 +268,81 @@ export function handoffKey(cwd, purpose) {
     return cwdKey(cwd) + String.fromCharCode(10) + p;
 }
 
+// "on the job 4h 28m (start -> end)" for the line above. Private: it exists for that one line, and a
+// half-open or clock-skewed pair returns null rather than printing a negative duration nobody can act
+// on -- an unparseable span is a missing line, never a wrong one.
+function jobSpan(from, to) {
+    const a = Date.parse(from), z = Date.parse(to);
+    if (!Number.isFinite(a) || !Number.isFinite(z) || z < a) return null;
+    const secs = Math.round((z - a) / 1000);
+    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+    return 'on the job ' + (h ? h + 'h ' + m + 'm' : m ? m + 'm' : secs + 's')
+        + ' (' + new Date(a).toISOString() + ' -> ' + new Date(z).toISOString() + ')';
+}
+
+// THE HANDOFF A PREDECESSOR NEVER WROTE. The console's relaunch button is POST /retire
+// {successor:true} carrying a fixed summary and nothing else, so retireSession files a record whose
+// `notes` is the empty string -- and the successor's boot prompt then sends it to GET /handoff for a
+// briefing that says nothing at all. Measured 2026-07-30: tango was relaunched, and zulu inherited a
+// board card plus a WIP commit on an inherited branch with nothing anywhere pointing at either.
+//
+// Every fact needed was already on the session row and nobody was assembling it. This assembles it
+// from OBSERVED state only -- never an inference about what the work MEANT, because meaning is
+// precisely what a missing checkpoint cannot be reconstructed from, and a plausible guess would read
+// as authoritative while being invented. The single judgement it makes is the last line: on an
+// inherited branch the predecessor's commits ARE the record it failed to write, so the successor is
+// sent to that diff before anything else.
+//
+// Attached to EVERY handoff record, not only the noteless ones. A checkpoint is written mid-flight, so
+// even a diligent predecessor's notes predate the WIP commit teardownWorktree makes on the way out --
+// and that is the one fact whose absence strands work.
+//
+// `opts.wip` is teardownWorktree's verdict on the predecessor's worktree: 'committed' (it had
+// uncommitted work and it landed on the branch), 'stranded' (it would not commit, the tree was kept),
+// 'none' (clean), or absent/'unknown' (the tree was already gone, so nothing is claimed either way).
+export function reconstructHandoff(session, board, opts = {}) {
+    const s = session || {}, b = board || {}, o = opts || {};
+    const cs = s.callsign || 'the previous session';
+    const out = [];
+    // WHO WROTE THIS, stated in-band rather than left to the field name, because the reader is a MODEL:
+    // a successor that mistakes reconstructed facts for a predecessor's judgement will trust them
+    // further than they deserve, and the whole design depends on that distinction staying legible even
+    // when the block is quoted, truncated or pasted somewhere else.
+    out.push(String(s.handoff || '').trim()
+        ? 'ASSEMBLED BY THE HUB FROM OBSERVABLE FACTS -- not written by your predecessor. Read it alongside the notes it did leave. Every line here was observed as it retired, so this half is current even where a mid-flight checkpoint has gone stale.'
+        : 'ASSEMBLED BY THE HUB FROM OBSERVABLE FACTS -- not written by your predecessor, which left NO notes at all. Treat it as evidence rather than a briefing: it says what the hub could see, never what the work MEANT.');
+    const span = jobSpan(s.started, s.ended);
+    out.push('predecessor: ' + cs + (o.uid ? ' (' + o.uid + ')' : '') + (span ? ', ' + span : ''));
+    if (s.purpose) out.push('its purpose: ' + s.purpose);
+    // The `doing` line off POST /health. Its ABSENCE earns a line of its own: it means no self-report
+    // exists anywhere, so a successor does not go hunting for one that was never written.
+    const doing = String(s.doing || '').trim();
+    const ctx = Number.isFinite(Number(s.ctx)) ? Math.round(Number(s.ctx)) : null;
+    out.push(doing
+        ? 'last said it was doing: "' + doing + '"' + (ctx === null ? '' : ' (its own context was ' + ctx + ' percent full)')
+        : 'it never posted a doing line, so no self-report of its state exists anywhere -- do not go hunting for one.');
+    // ISOLATION, and this is the line whose absence stranded tango's WIP commit. The successor
+    // continues the same branch; until something says so it has no reason to go and look at it.
+    if (s.branch) {
+        out.push('branch: ' + s.branch + (s.base ? ' (forked from ' + s.base + ')' : '')
+            + ' -- you continue ON IT in a fresh worktree, so its commits are already beneath you.');
+        if (o.wip === 'committed') out.push('in-flight work: it had UNCOMMITTED changes at retire and they were committed to ' + s.branch + ' as a WIP commit. That commit is work nobody has described.');
+        else if (o.wip === 'stranded') out.push('in-flight work: it had uncommitted changes that would NOT commit, so its worktree was KEPT at ' + (s.worktree || 'its old path') + ' as evidence. Go and look before you redo anything.');
+        else if (o.wip === 'none') out.push('in-flight work: none -- its worktree was clean at retire, so everything it did is already in commits.');
+        // NEVER SILENT on this line. An omission here reads as "there was no in-flight work", when what
+        // actually happened is that the worktree was already gone before the hub could look -- and the
+        // successor acts on the difference. Say which of the two it is, positively, every time.
+        else out.push('in-flight work: UNKNOWN -- its worktree was already gone when the hub went to check, so nobody looked. That is not the same as there having been none.');
+    }
+    const n = lane => (Array.isArray(b[lane]) ? b[lane].length : 0);
+    out.push('board carried over: ' + n('working') + ' working + ' + n('queued') + ' queued'
+        + (n('review') || n('done') ? ' (and ' + n('review') + ' in review, ' + n('done') + ' done)' : ''));
+    out.push(s.branch
+        ? 'FIRST MOVE: git log --oneline ' + (s.base || 'main') + '..' + s.branch + ' -- on an inherited branch that diff IS the handoff it did not write. Read it before you touch anything.'
+        : 'FIRST MOVE: git log --oneline -20 and git status in ' + (s.cwd || 'the working directory') + ' -- it shared this checkout, so recent commits there may be its work.');
+    return out.join('\n');
+}
+
 // The auto-successor rule for POST /retire: spawn a successor when work remains, but let an
 // explicit request override either way. `requested` is the body's `successor` field (may be
 // undefined); `hasWork` is whether the retiring board still has working+queued tasks.
@@ -1591,6 +1666,31 @@ function batonSentence(repo, L, now) {
 // the bug being fixed. It stays under the 2-minute gone-quiet threshold, so a spawn that never boots
 // is noticed at least as fast as one that boots and then goes silent.
 export const SPAWN_REGISTER_TIMEOUT_MS = 90000;
+
+// The dispatch stamped on a pending spawn: WHO asked for this worker, and WHICH PROJECT it was being
+// nested under. Both are needed because notifyDeadSpawnDispatcher prefers the asker and falls back to
+// the project's live coordinator -- see the ordering argument written out there.
+//
+// THIS EXISTS TO BE ONE SITE. It was inline at both watchSpawn calls in spawnWorker (the console-less
+// branch and the wt-new-tab branch), spelled identically, and that duplication was invisible to
+// probing: a mutation needle that included the log-path argument matched the console-less call ONLY, so
+// it passed the harness's one-hit guard and read as rigorous while the second branch had never been
+// touched by any needle at all. A needle that is unique only by accident leaves its twin unprobed. The
+// wt-new-tab branch shells out to wt.exe and is unreachable from a test, so collapsing the two callers
+// onto one expression is the only pin available -- and the source guard in test/deadspawn.test.mjs
+// asserts the collapse holds, which is what catches a THIRD site being added later.
+//
+// It takes subOf/boundTo ALREADY NORMALIZED rather than raw project/parentProject, deliberately:
+// spawnWorker derives those two for pendingBind, the boot text and hostMeta as well, and recomputing
+// them here would be a second source of truth for the same decision. All this owns is the choice
+// between them.
+export function spawnDispatch(spawnedBy, subOf, boundTo) {
+    // subOf wins, and in practice it cannot compete: spawnWorker sets subOf only when there is no
+    // project, so a worker is a sub-worker OR a coordinator and never both. The order is still written
+    // this way round on purpose -- if the two ever did arrive together, the nesting is the relationship
+    // a dead spawn should be reported against, because that is the coordinator who is waiting on it.
+    return { spawnedBy: spawnedBy || null, forProject: subOf || boundTo || null };
+}
 
 // Which pending spawns are overdue: launched more than `timeoutMs` ago with no session to show for
 // it. `pending` is the hub's spawned-but-not-registered stash ({cs, cwd, at} entries, `at` in ms),
