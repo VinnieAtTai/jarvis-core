@@ -31,10 +31,12 @@ const registered = (hub, cs) => hub.waitFor(cs + ' to register', async () => {
 test('SCHEDULE NUDGE: the first brain of the day is asked to pull the calendar, and only the first',
     { skip: SKIP, timeout: 300000 }, async (t) => {
         assertConsolelessPossible();
-        const hub = await createScratchHub({ graceMs: 5000 });
+        // staleSchedule: the rig seeds a schedule dated today for everyone else, precisely so this
+        // nudge cannot reach a test that is not about it. This test IS about it, so it opts out.
+        const hub = await createScratchHub({ graceMs: 5000, staleSchedule: true });
         t.after(() => hub.dispose());
         await hub.start('nudge hub');
-        assert.equal(existsSync(join(hub.DATA, 'schedule.json')), false, 'a scratch hub should start with no schedule at all');
+        assert.equal(existsSync(join(hub.DATA, 'schedule.json')), false, 'this rig opted out of the schedule seed, so it must start with no schedule at all');
 
         // ---- 1. the ask fires at register, on the bus and in the log ------------------------------
         // cwd is REPO_ROOT, not the rig's default scratch repo, and that is the point rather than a
