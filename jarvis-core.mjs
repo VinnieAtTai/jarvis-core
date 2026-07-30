@@ -4286,6 +4286,50 @@ async function handleRequest(req, res) {
         const b = await readBody(req);
         const cs = String(b.callsign || '').toLowerCase();
         if (!cs || cs === 'jarvis') return json(res, 400, { error: 'bad callsign' });
+        // THE GUARD RUNS BEFORE ANYTHING ELSE, and the ordering is the whole point. This handler
+        // retires the session and THEN deletes its board, so a check bolted on after the retire would
+        // kill the session and only then refuse -- strictly worse than the bug it was meant to fix.
+        //
+        // What it prevents: /forget deletes a whole board unconditionally, with no undo, and the
+        // console reaches it from a bare one-click X. Measured on the live board the day this went in,
+        // primeng held 500 cards and jarvis 231. The original card said 469, so the exposure had grown
+        // while the card sat in the queue.
+        //
+        // Why the guard is HERE and not only on the button: the console is the only caller today, but
+        // this project has already tried warning people off /forget -- three prose warnings in source,
+        // a hazard note in docs/PROJECT-THREADS.md, and two tests whose entire job is to assert the UI
+        // warns against it -- and the hazard stayed open the whole time. Documentation is not a guard,
+        // and /forget is a plain POST any worker or script can reach without going near the console.
+        //
+        // done/review are deliberately NOT counted. They are a record of finished work, so losing them
+        // is bad but recoverable from the transcript; working/queued is work in flight that nothing
+        // else remembers. Guarding on everything would make the refusal fire on boards nobody minds
+        // clearing, and a guard that cries wolf gets forced past by reflex.
+        //
+        // WHAT A LEGITIMATE force LOOKS LIKE, because a guard with an escape hatch is only as good as
+        // the discipline around the hatch. It is for a board whose work is genuinely dead: a session
+        // that never really started, a duplicate card minted by a mis-bound register, cards left by a
+        // job that has since been re-carded somewhere else. In every one of those the operator can say
+        // where the work WENT. If the honest answer is "I do not know what is on this board", that is
+        // the case the 409 exists for -- read the board, then hand it on with /retire {successor:true}
+        // or park it with /hold. force is for destroying work you have already accounted for, never
+        // for getting a refusal out of the way; the refusal body names the alternatives precisely so
+        // that reaching for force is a decision rather than the path of least resistance.
+        const w0 = loadWork();
+        const b0 = w0.sessions[cs];
+        const inFlight = b0 ? (b0.working || []).length + (b0.queued || []).length : 0;
+        if (inFlight > 0 && !b.force) {
+            const total = b0 ? ['working', 'queued', 'review', 'done'].reduce((n, l) => n + (b0[l] || []).length, 0) : 0;
+            return json(res, 409, {
+                error: 'board has work in flight',
+                callsign: cs,
+                working: (b0.working || []).length,
+                queued: (b0.queued || []).length,
+                total: total,
+                hint: 'POST /retire {uid,successor:true} hands the board to a fresh session; POST /hold parks it; '
+                    + 'repeat this call with force:true to destroy ' + total + ' card(s) deliberately.',
+            });
+        }
         const uid = liveUidOf(cs);
         if (uid) retireSession(uid, String(b.summary || '').trim() || 'Closed from console.');
         const w = loadWork();
@@ -4298,8 +4342,15 @@ async function handleRequest(req, res) {
             w.focus = nextFocusKey(liveBoardCandidates(), cs);
         }
         saveWork(w);
-        record({ kind: 'sys', text: 'removed ' + cs + ' from board' });
-        return json(res, 200, { ok: true });
+        // Name the cost when a forced call actually destroyed work in flight. A silent "removed X from
+        // board" is what made this hazard so hard to notice after the fact -- the sys line read the
+        // same whether the board was empty or held five hundred cards.
+        record({
+            kind: 'sys',
+            text: 'removed ' + cs + ' from board'
+                + (inFlight > 0 ? ' (FORCED - destroyed ' + inFlight + ' card(s) in flight)' : ''),
+        });
+        return json(res, 200, { ok: true, destroyed: inFlight });
     }
     if (key === 'POST /worklist') {
         const b = await readBody(req);

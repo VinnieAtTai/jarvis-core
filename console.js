@@ -1417,7 +1417,36 @@ workEl.onclick = (e) => {
     if (op) { post('/worklist', { op, callsign: t.getAttribute('data-cs'), text: t.getAttribute('data-t') }); return; }
     const act = t.getAttribute('data-act');
     if (act === 'focus') post('/focus', { callsign: t.getAttribute('data-cs') });
-    else if (act === 'close') post('/forget', { callsign: t.getAttribute('data-cs') });
+    // The X used to POST /forget straight out, which retires with no successor and then deletes the
+    // whole board -- 500 cards on primeng the day this was written, no undo, one click, no prompt.
+    // The endpoint now refuses a board with work in flight, so this is the second line of defence and
+    // its job is to make the choice an informed one rather than to be the only thing standing there.
+    //
+    // Two different cases wear the same X. A LIVE session's work can be handed on, so offer that
+    // instead of destroying it -- retire with successor:true is the whole point of the successor
+    // mechanism. A DEAD card has no uid to retire and spawning a successor for something the operator
+    // is tidying away would be a surprise, so that one asks for explicit consent and names the cost.
+    // An empty board still closes in one click, because that is the case the button was built for and
+    // a prompt there would just teach people to click through prompts.
+    else if (act === 'close') {
+        const ccs = t.getAttribute('data-cs');
+        const card = ((lastBoard && lastBoard.boards) || []).find(x => x.callsign === ccs) || {};
+        const flight = (card.working || []).length + (card.queued || []).length;
+        const total = ['working', 'queued', 'review', 'done'].reduce((n, l) => n + (card[l] || []).length, 0);
+        if (!flight) { post('/forget', { callsign: ccs }); return; }
+        if (card.alive !== false && card.uid) {
+            uiConfirm(ccs.toUpperCase() + ' has ' + flight + ' card(s) still in flight.\n\n'
+                + 'Hand the board to a fresh session instead of deleting it? The successor inherits all '
+                + total + ' card(s) and picks up where this one left off.',
+                { ok: 'Hand off', cancel: 'Leave it' })
+                .then(okd => { if (okd) post('/retire', { uid: card.uid, successor: true, summary: 'Closed from console -- board handed to a successor.' }); });
+            return;
+        }
+        uiConfirm('Delete ' + ccs.toUpperCase() + "'s board?\n\n" + total + ' card(s) go permanently, '
+            + flight + ' of them still working or queued. There is no undo.',
+            { ok: 'Delete ' + total + ' cards', cancel: 'Keep it', danger: true })
+            .then(okd => { if (okd) post('/forget', { callsign: ccs, force: true }); });
+    }
     else if (act === 'continue') post('/spawn', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose'), project: t.getAttribute('data-project') || undefined });
     else if (act === 'spawnjarvis') post('/spawn', { cwd: 'd:/claude/jarvis-core', purpose: 'JARVIS punchlist', project: 'jarvis' });
     else if (act === 'rebuild') { uiConfirm('Rebuild JARVIS now? Restarts the hub with the latest jarvis-core code. Live sessions ride it out. Heads-up: this resets the in-memory token gauge.', { ok: 'Rebuild', danger: true }).then(ok => { if (ok) post('/restart', {}); }); }
