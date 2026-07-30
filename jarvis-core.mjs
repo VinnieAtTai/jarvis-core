@@ -12,7 +12,7 @@ import { fetchRealUsage } from './usage.mjs';
 import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
 import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap, isBatonQuestion, speakBaton } from './jarvis-text.mjs';
 import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote } from './jarvis-text.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, cursorGap, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, wedgeGraceMs, wedgeEscalateDue, cursorGap, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // What code is actually RUNNING, resolved once at load and stated out loud.
@@ -1171,10 +1171,103 @@ function pendingFor(uid) {
 }
 // Is this session green-but-deaf? Wraps the pure detector with the two things it cannot know:
 // which session we mean, and what is queued behind it.
+// How many permission prompts this session is currently blocked on. A worker waiting on one cannot
+// act on ANYTHING queued behind it until the human answers -- which is the difference between an
+// inference and a certainty, and so the one signal that can honestly report in seconds.
+function permsFor(uid) {
+    let n = 0;
+    for (const p of pendingPerms.values()) if (p.uid === uid) n++;
+    return n;
+}
 function wedgedNow(uid) {
     const s = roster.sessions[uid];
-    return s ? wedgeState(s, Date.now(), { pending: pendingFor(uid) }) : null;
+    if (!s) return null;
+    const pending = pendingFor(uid);
+    // Role is decided HERE and passed in, never read from inside the pure detector. A bound
+    // coordinator is the session carrying .project (a session is one role or the other, never both).
+    return wedgeState(s, Date.now(), {
+        pending,
+        pendingPerms: permsFor(uid),
+        graceMs: wedgeGraceMs({ coordinator: !!s.project, pending, pollHoldMs: POLL_HOLD_MS }),
+    });
 }
+// The escalation ledger for wedge announcements, keyed by UID. Deliberately NOT nagAt: that map is
+// shared with the gone-quiet nag on one flat 5-minute throttle and keyed by CALLSIGN, so a
+// gone-quiet line silently ate the next wedge line for the same session. Keying on uid also stops
+// the same outage being announced twice under two names, since a bound coordinator is reached both
+// as its NATO callsign and as its project.
+const wedgeNag = Object.create(null);
+// Who IS reachable right now, so being told a coordinator is deaf does not leave the human with
+// nowhere to go. Filters the focus candidates by the wedge detector as well as by liveness --
+// offering a session that is itself deaf would just relocate the outage. On the night this was
+// written two idle workers were reachable for sixteen minutes and nobody said so.
+function listeningNow(exceptKey) {
+    const cands = liveBoardCandidates().filter(c => {
+        if ((c.project || c.callsign) === exceptKey) return false;
+        return !wedgedNow(liveUidOf(c.callsign));
+    });
+    if (!cands.length) return null;
+    const key = nextFocusKey(cands, exceptKey);
+    return key && key !== 'jarvis' ? key : null;
+}
+function deafFor(w) {
+    // Sub-minute outages are real now (a permission block is flagged with no grace at all), and
+    // flooring those to minutes is what would say "0 minutes" out loud.
+    if (w.seconds < 90) return w.seconds + ' second' + (w.seconds === 1 ? '' : 's');
+    return w.minutes + ' minute' + (w.minutes === 1 ? '' : 's');
+}
+// Say that a session is not hearing the human, and keep saying it on a widening schedule for as
+// long as it stays true. Returns the wedge report when it announced, else null.
+//
+// Four things the human needed and used to have to ask for: WHO is deaf, WHY (a permission prompt
+// it cannot answer, or a poll loop that stopped), what is stacked up behind it, and WHAT THE LEVER
+// IS. The lever is POST /retire successor:true, which transfers the entire board to a fresh session
+// and moves focus. It is never /forget: that handler calls retireSession with NO opts, so
+// shouldSpawnSuccessor never runs, and it then deletes the board outright -- pressed on a
+// coordinator to "clear" it, it destroys every card the project had.
+function announceWedge(uid) {
+    const s = roster.sessions[uid];
+    if (!s) return null;
+    const wedge = wedgedNow(uid);
+    if (!wedge) { delete wedgeNag[uid]; return null; }
+    const now = Date.now();
+    if (!wedgeEscalateDue(wedgeNag[uid], now)) return null;
+    wedgeNag[uid] = { count: (wedgeNag[uid] ? wedgeNag[uid].count : 0) + 1, lastAt: now };
+    // What the human calls it: the project column for a bound coordinator, else its callsign.
+    const who = s.project || s.callsign;
+    const queued = wedge.pending + ' message' + (wedge.pending === 1 ? '' : 's');
+    const why = wedge.reason === 'perm'
+        ? 'It is stuck on a permission prompt with ' + queued + ' queued.'
+        : 'No inbox read in ' + deafFor(wedge) + ', with ' + queued + ' queued.';
+    const other = listeningNow(who);
+    enqueueSay(who + ' is not hearing you. ' + why + (other ? ' ' + other + ' is listening.' : '')
+        + ' Details in chat.', 'jarvis');
+    record({
+        kind: 'chat', from: 'jarvis',
+        text: '**' + who + ' is not reading its inbox.** ' + why
+            + '\n\n- **Hand the board over:** POST /retire {"uid":"' + uid + '","successor":true} -- a successor'
+            + ' inherits the full board and focus moves to it. Never /forget: that one deletes the board.'
+            + (wedge.reason === 'perm' ? '\n- **Or just approve it:** the prompt is on its card; it can hear again the moment you do.' : '')
+            + (other ? '\n- **Reachable right now:** ' + other : ''),
+    });
+    return wedge;
+}
+// Escalate a deaf COORDINATOR even when the human stops talking to it. The announce used to hang
+// entirely off routeTo, so it could only fire while he was still speaking into the void -- the
+// moment he gave up and asked someone else, the hub went quiet about the outage too. Its own
+// interval on purpose: a wedge sweep sharing a cadence with something else is how thresholds
+// become accidental. Coordinators only, and only with traffic queued -- that is the outage that
+// was reported, and a narrow net that never cries wolf is worth more than a broad one that does.
+const WEDGE_SWEEP_MS = Number(process.env.JARVIS_WEDGE_SWEEP_MS) > 0 ? Number(process.env.JARVIS_WEDGE_SWEEP_MS) : 15000;
+function sweepWedged() {
+    for (const cs of liveCallsigns()) {
+        const uid = liveUidOf(cs);
+        const s = uid ? roster.sessions[uid] : null;
+        if (!s || !s.project || !aliveNow(uid)) continue;
+        announceWedge(uid);
+    }
+}
+setInterval(() => { try { sweepWedged(); } catch (e) { logCrash('wedge-sweep-failed', e); } }, WEDGE_SWEEP_MS).unref();
 function registerSession(cwd, purpose, pin, project, parentProject) {
     const cs = assignCallsign(pin);
     pendingPins.delete(cs);
@@ -1514,16 +1607,18 @@ function routeTo(cs, msg) {
     } else {
         // Alive by lastSeen, but is anyone actually LISTENING? A wedged session accepts the message
         // into its queue and never reads it, which reads as being ignored -- the human keeps talking
-        // to a corpse with no idea anything is wrong. Say it out loud, on the same 5-min nag throttle
-        // as gone-quiet, because this is the moment it matters: they just spoke.
-        const wedge = wedgedNow(uid);
-        if (wedge && Date.now() - (nagAt[cs] || 0) > 300000) {
-            nagAt[cs] = Date.now();
-            enqueueSay(cs + ' looks wedged. Its heartbeat is fine but it has not checked its inbox in '
-                + wedge.minutes + ' minute' + (wedge.minutes === 1 ? '' : 's') + ', so it may not hear that. Restart it from the console if it stays quiet.', 'jarvis');
-        } else if (!wedge) {
-            delete nagAt[cs];
-        }
+        // to a corpse with no idea anything is wrong. This is the moment it matters most: they just
+        // spoke. The escalation schedule lives in announceWedge, which the sweep shares, so a
+        // coordinator that goes deaf and is never spoken to again still gets chased.
+        //
+        // Clearing nagAt is NOT incidental tidying: it is the reset the old wedge branch did here and
+        // that moving the wedge nag onto its own uid-keyed ledger would otherwise have dropped. nagAt
+        // now serves ONLY the gone-quiet line above, and this session is demonstrably not gone quiet,
+        // so its throttle has to end here -- otherwise a session that goes quiet, recovers, and goes
+        // quiet again inside five minutes is silently un-nagged the second time. That is the same
+        // one-throttle-two-conditions bug the wedgeNag split was introduced to fix, mirrored.
+        delete nagAt[cs];
+        announceWedge(uid);
     }
     return true;
 }
@@ -1546,6 +1641,13 @@ function routeToMission(missionId, text) {
             roster.sessions[uid].needsYou = false;
             saveRoster();
         }
+        // The wedge check routeTo's direct branch has always had, and this one never did. Every
+        // mission-bound coordinator's traffic arrives HERE -- liveUidOf() reads the NATO callsign map,
+        // so a project name is always falsy there and a project with a missionId is handed straight to
+        // this function. The result was that the warning could not fire for the only project driving a
+        // mission, which is the exact outage it was built for: the human talked to a deaf coordinator
+        // for sixteen minutes and no grace value would have changed that, because nothing asked.
+        announceWedge(uid);
         return true;
     }
     // No LIVE coordinator: either none is bound, or the only match is a dead/ghost session whose
