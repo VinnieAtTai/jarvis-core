@@ -759,13 +759,30 @@ function watchIndicator(b) {
 // outage — which is exactly how the PrimeNG coordinator sat wedged for 12 minutes. The tooltip
 // carries the two numbers that decide what to do: how long it has been deaf, and whether anything
 // is stacked up behind it (queued messages = act now; nothing queued = just note it).
+//
+// Two shapes now, because a wedge has two causes and they want different words. `deaf` is the poll
+// loop having stopped, which is an INFERENCE from age and so carries a duration. `perm` is a pending
+// permission prompt, which is a CERTAINTY -- the session cannot act on anything queued until the
+// human answers -- so it is flagged with no grace window at all and a duration would be beside the
+// point. Both tooltips name the lever, because the remedy existed all night and nobody was told it.
 function wedgeIndicator(b) {
     if (!b.wedged) return '';
-    const m = b.wedged.minutes, p = b.wedged.pending;
-    const tip = 'possibly WEDGED: heartbeat is alive but no poll in ' + m + ' min'
-        + (p ? ' -- ' + p + ' event' + (p === 1 ? '' : 's') + ' queued and unread' : ' -- nothing queued')
-        + '. If it stays deaf, restart it from the console.';
-    return ' <span class="wedgechip' + (p ? ' hot' : '') + '" title="' + escAttr(tip) + '">DEAF ' + m + 'm</span>';
+    const w = b.wedged, p = w.pending;
+    const queued = p ? ' -- ' + p + ' event' + (p === 1 ? '' : 's') + ' queued and unread' : '';
+    // Sub-minute outages are real now, and Math.floor of those is 0: without the seconds field this
+    // renders a 45-second block as "DEAF 0m". Tolerate its absence so an older /board cannot break
+    // the chip -- the console and the hub are deployed separately and reload on their own schedules.
+    const howLong = Number.isFinite(w.seconds) && w.seconds < 90 ? w.seconds + 's' : w.minutes + 'm';
+    const lever = '. Hand the board over with POST /retire successor:true (a successor inherits every'
+        + ' card); never /forget, which deletes the board.';
+    if (w.reason === 'perm') {
+        const tip = 'BLOCKED: waiting on a permission approval it cannot answer' + (queued || ' -- nothing queued')
+            + '. Approve it on this card and it hears you again immediately' + lever;
+        return ' <span class="wedgechip' + (p ? ' hot' : '') + '" title="' + escAttr(tip) + '">NEEDS OK</span>';
+    }
+    const tip = 'possibly WEDGED: heartbeat is alive but no poll in ' + howLong
+        + (queued || ' -- nothing queued') + '. If it stays deaf' + lever;
+    return ' <span class="wedgechip' + (p ? ' hot' : '') + '" title="' + escAttr(tip) + '">DEAF ' + howLong + '</span>';
 }
 // Which mission a board card belongs to, or null.
 //
