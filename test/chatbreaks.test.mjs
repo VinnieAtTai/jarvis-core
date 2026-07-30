@@ -135,3 +135,76 @@ test('console.js -- chatBubble routes through bubbleText, and joins nowhere else
         'chatBubble still has a raw g.texts.join -- that path skips the per-message repair');
     assert.equal((body.match(/_md/g) || []).length, 4, 'expected _md defined once and used by render + both copy buttons');
 });
+
+// ---- The path hazard ----------------------------------------------------------------------------
+// The BROKEN fixture above carries a real Windows path and has always survived the repair -- but by
+// LUCK OF SPELLING, not by design: its sequences are backslash-c, backslash-dot and backslash-o, and
+// the rewrite only ever touched backslash-n and backslash-t. Point it at a path that does hit them
+// and the old code destroyed it. Measured on the live board 2026-07-30: of 2321 strings, one already
+// carried a backslash-t (a TMS path), so the corrupting input is present, not hypothetical.
+//
+// The shape that gets hurt is a SHORT ONE-LINE message naming a path, because the guard bails as soon
+// as a message has real line breaks. That is exactly the shape workers were asked to send, so the
+// exposure went UP when the house style got terser.
+const PATHS_THAT_HIT_IT = [
+    ['drive path with backslash-n', 'd:' + BS + 'node' + BS + 'x'],
+    ['drive path with backslash-t', 'd:' + BS + 'code' + BS + 'tms'],
+    ['both, worst case', 'C:' + BS + 'temp' + BS + 'new' + BS + 'thing'],
+    ['UNC share', BS + BS + 'build01' + BS + 'artifacts' + BS + 'nightly'],
+];
+
+test('fixEscapedBreaks -- a Windows path is never turned into a line break', () => {
+    for (const [label, p] of PATHS_THAT_HIT_IT) {
+        const msg = 'log is at ' + p;
+        const out = fixEscapedBreaks(msg);
+        assert.equal(realN(out), 0, label + ': a path must not produce a real newline -- got ' + JSON.stringify(out));
+        assert.ok(!out.includes('\t'), label + ': nor a real tab -- got ' + JSON.stringify(out));
+        assert.equal(out, msg, label + ': the path must come through byte-identical');
+    }
+});
+
+test('fixEscapedBreaks -- and these fixtures really would have been corrupted before', () => {
+    // Guards the guard. If a later edit made these paths harmless, the test above would still pass
+    // while proving nothing -- the same way the old fixture passed on luck of spelling.
+    // Built from BS with split/join instead of regex literals, for exactly the reason the fixtures
+    // at the top of this file are: backslash-heavy source is the thing that gets mangled in transit,
+    // and a mangled guard would go on passing while guarding nothing. This one already did once.
+    const oldBehaviour = (s) => {
+        const hadLiteral = s.includes(BS + 'n') || s.includes(BS + 't');
+        if (s.includes('\n') || !hadLiteral) return s;
+        return s.split(BS + 'n').join('\n').split(BS + 't').join('\t');
+    };
+    for (const [label, p] of PATHS_THAT_HIT_IT) {
+        const msg = 'log is at ' + p;
+        assert.notEqual(oldBehaviour(msg), msg, label + ': fixture no longer exercises the hazard');
+    }
+});
+
+test('fixEscapedBreaks -- a genuine double-escaped message is still repaired', () => {
+    // The repair must not have been bought by switching itself off. This is the whole reason the
+    // function exists, and a path-masking bug that disabled it would be a silent regression.
+    assert.equal(litN(fixEscapedBreaks(BROKEN)), 0, 'still no literal backslash-n');
+    assert.equal(realN(fixEscapedBreaks(BROKEN)), 2, 'still two real breaks');
+    assert.ok(fixEscapedBreaks(BROKEN).includes('d:' + BS + 'claude' + BS + '.jarvis-wt'),
+        'and the path inside it is still intact');
+});
+
+test('fixEscapedBreaks -- a path AND a break: the path wins, and that is deliberate', () => {
+    // "d:\temp\new.log\nit has the trace" is genuinely ambiguous -- a folder called nit is legal, so
+    // there is no way to know the break is a break. The mask is greedy and keeps the path whole,
+    // declining to repair that one break. A brick is ugly; a corrupted path is wrong, and only one
+    // of those can be undone by the person reading it. Pinned so nobody "fixes" it into corruption.
+    const msg = 'log is at d:' + BS + 'temp' + BS + 'new.log' + BS + 'nit has the stack trace';
+    const out = fixEscapedBreaks(msg);
+    assert.ok(out.includes('d:' + BS + 'temp' + BS + 'new.log'), 'the path survives whole');
+    assert.equal(realN(out), 0, 'and the ambiguous break is left alone rather than guessed at');
+});
+
+test('fixEscapedBreaks -- a break OUTSIDE a path span is still repaired when a path is present', () => {
+    // The masking must be surgical, not a blanket bail-out: one path in a message cannot be allowed
+    // to switch the repair off for the rest of it.
+    const msg = 'see d:' + BS + 'code' + BS + 'tms for the repo' + BS + 'n' + 'and the log is elsewhere';
+    const out = fixEscapedBreaks(msg);
+    assert.ok(out.includes('d:' + BS + 'code' + BS + 'tms'), 'path intact');
+    assert.equal(realN(out), 1, 'and the break that was not inside a path became real');
+});
