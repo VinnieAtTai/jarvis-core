@@ -1340,3 +1340,94 @@ export function batonReap(lane, seenAt, now, staleMs = BATON_STALE_MS) {
         revoked: L.holder, dropped, grantedTo,
     };
 }
+
+// --- spawns that die before they register ------------------------------------------------------
+//
+// A spawn is INVISIBLE until it registers. POST /spawn answers with a callsign the instant the pty
+// launches, and everything after that -- the host starting claude, claude booting, reading
+// /protocol, POSTing /register -- happens out of the hub's sight. A worker that dies inside that
+// window leaves nothing at all: no roster row (not ended, not booting -- absent), a pinned callsign
+// burned for five minutes, and no error on any channel. It is indistinguishable from a launch that
+// never happened, which is why on 2026-07-29 three TMS dispatches died on Claude Code's folder-trust
+// prompt and cost a whole session to diagnose. That specific cause is fixed; the INVISIBILITY is the
+// general defect, and it is this.
+//
+// THE TIMEOUT IS MEASURED, NOT GUESSED. 91 real spawn->register pairs in the hub transcript over a
+// 7.5-day window, across three repos including the big TMS checkout and worktree-isolated workers:
+//     min 7.3s   p50 13.5s   p90 19.3s   p95 22.0s   max 24.0s
+// The default below is ~4x that worst case, because the two errors are not symmetric. A late alarm
+// costs a few more seconds of not-knowing. A false alarm on a HEALTHY worker frees a pin and a
+// binding that are about to be used -- it turns a slow spawn into a broken one, which is worse than
+// the bug being fixed. It stays under the 2-minute gone-quiet threshold, so a spawn that never boots
+// is noticed at least as fast as one that boots and then goes silent.
+export const SPAWN_REGISTER_TIMEOUT_MS = 90000;
+
+// Which pending spawns are overdue: launched more than `timeoutMs` ago with no session to show for
+// it. `pending` is the hub's spawned-but-not-registered stash ({cs, cwd, at} entries, `at` in ms),
+// `sessions` is roster.sessions.
+//
+// THE ONLY THING THAT COUNTS AS HAVING REGISTERED is a session under this callsign that started
+// at or after the spawn. Not "a session appeared in that directory" -- the first cut of this tried
+// exactly that, to catch a worker that DROPPED its pin and came up under another name, and the
+// integration test caught it masking a genuine death within seconds: two spawns into one cwd, and
+// the healthy one explains away the dead one. That is the original bug wearing a reassuring
+// message, which is worse than the silence it replaced. The evidence says drop it: of 96 real
+// spawns in the transcript, 91 registered under their own pin and the 5 that did not were all
+// genuine deaths. Zero pin-drops observed; same-cwd spawns are routine.
+//
+// `at or after` is strict. A recycled callsign means an OLDER session can carry the same name, and
+// letting it match would mask every later death of that callsign forever.
+export function overdueSpawns(pending, sessions, now, timeoutMs = SPAWN_REGISTER_TIMEOUT_MS) {
+    const t = Number(now);
+    if (!Number.isFinite(t)) return [];
+    const rows = Object.values(sessions || {}).filter(s => s && s.callsign);
+    const out = [];
+    for (const e of (pending || [])) {
+        if (!e || !e.cs || !Number.isFinite(Number(e.at))) continue;
+        if (t - Number(e.at) < timeoutMs) continue;
+        if (rows.some(s => s.callsign === e.cs && Date.parse(s.started) >= Number(e.at))) continue;
+        out.push({ ...e });
+    }
+    return out;
+}
+
+// What a dead spawn's log says, reduced to one line worth reading. Every signature here is one that
+// has actually happened -- the folder-trust prompt (2026-07-29, three workers), cmd.exe eating an
+// angle bracket in the boot prompt as a redirection (charlie, same night), a host that could not
+// load node-pty. Returns null when the log says nothing recognizable, and the caller still names the
+// file: pointing at real evidence beats inventing a reason for it.
+//
+// Order matters. A worker stopped on a prompt and then killed shows BOTH the prompt and an exit
+// code, and the prompt is the cause while the exit is only the symptom.
+export function diagnoseSpawnLog(text) {
+    const raw = String(text == null ? '' : text);
+    if (!raw.trim()) return 'the log is empty -- claude produced no output at all';
+    // A claude log is a TUI recording: escape sequences, box borders, spinners, and hard wrapping at
+    // the pty width. Strip it back to printable ASCII on one line, because otherwise a phrase that is
+    // plainly on screen is unfindable -- the words are there but a border or a newline sits inside it.
+    const flat = raw
+        .replace(/\x1b\][^\x07\x1b]*\x07?/g, ' ')
+        .replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, ' ')
+        .replace(/[^\x20-\x7e]+/g, ' ')
+        .replace(/\s+/g, ' ');
+    if (/trust the files/i.test(flat)) return 'it stopped on Claude Code folder-trust prompt -- nobody can press Enter on a console-less worker';
+    if (/cannot find the file specified/i.test(flat)) return 'cmd.exe could not run the boot prompt -- a stray angle bracket in it is a redirection';
+    if (/node-pty unavailable/i.test(flat)) return 'the worker host could not load node-pty';
+    if (/invalid api key|please run \/login|\bnot logged in\b/i.test(flat)) return 'claude is not authenticated';
+    const ex = [...flat.matchAll(/worker exited \((-?\d+)\)/gi)].pop();
+    if (ex) return 'claude exited (code ' + ex[1] + ') before it registered';
+    return null;
+}
+
+// The sys line the human reads. One ASCII line, because it renders as a divider in the console chat
+// and lands in the searchable transcript -- it has to say what died, where, why, and what to open.
+export function deadSpawnNote(entry, reason, now) {
+    const e = entry || {};
+    const secs = Number.isFinite(Number(now)) && Number.isFinite(Number(e.at))
+        ? Math.round((Number(now) - Number(e.at)) / 1000) : null;
+    const age = secs === null ? '' : ' (' + secs + 's after launch)';
+    return e.cs + ' never registered' + age + ': spawned in ' + (e.cwd || 'an unknown directory')
+        + (e.repoKey ? ' (' + e.repoKey + ')' : '') + '. '
+        + (reason ? reason[0].toUpperCase() + reason.slice(1) : 'No reason in the log') + '.'
+        + (e.log ? ' Evidence: ' + e.log + '.' : '') + ' Callsign freed.';
+}

@@ -11,6 +11,7 @@ import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
 import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
 import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap } from './jarvis-text.mjs';
+import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote } from './jarvis-text.mjs';
 import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1126,6 +1127,7 @@ function wedgedNow(uid) {
 function registerSession(cwd, purpose, pin, project, parentProject) {
     const cs = assignCallsign(pin);
     pendingPins.delete(cs);
+    pendingSpawns.delete(cs);
     // An ISOLATED worker registers with the cwd it booted in — its worktree — which is a path no
     // configured repo matches. Left alone that quietly breaks four things that all key off cwd:
     // the trust tier and permissionMode resolved just below, the per-job handoff key, auto-bind's
@@ -2262,6 +2264,64 @@ function killWorkerHost(cs) {
     catch { return false; }
     return true;
 }
+// Spawns the hub has LAUNCHED but that have not registered yet. POST /spawn answers the instant the
+// pty starts, so from that moment until POST /register the worker is invisible: no roster row, no
+// error, nothing in the transcript past "spawned" -- and a launch that died looks exactly like one
+// that is merely slow. This stash is what makes the two distinguishable. The measurements behind the
+// window, and the reasoning about which way to be wrong, are on SPAWN_REGISTER_TIMEOUT_MS in
+// jarvis-text.mjs. The env override exists so tests can run the real path in seconds.
+const pendingSpawns = new Map();
+const SPAWN_TIMEOUT_MS = Number(process.env.JARVIS_SPAWN_TIMEOUT_MS) > 0 ? Number(process.env.JARVIS_SPAWN_TIMEOUT_MS) : SPAWN_REGISTER_TIMEOUT_MS;
+const SPAWN_SWEEP_MS = Math.min(15000, Math.max(2000, Math.round(SPAWN_TIMEOUT_MS / 6)));
+// The last few never-registered spawns, so /roster (and so the console, and any session that asks)
+// can SHOW the failure instead of everyone grepping the transcript for a gap. Deliberately in memory
+// and capped: the durable, searchable copy is the sys line, this is only the live view.
+const deadSpawns = [];
+function watchSpawn(cs, cwd, repoKey, log) {
+    pendingSpawns.set(cs, { cs, cwd: cwd || '', repoKey: repoKey || '', log: log || null, at: Date.now() });
+}
+// The tail of a worker's log, which is where the answer has actually been every time one of these
+// died. pty-host truncates this file as it starts, so whatever is in it belongs to THIS spawn.
+function readLogTail(path, maxBytes = 65536) {
+    try {
+        if (!path) return '';
+        const size = statSync(path).size;
+        if (!size) return '';
+        const len = Math.min(size, maxBytes);
+        const fd = openSync(path, 'r');
+        try {
+            const buf = Buffer.alloc(len);
+            readSync(fd, buf, 0, len, size - len);
+            return buf.toString('utf8');
+        } finally { closeSync(fd); }
+    } catch { return ''; }
+}
+// Notice the spawns that never came up, say so, and give their reservations back.
+//
+// Freeing the pin EARLY is the part that needs care. pendingPins / pendingTier / pendingBind /
+// pendingWorktree all expire on the SAME five-minute window on purpose, so that a reservation can
+// never outlive its pin and attach itself to the stranger who inherits the callsign next (the
+// argument is written out on pendingBind). Handing the name back sooner means honouring that sooner
+// too -- so all four go together here, or a dead TRUSTED spawn would lend its tier, or its project
+// binding, to whoever gets the name. The worktree is released but never torn down: it is evidence,
+// and the orphan sweep already owns collecting it.
+function sweepDeadSpawns() {
+    if (!pendingSpawns.size) return;
+    const now = Date.now();
+    for (const e of overdueSpawns(pendingSpawns.values(), roster.sessions, now, SPAWN_TIMEOUT_MS)) {
+        pendingSpawns.delete(e.cs);
+        pendingPins.delete(e.cs);
+        pendingTier.delete(e.cs);
+        takePendingBind(e.cs);
+        takePendingWorktree(e.cs);
+        const reason = diagnoseSpawnLog(readLogTail(e.log));
+        record({ kind: 'sys', text: deadSpawnNote(e, reason, now) });
+        deadSpawns.unshift({ callsign: e.cs, cwd: e.cwd, repoKey: e.repoKey, log: e.log, reason: reason || null, at: new Date(e.at).toISOString() });
+        if (deadSpawns.length > 10) deadSpawns.length = 10;
+        enqueueSay(e.cs + ' never came up. Details in chat.', 'jarvis');
+    }
+}
+setInterval(() => { try { sweepDeadSpawns(); } catch (e) { logCrash('dead-spawn-sweep-failed', e); } }, SPAWN_SWEEP_MS).unref();
 function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, parentProject, inheritBranch) {
     const cs = assignCallsign();
     pendingPins.set(cs, Date.now());
@@ -2355,6 +2415,7 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
         worktree: wt ? { path: wt.path, branch: wt.branch, base: wt.base, repoCwd: repo.cwd, repoKey: repo.key } : null,
     };
     if (CONSOLELESS && spawnWorkerConsoleless(cs, runRepo, boot, model, hookSettings, hostMeta)) {
+        watchSpawn(cs, runRepo.cwd, repo.key, join(DATA, 'worker-' + cs + '.log'));
         record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + runRepo.cwd + ' (' + repo.key + ')' + (wt ? ' [worktree ' + wt.branch + ']' : '') + ' [console-less]' });
         return cs;
     }
@@ -2379,6 +2440,7 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
             // The session will never register, so free the pinned callsign and remove the
             // leftover spawn script instead of letting both linger (phantom pin / .cmd clutter).
             pendingPins.delete(cs);
+            pendingSpawns.delete(cs);
             // ...and give back the worktree we cut for a worker that will never boot, so the next
             // spawn on this callsign gets its own name back instead of a suffix.
             const dead = takePendingWorktree(cs);
@@ -2388,6 +2450,7 @@ function spawnWorker(repo, purpose, model, handoff, tier, project, meeting, pare
         c2.unref();
     });
     child.unref();
+    watchSpawn(cs, runRepo.cwd, repo.key, null);
     record({ kind: 'sys', text: 'spawned ' + cs + ' in ' + runRepo.cwd + ' (' + repo.key + ')' + (wt ? ' [worktree ' + wt.branch + ']' : '') });
     return cs;
 }
@@ -3107,7 +3170,7 @@ async function handleRequest(req, res) {
             .sort((a, b) => Date.parse(b[1].ended) - Date.parse(a[1].ended))
             .slice(0, 20)
             .map(([uid, s]) => ({ uid, callsign: s.callsign, purpose: s.purpose, summary: s.summary || null, ended: s.ended }));
-        return json(res, 200, { focus: loadWork().focus, build: BUILD, live, retired });
+        return json(res, 200, { focus: loadWork().focus, build: BUILD, live, retired, deadSpawns });
     }
     if (key === 'GET /archive') {
         // Retired-session history from archive/*.json. ?uid=<uid> returns one full entry
