@@ -1610,6 +1610,14 @@ function routeTo(cs, msg) {
         // to a corpse with no idea anything is wrong. This is the moment it matters most: they just
         // spoke. The escalation schedule lives in announceWedge, which the sweep shares, so a
         // coordinator that goes deaf and is never spoken to again still gets chased.
+        //
+        // Clearing nagAt is NOT incidental tidying: it is the reset the old wedge branch did here and
+        // that moving the wedge nag onto its own uid-keyed ledger would otherwise have dropped. nagAt
+        // now serves ONLY the gone-quiet line above, and this session is demonstrably not gone quiet,
+        // so its throttle has to end here -- otherwise a session that goes quiet, recovers, and goes
+        // quiet again inside five minutes is silently un-nagged the second time. That is the same
+        // one-throttle-two-conditions bug the wedgeNag split was introduced to fix, mirrored.
+        delete nagAt[cs];
         announceWedge(uid);
     }
     return true;
