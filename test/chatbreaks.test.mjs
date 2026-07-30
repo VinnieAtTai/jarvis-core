@@ -208,3 +208,72 @@ test('fixEscapedBreaks -- a break OUTSIDE a path span is still repaired when a p
     assert.ok(out.includes('d:' + BS + 'code' + BS + 'tms'), 'path intact');
     assert.equal(realN(out), 1, 'and the break that was not inside a path became real');
 });
+
+// ---- The unmask out-of-range guard --------------------------------------------------------------
+// Masking parks each path span as NUL-index-NUL and puts it back on the way out. That makes the
+// sentinel a piece of SYNTAX living inside the message, so a message that already contains one
+// arrives carrying a forged index -- and held[+i] on a forged index is undefined, which
+// String.replace stringifies and splices into the chat as the literal word "undefined".
+//
+// This case is a debt, not a discovery. november mutation-probed the path-masking fix at merge time
+// and deleting the range check was its one survivor of three; it judged that a real test gap rather
+// than dead code, merged anyway (75ccf67) and handed the assertion on instead of leaving it implicit.
+// Nothing in the suite ever fed a sentinel, so the guard was live code no test had reached.
+//
+// A NUL byte is reachable, not hypothetical: JSON.parse accepts a u-plus-0000 escape inside a
+// string, so a worker's /send body carries one through the transcript into this function.
+//
+// That escape is named in prose on purpose. Typing it as itself put a LITERAL NUL byte into this
+// comment on the first attempt -- the same class of accident as the heredoc that ate this file's
+// backslashes, and invisible in every diff. Below this line every sentinel comes from
+// String.fromCharCode, never a literal, so nothing in transit can normalise one away.
+const NUL = String.fromCharCode(0);
+const sentinel = (i) => NUL + i + NUL;
+
+// The same function with ONLY the guard removed -- lifted from source and textually mutated rather
+// than reimplemented, so it cannot go on "proving" these fixtures are dangerous after the masking
+// scheme has changed underneath it. The two assertions are what stop the mutation from quietly
+// becoming a no-op, which is the failure mode that makes a fixture-validity check worthless.
+const GUARD = '+i < held.length ? held[+i] : m';
+const unguardedFix = (() => {
+    const body = lift('fixEscapedBreaks');
+    assert.equal(body.split(GUARD).length - 1, 1,
+        'console.js no longer spells the unmask guard exactly once as ' + JSON.stringify(GUARD) + ' -- update this test');
+    const mutated = body.replace(GUARD, 'held[+i]');
+    assert.notEqual(mutated, body, 'the guard removal did nothing -- this check would prove nothing');
+    return new Function(mutated + '\nreturn fixEscapedBreaks;')();
+})();
+
+const FORGED = [
+    // held is EMPTY here -- no path span to mask -- so index 0 is already out of range.
+    ['no path, forged index 0', sentinel(0),
+        'status ' + sentinel(0) + ' and the log moved' + BS + 'n' + 'to the new host'],
+    // A path IS present here, so the mask spends index 0 on it and held.length is 1 while the forged
+    // index is 7. That is why the guard has to be a RANGE check: rewritten as `held.length ? ... : m`
+    // it satisfies the first row and corrupts this one, so one fixture would not have been enough.
+    ['one path held, forged index 7', sentinel(7),
+        'see d:' + BS + 'code' + BS + 'tms and ' + sentinel(7) + ' then' + BS + 'n' + 'the trace'],
+];
+
+test('fixEscapedBreaks -- a forged mask sentinel is left alone, never resolved', () => {
+    for (const [label, tok, msg] of FORGED) {
+        const out = fixEscapedBreaks(msg);
+        assert.ok(!out.includes('undefined'),
+            label + ': the forged index resolved -- ' + JSON.stringify(out));
+        assert.ok(out.includes(tok),
+            label + ': the sentinel must come through verbatim -- ' + JSON.stringify(out));
+        assert.equal(realN(out), 1, label + ': and the genuine break beside it is still repaired');
+    }
+    assert.ok(fixEscapedBreaks(FORGED[1][2]).includes('d:' + BS + 'code' + BS + 'tms'),
+        'a real path must still round-trip through the mask alongside a forged sentinel');
+});
+
+test('fixEscapedBreaks -- and without the guard these fixtures really are corrupted', () => {
+    // Guards the guard, the way the oldBehaviour test above does for the path fixtures. If a later
+    // edit made a forged sentinel harmless, the test above would keep passing while reaching nothing
+    // -- which is exactly the state this section was written to end.
+    for (const [label, , msg] of FORGED) {
+        assert.match(unguardedFix(msg), /undefined/,
+            label + ': fixture no longer reaches the guard, so the test above proves nothing');
+    }
+});
