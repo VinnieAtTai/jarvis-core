@@ -1,0 +1,137 @@
+// Unit tests for bubbleText -- the repair of double-escaped line breaks in a chat bubble.
+//
+// THE BUG, photographed by Chris 2026-07-30 13:35 ("BRICK OF TEXT USE RICH TEXT MAKE NOT SO THIS").
+// A worker that double-escapes its JSON body sends the two characters backslash+n instead of a real
+// newline. fixEscapedBreaks has repaired that since 42fff0f, and it was in the deployed build. It
+// still shipped a brick, because of WHERE it was applied: chatBubble rendered
+//
+//     richText(g.texts.join('\n'))
+//
+// and g.texts is a GROUP -- consecutive messages from one sender in a single bubble. The join
+// supplies a real newline, and fixEscapedBreaks' guard reads a real newline as "this text already
+// has genuine breaks, leave its backslash-n alone" (deliberately, so a regex or code sample is not
+// mangled). So the repair switched itself off for exactly the messages that had a neighbour.
+//
+// That is why only 2 of 14 of oscar's messages broke, and it is why this was so easy to misread as a
+// stale browser: the SAME string rendered correctly when it happened to arrive alone.
+//
+// The lesson worth keeping: the guard was never wrong and the call path was never wrong. It was
+// applied at the wrong LAYER -- to a concatenation, by a function that only ever reasoned about one
+// message. A per-message guard cannot survive being handed a join.
+//
+// FIXTURES ARE CAPTURED, NOT INVENTED. The strings below are excerpts of the real transcript entry
+// (ts 2026-07-30T13:34:55.559Z: 1806 chars, 0 real newlines, 10 literal backslash-n) including its
+// real Windows path, because a fixture that shares an assumption with the code only proves the two
+// agree -- diagnoseSpawnLog was pinned for weeks against wording that no real log ever contained.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+
+const src = readFileSync(new URL('../console.js', import.meta.url), 'utf8');
+function lift(name) {
+    const start = src.indexOf('function ' + name + '(');
+    assert.notEqual(start, -1, 'console.js no longer defines ' + name + ' -- update this test');
+    let i = src.indexOf('{', start), depth = 0;
+    for (let n = i; n < src.length; n++) {
+        if (src[n] === '{') depth++;
+        else if (src[n] === '}' && --depth === 0) return src.slice(start, n + 1);
+    }
+    throw new Error('unbalanced braces reading ' + name);
+}
+const bubbleText = new Function(
+    lift('fixEscapedBreaks') + '\n' + lift('bubbleText') + '\nreturn bubbleText;')();
+const fixEscapedBreaks = new Function(lift('fixEscapedBreaks') + '\nreturn fixEscapedBreaks;')();
+
+const BS = String.fromCharCode(92);
+// Verbatim opening of the real broken message. Written by escape rather than as a literal so no
+// editor, shell or line-ending pass can quietly "helpfully" collapse the backslash-n into a newline
+// and turn this fixture into one that proves nothing.
+const BROKEN = '**The probe found a better bug than the one it was looking for.**'
+    + BS + 'n' + BS + 'n'
+    + 'Not a guess - the hub logged it: worktree remove FAILED for a dead session at '
+    + 'd:' + BS + 'claude' + BS + '.jarvis-wt' + BS + 'oscar-verify; branch HEAD kept.';
+const NEIGHBOUR = 'Re-ran it somewhere the sweep cannot reach.';
+const litN = (s) => s.split(BS + 'n').length - 1;
+const realN = (s) => s.split('\n').length - 1;
+
+test('the captured fixture is genuinely double-escaped, or every test below is vacuous', () => {
+    // The baseline check. If this fixture ever stops carrying literal backslash-n, the assertions
+    // that follow would all pass against a string with nothing to repair.
+    assert.equal(realN(BROKEN), 0, 'fixture must have NO real newlines');
+    assert.equal(litN(BROKEN), 2, 'fixture must carry literal backslash-n');
+    assert.ok(BROKEN.includes('d:' + BS + 'claude'), 'fixture must keep its real Windows path');
+});
+
+test('bubbleText -- a lone message is repaired (this always worked)', () => {
+    const out = bubbleText([BROKEN]);
+    assert.equal(litN(out), 0, 'no literal backslash-n survives');
+    assert.equal(realN(out), 2, 'and they became real breaks');
+});
+
+test('bubbleText -- THE BUG: a message with a neighbour is repaired too', () => {
+    // Before the fix this returned the group untouched: the join put a real newline in front of the
+    // guard, so it bailed and Chris got a brick. Both orders, because grouping is not ordered.
+    for (const group of [[BROKEN, NEIGHBOUR], [NEIGHBOUR, BROKEN]]) {
+        const out = bubbleText(group);
+        assert.equal(litN(out), 0, 'literal backslash-n survived in group ' + JSON.stringify(group.map(s => s.slice(0, 24))));
+        assert.ok(out.includes(NEIGHBOUR), 'the neighbour is still in the bubble');
+    }
+});
+
+test('bubbleText -- a whole bubble of broken messages is repaired, not just the first', () => {
+    // A map() that only fixed [0], or a loop that broke early, would pass the two-message test.
+    const out = bubbleText([BROKEN, BROKEN, BROKEN]);
+    assert.equal(litN(out), 0, out.slice(0, 120));
+    assert.equal(realN(out), 8, '2 breaks per message + 2 joins');
+});
+
+test('bubbleText -- messages are still SEPARATED by a newline', () => {
+    // The join is load-bearing: drop it and two messages run together into one line. Plain messages
+    // with nothing to repair must come through as distinct lines.
+    const out = bubbleText(['first line', 'second line']);
+    assert.equal(out, 'first line\nsecond line');
+});
+
+test('bubbleText -- real content backslashes are NOT touched', () => {
+    // The Windows path in the captured message is why this matters: backslash-c, backslash-dot and
+    // backslash-o must arrive intact or the repair has corrupted what it was meant to rescue.
+    const out = bubbleText([BROKEN]);
+    assert.ok(out.includes('d:' + BS + 'claude' + BS + '.jarvis-wt' + BS + 'oscar-verify'),
+        'the Windows path was mangled: ' + out.slice(-90));
+});
+
+test('bubbleText -- a message with GENUINE line breaks keeps its backslash-n as content', () => {
+    // The original guard's whole purpose, and it must survive per-message. A message that already
+    // has real breaks is far more likely to carry a backslash-n as content (a regex, a code sample)
+    // than as a mistake -- so it is left alone even when it sits in a group.
+    const genuine = 'here is the pattern:\n  /' + BS + 'n/g\nuse it as-is';
+    const out = bubbleText([genuine, NEIGHBOUR]);
+    assert.equal(litN(out), 1, 'the regex sample must survive verbatim');
+    assert.ok(out.includes('/' + BS + 'n/g'), out);
+});
+
+test('bubbleText -- empty and junk groups cannot throw the whole chat render', () => {
+    // chatBubble runs inside the 1.5s poll re-render; a throw here takes the conversation down.
+    assert.equal(bubbleText([]), '');
+    assert.equal(bubbleText(null), '');
+    assert.equal(bubbleText(undefined), '');
+    assert.equal(bubbleText([null, 'ok']), '\nok');
+});
+
+test('fixEscapedBreaks itself is unchanged -- the fix was the LAYER, not the guard', () => {
+    // Pins that this change did not quietly loosen the guard to paper over the layering bug. Handed
+    // a joined string it must STILL decline, because that behaviour is correct for a single message.
+    assert.equal(fixEscapedBreaks(BROKEN + '\n' + NEIGHBOUR), BROKEN + '\n' + NEIGHBOUR,
+        'the guard must still leave already-broken-up text alone');
+    assert.equal(litN(fixEscapedBreaks(BROKEN)), 0, 'and still repair a lone message');
+});
+
+test('console.js -- chatBubble routes through bubbleText, and joins nowhere else', () => {
+    // The wiring. The render and BOTH copy buttons shared the same raw join, so a fix applied to one
+    // of the three would have left a bubble that read correctly and copied a brick into an email.
+    const body = src.slice(src.indexOf('function chatBubble('), src.indexOf('// ---- Chat search'));
+    assert.match(body, /const _md = bubbleText\(g\.texts\)/, 'chatBubble no longer builds its markdown via bubbleText');
+    assert.ok(!body.includes("g.texts.join('\\n')"),
+        'chatBubble still has a raw g.texts.join -- that path skips the per-message repair');
+    assert.equal((body.match(/_md/g) || []).length, 4, 'expected _md defined once and used by render + both copy buttons');
+});
