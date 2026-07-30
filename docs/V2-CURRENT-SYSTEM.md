@@ -1269,3 +1269,19 @@ In the repo, worth reading before touching the matching area:
 - `test/` — 53 test files. `node --test` **silently skips every integration test** without
   `JARVIS_INTEGRATION=1`; the gate is `npm run test:integration` and you must read the pass count,
   not the fail count.
+
+### 10.1 Two ways a gate harness lies, measured while writing this doc
+
+The known trap is that the summary lines are `ℹ tests 607` with a multibyte information glyph, so a
+`^#` regex reads every count as null. `^\W*tests (\d+)\s*$` with the `m` flag is the working form.
+Two additions from building one here:
+
+1. **Write the parser from regex LITERALS, not `new RegExp('...')`.** Backslashes do not always
+   survive the trip through a shell heredoc into a script file: `new RegExp('^\\W*tests (\\d+)')`
+   silently became `^W*tests (d+)`, which matches nothing, and **every count parsed as null** while
+   the harness printed a confident verdict. A literal `/^\W*tests (\d+)\s*$/m` cannot be corrupted
+   this way.
+2. **Make the parser prove it parsed.** Assert `pass + fail === tests` before printing anything. That
+   one line is what caught the failure above — nulls otherwise read as zeros, and "fail: 0" from a
+   parser that read nothing looks exactly like a green run. This is the same class of error as the
+   `JARVIS_INTEGRATION` skip: an instrument reporting silence as success.
