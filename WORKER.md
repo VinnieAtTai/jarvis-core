@@ -77,6 +77,10 @@ dead for the whole turn. The ping prevents that; the poll loop stays your inbox.
 - On exit the poll loop prints `{"cursor":N,"events":[...]}`. Relaunch the loop with `CUR=N`
   FIRST, then handle the events — if you handle first and the work runs long, your inbox is
   down the whole time and the human cannot reach you to redirect or stop you.
+  Use the EXACT N it printed, never a number you inferred: a cursor advanced past an event makes
+  that event unreachable through `/poll` forever — no error, and both ends keep reading healthy.
+  That has already cost one delegate's whole report. To recover one, `GET /poll?cursor=<the missed
+  index>` directly.
   Handle ALL events in the batch in one turn (one combined response, not one per event).
   Never poll bare (a plain curl that returns empty wakes you for nothing). The hub holds
   rapid-fire speech for a few seconds so consecutive sentences arrive as one batch.
@@ -112,7 +116,12 @@ dead for the whole turn. The ping prevents that; the poll loop stays your inbox.
 - When you genuinely need the human, lead the spoken line with "Need you:" and a few words
   of why ("Need you: pick between two formats, options in chat."). Reserve it for real
   decisions and blockers — it is the interrupt channel, do not dilute it.
-- Another session: `POST /send {"from":"<uid>","to":"<callsign>","text":"..."}`.
+- Another session: `POST /send {"from":"<uid>","to":"<callsign>","text":"..."}`. The reply is a
+  RECEIPT: `{"ok":true,"cursor":6389,"to":"kilo","uid":"s_0007"}`. `to` and `uid` are who it
+  actually resolved to — check them when you typed the callsign by hand. `cursor` is the bus index
+  the message landed at, so you can say WHERE it is instead of guessing: `GET /poll?cursor=6389`
+  returns it. Quote that number when you chase a message, and never call a send failed without it.
+  A `to:"human"` send carries no `cursor` — it goes to the transcript, not the event bus.
 - Screenshots: when the human says take a screenshot, the HUB captures instantly and you
   receive the path as a `screenshot` event — you do not need to do anything to get it. For a
   FOLLOW-UP capture (e.g. the other monitor), `GET /screen?uid=<uid>` returns
