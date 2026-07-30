@@ -328,6 +328,47 @@ export async function createScratchHub(opts = {}) {
     return api;
 }
 
+// ---- capturing a worker's BOOT PROMPT ----------------------------------------------------------
+//
+// Promoted here from test/delegate.test.mjs the moment a second test needed it (the handoff rig, which
+// has to prove the successor is told its predecessor's notes may be empty). Two copies of a rig that
+// silently tests the wrong thing is the exact failure this file's header is about.
+//
+// The prompt is deliberately never persisted: spawnWorkerConsoleless hands it to pty-host in a config
+// file that pty-host deletes the instant it has read it, specifically so JARVIS_DATA does not
+// accumulate every brief the hub has ever written. So catch it at the far end, in the claude stub,
+// which is the only place it comes to rest.
+//
+// It cannot be forwarded with %*. node-pty escapes the prompt's own quotes as \" when it builds the
+// command line; cmd.exe does not understand that escape, so the quote state unbalances and the &s in
+// the hub's URLs leak out as command separators. !CMDCMDLINE! under DELAYED expansion is substituted
+// AFTER the line has been parsed, so nothing inside it is ever re-interpreted -- and it has to be
+// delayed expansion rather than %CMDCMDLINE%, which is a cmd pseudo-variable that no child process
+// inherits (measured: the child sees it empty).
+//
+// The capture is byte-exact except for non-ASCII, which the console codepage folds. Hence ASCII-only
+// needles in callers -- the same rule the hub's own bodies follow.
+//
+// Call this BEFORE hub.start(): the stub is read at spawn time, not at boot.
+export function recordBootPrompts(hub) {
+    writeFileSync(join(hub.BIN, 'claude.cmd'), [
+        '@echo off',
+        'setlocal enabledelayedexpansion',
+        '> "' + join(hub.DATA, 'boot-') + '%JARVIS_CALLSIGN%.txt" echo(!CMDCMDLINE!',
+        'endlocal',
+        'node "%~dp0stub-worker.mjs"',
+    ].join('\r\n') + '\r\n');
+}
+
+// The recorded prompt with node-pty's argv escaping undone, so needles read the way the prompt does.
+// Length-gated because the redirect above and this read are not synchronised: a zero-length or
+// half-written file means "not yet", not "no prompt".
+export const bootPrompt = (hub, cs) => hub.waitFor('the boot prompt for ' + cs, () => {
+    const p = join(hub.DATA, 'boot-' + cs + '.txt');
+    if (!existsSync(p)) return null;
+    const t = readFileSync(p, 'utf8');
+    return t.length > 400 ? t.replace(/\\"/g, '"') : null;
+}, 60000);
 // CLI, for a session that wants a real hub to curl at by hand instead of writing a test. Safe to
 // have here only because test-support/ is outside the paths `node --test` collects -- the same file
 // under test/ would run this during the suite.

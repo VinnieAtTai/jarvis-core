@@ -5,7 +5,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, reconstructHandoff } from '../jarvis-text.mjs';
-import { createScratchHub, assertConsolelessPossible, treeKill } from '../test-support/scratch-hub.mjs';
+import { createScratchHub, assertConsolelessPossible, treeKill, recordBootPrompts, bootPrompt } from '../test-support/scratch-hub.mjs';
 import { writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -321,6 +321,7 @@ test('HANDOFF: a console relaunch hands its successor a record that is not empty
         assertConsolelessPossible();
         const hub = await createScratchHub({ graceMs: 5000 });
         t.after(() => hub.dispose());
+        recordBootPrompts(hub);          // before start(): the stub is read at spawn time, not at boot
         await hub.start('handoff hub');
 
         const PURPOSE = 'the job nobody wrote down';
@@ -362,6 +363,15 @@ test('HANDOFF: a console relaunch hands its successor a record that is not empty
         assert.match(rec.auto, /FIRST MOVE:/, 'it does not tell the successor where to start looking');
         // The board really did come with it (1 queued card, nothing in progress after the transfer).
         assert.match(rec.auto, /board carried over: 0 working \+ 1 queued/);
+
+        // ...AND THE SUCCESSOR IS TOLD TO READ IT. Filing a good record is half the fix: the boot prompt
+        // is the only thing that ever points a successor at /handoff, and "read its notes" plus an empty
+        // string is what a relaunched worker concluded meant "no context". FOUND BY MUTATION PROBE --
+        // deleting this wording from the prompt killed nothing until this assertion existed, because no
+        // test read a boot prompt on a handoff spawn at all.
+        const boot = await bootPrompt(hub, succ);
+        assert.match(boot, /MAY BE EMPTY/, 'the successor is not warned that notes can be empty');
+        assert.match(boot, /"auto"/, 'the successor is never told the auto block exists: ' + boot.slice(-400));
 
         // ---- the OTHER call site: a live checkpoint files a record too -----------------------------
         // reconstructHandoff is called from two places, and until this ran only the retire path had a
