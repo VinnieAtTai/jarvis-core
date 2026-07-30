@@ -52,7 +52,7 @@ test('cursorGap -- one index skipped is still a skip (off-by-one is the likely t
 });
 
 test('cursorGap -- re-reading an OLDER index is the documented recovery, never an alarm', () => {
-    // GET /poll?cursor=<missed> is exactly how a worker recovers a skipped event. If that tripped the
+    // GET /poll?uid=<uid>&cursor=<missed> is how a worker recovers a skipped event. If that tripped the
     // detector, following the advice in the notice would produce another notice.
     assert.equal(cursorGap(6390, 6389), null);
     assert.equal(cursorGap(6390, 0), null);
@@ -108,14 +108,26 @@ test('GAP: a message jumped over is reported, and the notice names an index that
     const jumped = await poll(A.uid, r.cursor + 1);         // the 6390-for-6388 mistake, in miniature
     const [gap] = gapsIn(jumped);
     assert.ok(gap, 'no gap event on a cursor that skipped a message: ' + JSON.stringify(jumped));
-    assert.match(gap.text, new RegExp('GET /poll\\?cursor=' + r.cursor + '\\b'),
+    assert.match(gap.text, new RegExp('GET /poll\\?\\S*cursor=' + r.cursor + '\\b'),
         'the notice must name the recoverable index, not just say something was lost: ' + gap.text);
 
-    // The notice is only worth anything if the index it names actually produces the message. Follow
-    // its own advice and check.
-    const recovered = await poll(A.uid, r.cursor);
+    // Follow the notice's advice LITERALLY: lift the URL out of the text and fetch THAT STRING,
+    // rather than rebuilding it with the poll() helper.
+    //
+    // WHY, and it is the whole reason this test changed: the helper always injects uid, so this test
+    // spent months 'following the advice' down a path the advice never described. The notice printed
+    // `GET /poll?cursor=N`, /poll reads uid first and 404s `unknown uid` without it, and neither the
+    // match above nor the fetch below could see the difference -- the recovery documented for a worker
+    // that had already lost an event was broken the entire time, in the hub's own notice text and in
+    // WORKER.md. A test that REBUILDS the instruction it is checking is only testing its own helper.
+    const advised = (gap.text.match(/GET (\/poll\?[^\s.]+)/) || [])[1];
+    assert.ok(advised, 'the notice contains no fetchable /poll URL at all: ' + gap.text);
+    assert.match(advised, new RegExp('uid=' + A.uid + '\\b'),
+        'the advised URL omits uid, so a worker following it verbatim gets 404 unknown uid: ' + advised);
+    const recovered = await hub.get(advised);
     assert.ok((recovered.events || []).some(e => e.text === 'wsk jumped payload'),
-        'the index the notice pointed at did not return the skipped message: ' + JSON.stringify(recovered));
+        'the URL the notice printed did not return the skipped message: ' + advised + ' -> '
+        + JSON.stringify(recovered));
 });
 
 test('GAP: the notice arrives as an EVENT, because the documented poll loop sees nothing else',
@@ -305,12 +317,22 @@ test('GAP: a window straddling the trim boundary reports BOTH halves -- what is 
     const jumped = await pollT(S.uid, r.cursor + 1);              // window 995 .. past the message
     const [gap] = gapsIn(jumped);
     assert.ok(gap, 'the straddling jump was not reported: ' + JSON.stringify(jumped));
-    assert.match(gap.text, new RegExp('GET /poll\\?cursor=' + (TRIM_BASE - 5) + '\\b'),
+    assert.match(gap.text, new RegExp('GET /poll\\?\\S*cursor=' + (TRIM_BASE - 5) + '\\b'),
         'the recoverable half must still name an index: ' + gap.text);
     assert.match(gap.text, new RegExp('\\b5 index\\(es\\) from ' + (TRIM_BASE - 5) + '\\b'),
         'the trimmed half must still be counted: ' + gap.text);
-    // And the index it names really does produce the message, trimmed prefix or not.
-    const recovered = await pollT(S.uid, TRIM_BASE - 5);
+    // And the URL it prints really does produce the message, trimmed prefix or not -- fetched
+    // VERBATIM, for the reason the other gap test now spells out.
+    //
+    // THIS was the twin that let the broken advice survive: the assertion above pinned the uid-less
+    // `GET /poll?cursor=N` here as well, so fixing the notice in one place turned this test red and
+    // fixing only the OTHER test would have left the old format pinned in the suite. A needle that
+    // looks unique is not the same as a semantic core with one site -- count the sites.
+    const advised = (gap.text.match(/GET (\/poll\?[^\s.]+)/) || [])[1];
+    assert.match(advised || '', new RegExp('uid=' + S.uid + '\\b'),
+        'the advised URL omits uid, so a worker following it verbatim gets 404: ' + gap.text);
+    const recovered = await tHub.get(advised);
     assert.ok((recovered.events || []).some(e => e.text === 'wsk straddle payload'),
-        'the index the notice named did not return the message: ' + JSON.stringify(recovered));
+        'the URL the notice printed did not return the message: ' + advised + ' -> '
+        + JSON.stringify(recovered));
 });

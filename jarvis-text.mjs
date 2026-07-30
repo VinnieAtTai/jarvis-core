@@ -1869,6 +1869,20 @@ export function diagnoseSpawnLog(text) {
     if (/trust the files|is this a project you created|trust this folder/i.test(flat)) return 'it stopped on Claude Code folder-trust prompt -- nobody can press Enter on a console-less worker';
     if (/cannot find the file specified/i.test(flat)) return 'cmd.exe could not run the boot prompt -- a stray angle bracket in it is a redirection';
     if (/node-pty unavailable/i.test(flat)) return 'the worker host could not load node-pty';
+    // EVIDENCE PROVENANCE, recorded because a signature keyed to someone else's product copy is the
+    // failure above waiting its turn. Audited 2026-07-30: `worker exited (N)` and `node-pty
+    // unavailable` are OUR OWN strings -- pty-host.mjs writes both -- so they cannot drift without
+    // this repo drifting with them. `cannot find the file specified` is cmd.exe's. The trust
+    // phrasings are backed by a capture kept byte-identical in test/deadspawn.test.mjs.
+    //
+    // THE LINE BELOW IS THE ONE EXCEPTION AND IT IS UNPROVEN. No real auth death has ever been
+    // captured, so these three phrasings are RECALLED, not measured. Do not `fix` that by writing a
+    // fixture out of the same memory the regex came from: a fixture that agrees with the code is
+    // precisely the defect that kept the trust signature a no-op for months. Capture the real output
+    // the next time a worker dies unauthenticated, then pin THAT. Until then the fallback below is an
+    // honest one -- an auth failure prints and exits instead of hanging on a prompt, so a miss here
+    // costs a named cause, not silence.
+
     if (/invalid api key|please run \/login|\bnot logged in\b/i.test(flat)) return 'claude is not authenticated';
     // ANY interactive prompt, recognised by SHAPE instead of by its sentence -- the guard against
     // the failure above happening again. A phrase-keyed signature is one release away from going

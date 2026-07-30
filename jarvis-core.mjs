@@ -1107,8 +1107,13 @@ function gapNotice(uid, cursor) {
     if (!n && !gone) return null;
     const text = 'poll cursor gap: you polled at ' + gap.to + ' but your last poll returned ' + gap.from
         + ', so ' + (gap.to - gap.from) + ' event(s) were never delivered to you'
+        // The uid is in this URL deliberately. /poll reads uid FIRST and answers 404 `unknown uid`,
+        // so the uid-less form this notice printed for months was advice that could not work -- handed
+        // to the one worker already known to have lost an event, which is the worst possible reader for
+        // it. A recovery instruction that 404s is worse than none: the worker follows it, gets an error,
+        // and concludes the event is unrecoverable.
         + (n ? ' and ' + n + ' of them ' + (n === 1 ? 'is' : 'are') + ' addressed to you. Read '
-            + (n === 1 ? 'it' : 'them') + ' with GET /poll?cursor=' + gap.from + '.' : '.')
+            + (n === 1 ? 'it' : 'them') + ' with GET /poll?uid=' + uid + '&cursor=' + gap.from + '.' : '.')
         + (gone ? ' ' + gone + ' index(es) from ' + gap.from + ' have already been trimmed off the bus and are gone for good.' : '')
         + ' Relaunch your loop with the EXACT cursor the poll printed, never a number you inferred.';
     record({ kind: 'sys', text: (roster.sessions[uid] ? roster.sessions[uid].callsign : uid) + ' skipped ' + (gap.to - gap.from) + ' event(s) at cursor ' + gap.from + ' (' + n + ' addressed to it)' });
@@ -4135,8 +4140,9 @@ async function handleRequest(req, res) {
         record({ kind: 'msg', from: label, to: toCs, text });
         // A RECEIPT, not just an ack: ok:true alone only ever proved the recipient RESOLVED. `cursor`
         // is the bus index the message landed at, so a sender can say WHERE it is rather than guess
-        // (GET /poll?cursor=<it> returns it), and `to` closes the other half -- that it resolved to
-        // the session the sender MEANT, not merely to some live one. The to:'human' branch above gets
+        // (GET /poll?uid=<uid>&cursor=<it> returns it -- uid is required), and `to` closes the other
+        // half -- that it resolved to the session the sender MEANT, not merely to some live one. The
+        // to:'human' branch above gets
         // no cursor on purpose: it records to the transcript and never touches the bus, so there is
         // no index to name and inventing one would be the exact false receipt this set out to fix.
         return json(res, 200, { ok: true, cursor: at, to: toCs, uid: toUid });
@@ -4328,6 +4334,50 @@ async function handleRequest(req, res) {
         const b = await readBody(req);
         const cs = String(b.callsign || '').toLowerCase();
         if (!cs || cs === 'jarvis') return json(res, 400, { error: 'bad callsign' });
+        // THE GUARD RUNS BEFORE ANYTHING ELSE, and the ordering is the whole point. This handler
+        // retires the session and THEN deletes its board, so a check bolted on after the retire would
+        // kill the session and only then refuse -- strictly worse than the bug it was meant to fix.
+        //
+        // What it prevents: /forget deletes a whole board unconditionally, with no undo, and the
+        // console reaches it from a bare one-click X. Measured on the live board the day this went in,
+        // primeng held 500 cards and jarvis 231. The original card said 469, so the exposure had grown
+        // while the card sat in the queue.
+        //
+        // Why the guard is HERE and not only on the button: the console is the only caller today, but
+        // this project has already tried warning people off /forget -- three prose warnings in source,
+        // a hazard note in docs/PROJECT-THREADS.md, and two tests whose entire job is to assert the UI
+        // warns against it -- and the hazard stayed open the whole time. Documentation is not a guard,
+        // and /forget is a plain POST any worker or script can reach without going near the console.
+        //
+        // done/review are deliberately NOT counted. They are a record of finished work, so losing them
+        // is bad but recoverable from the transcript; working/queued is work in flight that nothing
+        // else remembers. Guarding on everything would make the refusal fire on boards nobody minds
+        // clearing, and a guard that cries wolf gets forced past by reflex.
+        //
+        // WHAT A LEGITIMATE force LOOKS LIKE, because a guard with an escape hatch is only as good as
+        // the discipline around the hatch. It is for a board whose work is genuinely dead: a session
+        // that never really started, a duplicate card minted by a mis-bound register, cards left by a
+        // job that has since been re-carded somewhere else. In every one of those the operator can say
+        // where the work WENT. If the honest answer is "I do not know what is on this board", that is
+        // the case the 409 exists for -- read the board, then hand it on with /retire {successor:true}
+        // or park it with /hold. force is for destroying work you have already accounted for, never
+        // for getting a refusal out of the way; the refusal body names the alternatives precisely so
+        // that reaching for force is a decision rather than the path of least resistance.
+        const w0 = loadWork();
+        const b0 = w0.sessions[cs];
+        const inFlight = b0 ? (b0.working || []).length + (b0.queued || []).length : 0;
+        if (inFlight > 0 && !b.force) {
+            const total = b0 ? ['working', 'queued', 'review', 'done'].reduce((n, l) => n + (b0[l] || []).length, 0) : 0;
+            return json(res, 409, {
+                error: 'board has work in flight',
+                callsign: cs,
+                working: (b0.working || []).length,
+                queued: (b0.queued || []).length,
+                total: total,
+                hint: 'POST /retire {uid,successor:true} hands the board to a fresh session; POST /hold parks it; '
+                    + 'repeat this call with force:true to destroy ' + total + ' card(s) deliberately.',
+            });
+        }
         const uid = liveUidOf(cs);
         if (uid) retireSession(uid, String(b.summary || '').trim() || 'Closed from console.');
         const w = loadWork();
@@ -4340,8 +4390,15 @@ async function handleRequest(req, res) {
             w.focus = nextFocusKey(liveBoardCandidates(), cs);
         }
         saveWork(w);
-        record({ kind: 'sys', text: 'removed ' + cs + ' from board' });
-        return json(res, 200, { ok: true });
+        // Name the cost when a forced call actually destroyed work in flight. A silent "removed X from
+        // board" is what made this hazard so hard to notice after the fact -- the sys line read the
+        // same whether the board was empty or held five hundred cards.
+        record({
+            kind: 'sys',
+            text: 'removed ' + cs + ' from board'
+                + (inFlight > 0 ? ' (FORCED - destroyed ' + inFlight + ' card(s) in flight)' : ''),
+        });
+        return json(res, 200, { ok: true, destroyed: inFlight });
     }
     if (key === 'POST /worklist') {
         const b = await readBody(req);

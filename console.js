@@ -188,9 +188,34 @@ function inlineMd(line) {
 // literal ones -- that combination is unambiguous double-escaping. A message that already has real
 // line breaks is left alone, because there a \n is far more likely to be genuine content (a regex,
 // a code sample) than a mistake.
+//
+// A WINDOWS PATH IS THE COUNTER-EXAMPLE, and it is live rather than theoretical: d:\node\x and
+// C:\temp\new both carry a backslash-n or -t that means a directory, not a line break, and the
+// blanket rewrite silently destroyed them. What saved us so far was luck of SHAPE, not of spelling
+// -- a message naming a path usually also had real line breaks, so the guard above bailed before
+// reaching them. The corrupting case is therefore a SHORT ONE-LINE message that mentions a path,
+// which is exactly the shape Chris has asked workers to send, so the risk went UP when we got
+// terser. Measured on the live board: one of 2321 strings already carries a backslash-t.
+//
+// The discriminator is not the backslash-n itself -- it is CONTEXT. So mask the path-shaped spans,
+// repair what is left, unmask. That never has to guess what a lone backslash-n "probably" meant.
+//
+// AMBIGUITY IS RESOLVED IN FAVOUR OF THE PATH, deliberately. In "d:\temp\new.log\nit has the trace"
+// there is no way to know whether the break is a break or a folder called nit -- both are legal. The
+// mask is greedy, so it keeps the path whole and declines to repair that one break. A brick is ugly;
+// a corrupted path is wrong, and only one of those can be fixed by the reader.
+// PATH_SPAN lives INSIDE the function on purpose: test/headline.test.mjs and test/chatbreaks.test.mjs
+// lift this function out of the source BY NAME and eval it, and lift() can only take `function`
+// declarations -- so a module-level const would be an undefined reference in every one of those
+// tests. Keeping it here also contains the /g regex's lastIndex, one less way for a shared literal
+// to bite a later caller.
 function fixEscapedBreaks(s) {
     if (s.includes('\n') || !/\\[nt]/.test(s)) return s;
-    return s.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    const PATH_SPAN = /(?:[A-Za-z]:\\|\\\\)[^\s"'<>|,;]*/g;
+    const held = [];
+    const masked = s.replace(PATH_SPAN, (m) => '\u0000' + (held.push(m) - 1) + '\u0000');
+    return masked.replace(/\\n/g, '\n').replace(/\\t/g, '\t')
+        .replace(/\u0000(\d+)\u0000/g, (m, i) => (+i < held.length ? held[+i] : m));
 }
 // One chat bubble's markdown. A bubble is a GROUP -- consecutive messages from the same sender --
 // so the repair above must run PER MESSAGE, before the join. Run AFTER the join it disables itself:
@@ -767,14 +792,24 @@ function splitHeadline(text, max) {
 // test/headline.test.mjs to lift and assert on the real HTML. That test is the wiring proof: this
 // project has shipped helpers with no caller before (the "where is the search" failure), and a pure
 // function nobody calls is worse than no function at all.
+//
+// THE REPAIR HAPPENS HERE, not inside splitHeadline, and the layer is the whole point. A card posted
+// with double-escaped breaks was invisible to the splitter: it looks for a REAL newline, so the brick
+// arrived as one 80-character headline with the backslash-n showing, and its caret opened onto the
+// same brick. Repairing at this layer fixes both the headline and the expanded body from one call,
+// and leaves splitHeadline pure -- which matters because splitHeadline is the MIRRORED function, and
+// putting the repair inside it would drag fixEscapedBreaks into jarvis-text.mjs for no gain. bravo
+// learned this the expensive way one layer down: the repair was correct and applied in the wrong
+// place, so it switched itself off.
 function headlineHtml(text, key, open, max) {
-    const p = splitHeadline(text, max);
+    const src = fixEscapedBreaks(String(text == null ? '' : text));
+    const p = splitHeadline(src, max);
     const caret = p.hasMore
         ? '<span class="hlmore" data-x="' + escAttr(key) + '" title="' + (open ? 'hide the detail' : 'show the full text') + '">'
             + (open ? '&#9662;' : '&#8230;') + '</span>'
         : '';
     const body = (open && p.hasMore)
-        ? '<div class="hldetail">' + esc(String(text == null ? '' : text).replace(/\r/g, '')).split('\n').join('<br>') + '</div>'
+        ? '<div class="hldetail">' + esc(src.replace(/\r/g, '')).split('\n').join('<br>') + '</div>'
         : '';
     return { text: esc(p.headline), caret: caret, body: body, hasMore: p.hasMore };
 }
@@ -1382,7 +1417,36 @@ workEl.onclick = (e) => {
     if (op) { post('/worklist', { op, callsign: t.getAttribute('data-cs'), text: t.getAttribute('data-t') }); return; }
     const act = t.getAttribute('data-act');
     if (act === 'focus') post('/focus', { callsign: t.getAttribute('data-cs') });
-    else if (act === 'close') post('/forget', { callsign: t.getAttribute('data-cs') });
+    // The X used to POST /forget straight out, which retires with no successor and then deletes the
+    // whole board -- 500 cards on primeng the day this was written, no undo, one click, no prompt.
+    // The endpoint now refuses a board with work in flight, so this is the second line of defence and
+    // its job is to make the choice an informed one rather than to be the only thing standing there.
+    //
+    // Two different cases wear the same X. A LIVE session's work can be handed on, so offer that
+    // instead of destroying it -- retire with successor:true is the whole point of the successor
+    // mechanism. A DEAD card has no uid to retire and spawning a successor for something the operator
+    // is tidying away would be a surprise, so that one asks for explicit consent and names the cost.
+    // An empty board still closes in one click, because that is the case the button was built for and
+    // a prompt there would just teach people to click through prompts.
+    else if (act === 'close') {
+        const ccs = t.getAttribute('data-cs');
+        const card = ((lastBoard && lastBoard.boards) || []).find(x => x.callsign === ccs) || {};
+        const flight = (card.working || []).length + (card.queued || []).length;
+        const total = ['working', 'queued', 'review', 'done'].reduce((n, l) => n + (card[l] || []).length, 0);
+        if (!flight) { post('/forget', { callsign: ccs }); return; }
+        if (card.alive !== false && card.uid) {
+            uiConfirm(ccs.toUpperCase() + ' has ' + flight + ' card(s) still in flight.\n\n'
+                + 'Hand the board to a fresh session instead of deleting it? The successor inherits all '
+                + total + ' card(s) and picks up where this one left off.',
+                { ok: 'Hand off', cancel: 'Leave it' })
+                .then(okd => { if (okd) post('/retire', { uid: card.uid, successor: true, summary: 'Closed from console -- board handed to a successor.' }); });
+            return;
+        }
+        uiConfirm('Delete ' + ccs.toUpperCase() + "'s board?\n\n" + total + ' card(s) go permanently, '
+            + flight + ' of them still working or queued. There is no undo.',
+            { ok: 'Delete ' + total + ' cards', cancel: 'Keep it', danger: true })
+            .then(okd => { if (okd) post('/forget', { callsign: ccs, force: true }); });
+    }
     else if (act === 'continue') post('/spawn', { cwd: t.getAttribute('data-cwd'), purpose: t.getAttribute('data-purpose'), project: t.getAttribute('data-project') || undefined });
     else if (act === 'spawnjarvis') post('/spawn', { cwd: 'd:/claude/jarvis-core', purpose: 'JARVIS punchlist', project: 'jarvis' });
     else if (act === 'rebuild') { uiConfirm('Rebuild JARVIS now? Restarts the hub with the latest jarvis-core code. Live sessions ride it out. Heads-up: this resets the in-memory token gauge.', { ok: 'Rebuild', danger: true }).then(ok => { if (ok) post('/restart', {}); }); }
