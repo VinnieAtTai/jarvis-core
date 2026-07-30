@@ -489,14 +489,60 @@ export function pushCapped(arr, entry, cap = PROJECT_LOG_CAP) {
     return next.length > cap ? next.slice(next.length - cap) : next;
 }
 
+// How much of a project's open-thread list reaches a sub-worker. THIS IS A BLAST RADIUS, not a style
+// preference. subworkerBrief's output is pasted VERBATIM into a boot prompt that cmd.exe re-parses as
+// a Windows command line, and CreateProcess refuses one longer than 32767 chars — so an array that
+// grows in a JSON store is a fuse burning towards every future spawn. Measured on the live store on
+// 2026-07-30: 46 threads, brief 31822 chars of which openThreads was 30570, leaving 945 for the entire
+// rest of the prompt. Dispatch was DEAD — two workers died before registering with a completely empty
+// log, indistinguishable from any other launch failure, and it cost two sessions before quebec found
+// the mechanism. Hand-trimming the store to 15 threads fixed the DATA. These caps are the code half:
+// the brief no longer scales with the store at all, so the same growth can never do it again.
+//
+// The budget is CHARS as well as a count, because one 30k thread bricks a spawn exactly as well as
+// forty small ones. Both sit deliberately ABOVE today's real store (15 threads, 9.8k chars) so nothing
+// a curator has written is dropped right now — what they buy is that nothing written LATER can reach
+// the launcher. Lower them if a leaner story is wanted; that is a judgement call about what a
+// sub-worker should read, and it is now the only thing these numbers control.
+export const BRIEF_THREADS_MAX = 16;        // at most this many open threads reach a sub-worker
+export const BRIEF_THREADS_CHARS = 10000;   // ...and at most this many chars of them, joined
+
+// The open-threads clause of a brief, bounded. Returns the plain "Open threads: a; b." when the whole
+// list fits, and a clause that SAYS WHAT IT DROPPED when it does not — never a silently short list. A
+// sub-worker cannot tell a trimmed working set from a project that simply has few threads, so a quiet
+// slice would read as "that is all of them" and it would act as if the rest did not exist. Pure.
+function threadsClause(ot, opts) {
+    const o = (opts && typeof opts === 'object') ? opts : {};
+    const maxN = Number(o.maxThreads) > 0 ? Math.floor(Number(o.maxThreads)) : BRIEF_THREADS_MAX;
+    const maxC = Number(o.maxChars) > 0 ? Math.floor(Number(o.maxChars)) : BRIEF_THREADS_CHARS;
+    const take = [];
+    let used = 0, cutOne = false;
+    for (const t of ot.slice(0, maxN)) {
+        const cost = used ? t.length + 2 : t.length;   // '; ' joins the entries
+        if (used + cost <= maxC) { take.push(t); used += cost; continue; }
+        // NOTHING fit: a single thread longer than the whole budget. Hand over its head rather than an
+        // empty list — the first entry is the curated top of the working set (on the live store it is
+        // the pointer to the thread archive), and a store made of one monster entry must still tell a
+        // sub-worker something. Marked as cut so the heading cannot claim it is whole.
+        if (!take.length && maxC > 40) { take.push(t.slice(0, maxC - 4) + ' ...'); cutOne = true; }
+        break;
+    }
+    if (take.length === ot.length && !cutOne) return 'Open threads: ' + take.join('; ') + '.';
+    return 'Open threads (' + take.length + ' of ' + ot.length + ' shown'
+        + (cutOne ? ', and that one cut short' : '') + ' - your working set in store order, not the'
+        + ' archive; GET /project for the rest): ' + take.join('; ') + '.';
+}
+
 // Compose the read-only STORY brief a parentProject SUB-WORKER is seeded with on boot (Chris's ask:
 // "workers get their context from the mission"). Given the parent project object and its linked
 // mission (or null), returns a compact prose brief — project title, the mission it serves + phase
 // progress, where the project stands, current focus, and open threads — so an ephemeral sub-worker
 // inherits the history without rehydrating the store or acting as the coordinator. Its TASK stays its
 // own; this is only context. Returns '' when there is no project to describe. Pure: reads its args,
-// mutates nothing, invents nothing.
-export function subworkerBrief(project, mission) {
+// mutates nothing, invents nothing. `opts` overrides the thread caps for tests only. The open-threads
+// clause is BOUNDED (threadsClause, above) and says so when it drops any: this string lands in a
+// Windows command line, so its length is a launch failure waiting to happen, not a matter of taste.
+export function subworkerBrief(project, mission, opts) {
     if (!project || typeof project !== 'object') return '';
     const c = (project.context && typeof project.context === 'object') ? project.context : {};
     const title = String(project.title || project.name || 'the project').trim();
@@ -510,7 +556,7 @@ export function subworkerBrief(project, mission) {
     if (c.summary && String(c.summary).trim()) parts.push('Where it stands: ' + String(c.summary).trim());
     if (c.currentFocus && String(c.currentFocus).trim()) parts.push('Current focus: ' + String(c.currentFocus).trim() + '.');
     const ot = Array.isArray(c.openThreads) ? c.openThreads.map(String).map(s => s.trim()).filter(Boolean) : [];
-    if (ot.length) parts.push('Open threads: ' + ot.join('; ') + '.');
+    if (ot.length) parts.push(threadsClause(ot, opts));
     return parts.join(' ');
 }
 
@@ -1644,6 +1690,69 @@ function batonSentence(repo, L, now) {
         : q.length === 1 ? capFirst(q[0]) + ' is waiting behind it.'
             : q.length + ' are waiting: ' + q.join(', ') + '.';
     return capFirst(batonSpokenName(L.holder)) + ' holds the ' + repo + ' merge lane' + held + '. ' + tail;
+}
+
+// --- the boot prompt: its LENGTH is a launch failure --------------------------------------------
+//
+// The prompt spawnWorker assembles does not travel as a string to a function. node-pty runs claude
+// through cmd.exe (claude resolves to a .cmd), and the wt-new-tab fallback writes the prompt inline
+// into a batch file — so either way the whole paragraph is re-parsed as a WINDOWS COMMAND LINE, and
+// CreateProcess refuses one longer than 32767 chars. Past that the spawn does not fail loudly: the
+// worker never registers and leaves an EMPTY log, which is the single most expensive failure mode this
+// project has (see the section below — same invisibility, different cause). It has already happened
+// once, from the project store growing to 46 open threads, and it cost two sessions.
+//
+// So the length is checked ONCE, where the prompt is finished, and never silently: capBootPrompt only
+// decides WHAT to cut, and its caller has to say on the bus that it cut anything. The individual
+// contributors are capped too (BRIEF_THREADS_MAX for the story) — this is the backstop for everything
+// they cannot see, like a 20k `purpose` or a paragraph somebody adds next month.
+export const CMD_LINE_MAX = 32767;             // CreateProcess's hard ceiling on a command line
+// AND NOT 8191, which is the number you will find if you look this up. MEASURED on this box 2026-07-30,
+// because the difference decides whether the cap below is 24000 or 7700: a batch line with nothing to
+// expand carried 32700 chars fine, while the SAME line carrying a %~dp0 died at ~8191 chars of EXPANDED
+// text with "The input line is too long." So cmd.exe's famous 8191 applies to percent-expansion, not to
+// the literal line -- and the spawn .cmd's claude line is all literal (an absolute claude path, literal
+// flags, and a prompt whose % chars are stripped out of the purpose). Put a %VAR% or a %~dp0 back on
+// that line and the real budget silently drops to 8191; test/bootprompt.test.mjs guards it.
+export const CMD_BATCH_EXPANSION_MAX = 8191;
+// The ceiling we actually enforce. The gap under CMD_LINE_MAX is the launcher's own chrome, which is
+// NOT in the string we measure: the quoted claude.exe path, --permission-mode, --model, --settings and
+// its DATA path, plus cmd.exe's wrapper. That is a few hundred chars, so 8k of slack is generous on
+// purpose — nothing today comes near 24000 (a fully-briefed sub-worker measures ~12k), and a prompt
+// that does has a bug in it rather than a lot to say.
+export const BOOT_PROMPT_MAX = 24000;
+// A cut keeps the head AND the tail, not just the head. The tail is where the SAFETY paragraphs are —
+// which worktree you are in, do not switch branches, which commands are pre-approved — and a worker
+// that lost those is not a worker with less context, it is one that goes looking for the main checkout.
+// The story in the middle is what a sub-worker can recover from /project; those two paragraphs it
+// cannot recover from anywhere.
+export const BOOT_PROMPT_TAIL_KEEP = 1600;
+// ASCII, and no angle brackets: this text ends up inside the same command line, where a `<` or `>` is a
+// REDIRECTION that kills the spawn outright.
+export const BOOT_CUT_MARKER = ' [PROMPT CUT BY THE HUB: a chunk of the briefing was removed here to stay'
+    + ' under the Windows command-line limit, so what you have is INCOMPLETE. GET /project for the full'
+    + ' project store and ask your dispatcher for the rest before you act on a partial instruction.] ';
+
+// Cap a finished boot prompt to something a Windows launcher can actually carry. Returns
+// `{text, truncated, length, original, cut}` — `truncated` is the caller's cue to announce it, and
+// `original`/`cut` are the numbers worth announcing. Pure: it never logs, because a hub-side record is
+// the caller's job and a pure helper that "handles" it quietly is how this got invisible the first time.
+export function capBootPrompt(boot, max = BOOT_PROMPT_MAX, tailKeep = BOOT_PROMPT_TAIL_KEEP) {
+    const text = String(boot == null ? '' : boot);
+    const cap = Number(max) > 0 ? Math.floor(Number(max)) : BOOT_PROMPT_MAX;
+    const original = text.length;
+    if (original <= cap) return { text, truncated: false, length: original, original, cut: 0 };
+    // A cap too small to hold the marker at all (only a test would ask for one): a bare slice beats
+    // returning something longer than the caller asked for, which is the one thing this must never do.
+    if (cap <= BOOT_CUT_MARKER.length) {
+        const bare = text.slice(0, cap);
+        return { text: bare, truncated: true, length: bare.length, original, cut: original - cap };
+    }
+    const room = cap - BOOT_CUT_MARKER.length;
+    const tail = Math.max(0, Math.min(Number(tailKeep) > 0 ? Math.floor(Number(tailKeep)) : 0, room - 1));
+    const head = room - tail;
+    const out = text.slice(0, head) + BOOT_CUT_MARKER + (tail ? text.slice(original - tail) : '');
+    return { text: out, truncated: true, length: out.length, original, cut: original - head - tail };
 }
 
 // --- spawns that die before they register ------------------------------------------------------

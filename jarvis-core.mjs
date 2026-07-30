@@ -12,6 +12,7 @@ import { fetchRealUsage } from './usage.mjs';
 import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
 import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap, isBatonQuestion, speakBaton } from './jarvis-text.mjs';
 import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote, reconstructHandoff, spawnDispatch } from './jarvis-text.mjs';
+import { CMD_LINE_MAX, BOOT_PROMPT_MAX, capBootPrompt } from './jarvis-text.mjs';
 import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, wedgeGraceMs, wedgeEscalateDue, cursorGap, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -2646,7 +2647,14 @@ function spawnWorker(repo, purpose, opts = {}) {
         try { pr = getProject(subOf); if (pr && pr.missionId) ms = (loadMissions().missions || []).find(x => x.id === pr.missionId) || null; } catch { }
         const brief = subworkerBrief(pr, ms);
         boot += ' You are a SUB-WORKER under ' + (brief || ('the ' + subOf + ' project.'))
-            + ' That is your STORY/context so you carry the history without rebuilding it; your TASK is only what is described above. You are NOT the ' + subOf + ' coordinator: use your OWN callsign for every /worklist op, do not touch the ' + subOf + ' board column, and do not rehydrate or POST project context. When your task is done, /retire with a crisp one-line summary — it auto-appends to the ' + subOf + ' project log so the coordinator and the next worker rebuild from your outcome.';
+            + ' That is your STORY/context so you carry the history without rebuilding it; your TASK is only what is described above. You are NOT the ' + subOf + ' coordinator: use your OWN callsign for every /worklist op, do not touch the ' + subOf + ' board column, and do not rehydrate or POST project context. When your task is done, /retire with a crisp one-line summary — it auto-appends to the ' + subOf + ' project log so the coordinator and the next worker rebuild from your outcome.'
+            // WHERE THE REST IS. The story above is a BOUNDED slice (subworkerBrief caps it, because
+            // pasting a whole growing store into a command line is what killed dispatch outright on
+            // 2026-07-30). A cap that quietly withholds context is only safe if the worker is told how
+            // to go and get it -- otherwise the fix for an invisible brick is an invisible blind spot.
+            // Reading is free and read-only: /project is a GET, and it is the coordinator's store, not
+            // a thing a sub-worker has to avoid touching.
+            + ' Your STORY above is a bounded slice, not the archive: GET http://127.0.0.1:' + PORT + '/project?name=' + subOf + ' any time for the full store - every open thread, the recent-work log and the project\'s doc links - and if this repo keeps a thread history under docs (the jarvis project keeps docs/PROJECT-THREADS.md), read that when you touch an area it covers. Reading is free; you still must not POST to it.';
     }
     if (meeting && meeting.title) {
         boot += ' You are a MEETING worker for "' + meeting.title + '"' + (meeting.start && meeting.end ? ' (' + meeting.start + ' to ' + meeting.end + ')' : '') + '. Assist Chris live during this call: capture decisions and action items, draft Jira items when he asks, and pull up references.';
@@ -2658,6 +2666,28 @@ function spawnWorker(repo, purpose, opts = {}) {
     // and "helpfully" switches branches or goes looking for the real checkout.
     if (wt) boot += ' You are in a DEDICATED git worktree at ' + wt.path + ' on branch ' + wt.branch + ' (forked from ' + wt.base + '). Commit freely here: you cannot see or touch other worktrees or Chris\'s own checkout, so nothing you do can collide with his work. Do NOT switch branches and do not go looking for the main checkout. On retire, commit everything - your branch is how your work merges back.';
     boot += ' Permissions: read-only and routine build commands (git status/diff/log, npm run lint, node --check, ls/cat/grep/rg, dotnet build/test) run WITHOUT asking the human; only risky or out-of-repo actions prompt. Favor those pre-approved commands, batch shell calls, and self-verify (run the lint gate yourself) instead of asking. If you fan out subagents, keep them to the same safe command set so they do not each trigger a prompt.' + (effTier ? ' You are a TRUSTED session: your non-risky actions are auto-approved — work autonomously and only surface genuine decisions.' : '');
+    // THE PROMPT IS FINISHED HERE, so this is where its LENGTH is checked -- once, for both launch
+    // branches below, before either can carry it. Every paragraph above is a contributor and no single
+    // one of them can see the total: the sub-worker story, the successor handoff, the project-manager
+    // and delegation paragraphs and a human-supplied purpose all pile onto the same command line, and
+    // past CMD_LINE_MAX chars CreateProcess refuses it. What that looks like is not an error -- it is a
+    // worker that never registers, with an empty log, indistinguishable from every other launch
+    // failure. That is exactly how dispatch died on 2026-07-30 and it cost two sessions to find.
+    //
+    // AND IT IS SAID OUT LOUD. The entire cost of that bug was its silence, so a cut prompt gets a sys
+    // line naming the callsign and both lengths, plus a spoken headline -- a worker briefed on a
+    // shortened prompt is a worker that may do the wrong thing confidently, which is worth interrupting
+    // for. If this ever fires, the fix is upstream (trim the project store, shorten the purpose), not a
+    // bigger cap: the cap is what a Windows command line will take, not a preference.
+    const capped = capBootPrompt(boot);
+    if (capped.truncated) {
+        record({ kind: 'sys', text: 'boot prompt for ' + cs + ' was CUT: ' + capped.original + ' chars is over the '
+            + BOOT_PROMPT_MAX + '-char launch limit (CreateProcess refuses ' + CMD_LINE_MAX + '), so ' + capped.cut
+            + ' chars of briefing were removed and it launched on ' + capped.length + '. It boots on an INCOMPLETE brief. '
+            + 'Trim the project store openThreads or the purpose -- an un-cut prompt this long would have died silently before registering.' });
+        enqueueSay('Heads up: ' + cs + ' had to launch on a shortened brief. Details in chat.', 'jarvis');
+    }
+    boot = capped.text;
     const hookSettings = repo.permissionMode === 'bypassPermissions' ? null : join(DATA, 'perm-settings.json');
     // ONE dispatch for BOTH launch branches below. It used to be spelled out inline at each watchSpawn
     // call, identically, and that is precisely what made it unprobeable: a needle carrying the log-path
