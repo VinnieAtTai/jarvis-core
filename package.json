@@ -20,6 +20,7 @@
         "test:delegate": "set JARVIS_INTEGRATION=1&& node --test test/delegate.test.mjs",
         "test:search": "set JARVIS_INTEGRATION=1&& node --test test/search.test.mjs",
         "test:send": "set JARVIS_INTEGRATION=1&& node --test test/send.test.mjs",
+        "test:cursorgap": "set JARVIS_INTEGRATION=1&& node --test test/cursorgap.test.mjs",
         "test:archive": "set JARVIS_INTEGRATION=1&& node --test test/archive.test.mjs",
         "test:deadspawn": "set JARVIS_INTEGRATION=1&& node --test test/deadspawn.test.mjs",
         "test:integration": "set JARVIS_INTEGRATION=1&& node --test",
