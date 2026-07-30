@@ -25,8 +25,8 @@ commit is not a deployed one, and session churn looks identical either way — t
 burned whole sessions. `GET /roster` returns the same `build` block if you need it later.
 
 If the response also carries a `handoff` field, a predecessor on your cwd left you one:
-`GET /handoff?cwd=<your cwd>` to read its summary + detailed notes, tell the human in one
-chat line that you've picked up the handoff, then resume that work (see §5).
+`GET /handoff?cwd=<your cwd>` to read it, tell the human in one chat line that you've picked
+up the handoff, then resume that work (see §5).
 
 If your boot instructions name a pin (e.g. "Register with pin: golf"), include
 `"pin":"golf"` in the register body — the hub pre-assigned you that callsign when it
@@ -220,9 +220,18 @@ anytime, latest wins), then `/retire` with `successor:true`. A fresh session pic
 where you left off.
 
 **If you ARE the successor** (your boot prompt said so): the moment you register, `GET
-/handoff?cs=<your-callsign>` to read your predecessor's summary + notes, tell the human in
-one chat line that you've picked up the handoff, then resume. Your board already holds the
-unfinished items.
+/handoff?cs=<your-callsign>`, tell the human in one chat line that you've picked up the
+handoff, then resume. Your board already holds the unfinished items.
+
+That record has TWO halves and you need both. `notes` is what your predecessor WROTE, and it
+**may be empty** — a relaunch from the console retires a session without giving it a chance to
+checkpoint, so an empty `notes` means nobody wrote anything, NOT that there is nothing to pick
+up. `auto` is a block the hub assembled from what it observed: the branch you are continuing,
+your predecessor's last reported state, whether its in-flight work was committed as WIP on the
+way out, and the `git log` range to read. Read `auto` whether or not `notes` has anything in
+it — on an inherited branch that commit diff IS the handoff nobody wrote. `auto` is
+reconstructed fact, not your predecessor's judgement; it says so on its own first line, and the
+distinction matters when you decide how far to trust it.
 
 ## Rules
 
