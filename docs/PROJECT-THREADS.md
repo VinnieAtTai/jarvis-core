@@ -94,6 +94,17 @@ TRAP THAT MAKES A FALSE TEST LOOK CONCLUSIVE, found by zulu 2026-07-29: inter-wo
 
 POLL DISCIPLINE, and it cost a report tonight: relaunch the loop with the EXACT cursor the poll printed, never a number you inferred. I relaunched at 6390 when the poll had returned 6388 and silently skipped 6389, which was zulu's whole board audit. A cursor advanced past an event makes that event UNREACHABLE through /poll - there is no catch-up and no error, and both ends read healthy. Recovery: curl /poll?cursor=<N-1> directly for the missed index. Related open card asks for a delivery signal on /send.
 
+> **[Editor's note, november 2026-07-30 -- the recovery command in the sentence above does not work as
+> written, and the original is left standing because it is what the session that got burned wrote.]**
+> `/poll` reads `uid` first and answers `404 unknown uid` without it (jarvis-core.mjs:3947-3952), so a
+> uid-less cursor fetch never returns the missed event. The working form is
+> `GET /poll?uid=<your-uid>&cursor=<the missed index>`. juliet found and fixed the same wrong advice at
+> four live sites (WORKER.md, which `GET /protocol` serves verbatim, so those were never two places; the
+> hub's own gap-notice text; and a `/send` receipt comment) and pinned it by lifting the URL out of the
+> notice and fetching that exact string. Which is the real lesson here: the gap test had asserted this
+> path for months and passed, because it rebuilt the URL through its own helper instead of following the
+> printed advice. A test that rebuilds the instruction it is checking only tests its own helper.
+
 ## 21. CORRECTION 2026-07-29
 
 CORRECTION 2026-07-29, measured: the 'node db.mjs backfill still owed / jarvis.db last written Jul 22' item that has been parked on Chris for days is DEAD. jarvis.db mtime is 2026-07-29 18:36 (verified on disk), and the hub never writes that file - only db.mjs does - so the re-run already happened. Do not re-park it.
