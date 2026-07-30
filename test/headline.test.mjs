@@ -40,8 +40,12 @@ function lift(name) {
 // headlineHtml escapes through esc/escAttr; lifting them too keeps the escaping under test rather
 // than stubbed, because card text is agent-authored and lands in both a title="" and a text node.
 const consoleSplit = new Function(lift('splitHeadline') + '\nreturn splitHeadline;')();
+// fixEscapedBreaks joined this list when headlineHtml started repairing double-escaped card text
+// before splitting it. Lifted rather than stubbed for the same reason as esc: it is the thing under
+// test on the brick fixtures below, and a stub would let the repair rot without failing anything.
 const headlineHtml = new Function(
-    lift('esc') + '\n' + lift('escAttr') + '\n' + lift('splitHeadline') + '\n' + lift('headlineHtml')
+    lift('esc') + '\n' + lift('escAttr') + '\n' + lift('fixEscapedBreaks') + '\n'
+    + lift('splitHeadline') + '\n' + lift('headlineHtml')
     + '\nreturn headlineHtml;')();
 
 // ---- the split rules -------------------------------------------------------------------------
@@ -277,6 +281,48 @@ test('console.js -- no surface still prints the raw un-split prose', () => {
     // esc(doing) was the mission rail. It is the one needle here that is NOT unique by construction:
     // `doing` is a common local name, so pin the rail's own row markup instead of the bare call.
     assert.ok(!/nowrap">' \+ esc\(doing\)/.test(src), 'the mission rail row still prints esc(doing)');
+});
+
+// ---- A double-escaped CARD ----------------------------------------------------------------------
+// splitHeadline looks for a REAL newline, so a card posted with literal backslash-n was invisible to
+// it: the whole brick became one 80-character headline with the backslash-n showing, and because the
+// truncation set hasMore, the caret opened onto the same brick. headlineHtml now repairs before it
+// splits. Written with BS rather than a literal backslash so no editor or shell can collapse the
+// fixture into a real newline and leave these assertions proving nothing.
+const BS = String.fromCharCode(92);
+const BRICK = 'BUG: chat renders a brick' + BS + 'n'
+    + 'the repair runs after the join' + BS + 'n' + 'so it disables itself';
+
+test('headlineHtml -- a double-escaped card gets a real headline, not a brick', () => {
+    const r = headlineHtml(BRICK, 'k', false);
+    assert.equal(r.text, 'BUG: chat renders a brick', 'the first line becomes the headline');
+    assert.ok(!r.text.includes(BS + 'n'), 'and no literal backslash-n is left on screen');
+    assert.ok(r.hasMore, 'the rest is still reachable behind the caret');
+});
+
+test('headlineHtml -- and expanding it shows real lines rather than the same brick', () => {
+    const r = headlineHtml(BRICK, 'k', true);
+    assert.ok(!r.body.includes(BS + 'n'), 'the detail block carries no literal backslash-n');
+    assert.equal((r.body.match(/<br>/g) || []).length, 2, 'the two breaks became real line breaks');
+    assert.ok(r.body.includes('so it disables itself'), 'and the whole stored text is still shown');
+});
+
+test('headlineHtml -- a card naming a Windows path keeps the path', () => {
+    // The reason the repair could not simply be bolted on: the obvious version corrupts a path, and
+    // the board is where paths get quoted. d:\node\x has to survive being rendered.
+    const card = 'NOTE: the worktree is at d:' + BS + 'node' + BS + 'x';
+    const r = headlineHtml(card, 'k', false);
+    assert.ok(r.text.includes('d:' + BS + 'node' + BS + 'x'), 'path intact in the headline -- got ' + r.text);
+    assert.ok(!r.hasMore, 'and a short card still offers no expander');
+});
+
+test('splitHeadline itself stayed pure -- the repair went in the LAYER above it', () => {
+    // Deliberate: splitHeadline is the MIRRORED function, so putting fixEscapedBreaks inside it would
+    // drag the repair into jarvis-text.mjs too, for no gain. Both copies must stay blind to a literal
+    // backslash-n, and headlineHtml is what hands them repaired text.
+    assert.equal(splitHeadline(BRICK).detail, '', 'the exported splitter must NOT repair');
+    assert.equal(consoleSplit(BRICK).detail, '', 'and neither must the console mirror');
+    assert.ok(!lift('splitHeadline').includes('fixEscapedBreaks'), 'the repair leaked into splitHeadline');
 });
 
 test('console.js -- the rail can actually open its expander', () => {
