@@ -814,6 +814,75 @@ function coordTip(b) {
     return 'COORDINATOR of ' + proj + (who ? ', run by session ' + who : '')
         + ' -- it holds the project context and dispatches the sub-workers indented under it.';
 }
+// —— The commit baton, made visible ——————————————————————————————————————————————————————————————
+// The merge lane has been live, tested and deployed for days and the console said NOTHING about it:
+// `grep -c baton console.js` returned 0. That is the chat-search mistake one layer down -- a lane only
+// the workers can see is not a lane Chris can supervise, and the moment it matters is exactly the
+// moment two sessions both report "committed and ready" and he has no way to tell which one is cleared
+// to merge and which is queued behind it.
+//
+// No new fetch and no server change: GET /board already stamps every card with the lane it is in
+// (jarvis-core.mjs `batonFor` -> the card's `baton` field), one store read per /board and no git call.
+// The four functions below are the whole decision, kept pure and named so the gate can lift them out
+// of this browser script (test/batonchip.test.mjs); the HTML and the escaping stay at the call sites,
+// exactly the way railRole/coordTip split it.
+//
+// WHERE THE CHIP LANDS, and it is not obvious: `batonFor` is keyed on the CARD's uid, and a PROJECT
+// card's uid is the session bound to it. So when a coordinator takes the lane the chip appears on the
+// project card (JARVIS), never on a card named after the session. That is the honest place for it --
+// the project is what is merging -- but it means neither of these may assume a plain NATO card.
+
+// Which end of the lane this card is on: 'holder' (the one session cleared to merge), 'waiter' (queued
+// behind it), or null -- which is the normal state and must render nothing at all.
+function batonRole(b) {
+    const t = b && b.baton;
+    if (!t || typeof t !== 'object') return null;
+    if (t.holding) return 'holder';
+    // A queue entry is only meaningful with its position, since both the label and the tooltip quote
+    // it: "LANE #undefined" on Chris's board would be worse than no chip.
+    return Number(t.position) > 0 ? 'waiter' : null;
+}
+// The chip face. Deliberately tiny: it shares a flex row with the doing-line on a rail Chris keeps
+// pinned at 2/5 of his window, so the repo key and the base go in the tooltip where they cost no width.
+function batonLabel(b) {
+    const role = batonRole(b);
+    if (!role) return '';
+    return role === 'holder' ? 'LANE' : 'LANE #' + b.baton.position;
+}
+// The callsigns queued BEHIND this holder, in the order they will be served -- the waiting strip's
+// whole content. Empty for anyone who is not the holder, and for a holder with a clear lane.
+function batonQueue(b) {
+    if (batonRole(b) !== 'holder') return [];
+    const q = b.baton.queue;
+    return (Array.isArray(q) ? q : [])
+        .filter(x => x != null && String(x).trim() !== '')
+        .map(x => String(x).toUpperCase());
+}
+// The tooltip. PLAIN TEXT on purpose: the call site escapes it (same division of labour as coordTip,
+// and pinned by a test, so nobody "helpfully" double-escapes it into &quot; in Chris's tooltip). It
+// answers what the chip is too small to say -- which repo, off which base, and who is blocked.
+function batonTip(b) {
+    const role = batonRole(b);
+    if (!role) return '';
+    const t = b.baton;
+    const repo = t.repo ? String(t.repo) : 'this repo';
+    const base = t.base ? ', base ' + t.base : '';
+    if (role === 'holder') {
+        const q = batonQueue(b);
+        return 'HOLDS THE MERGE LANE for ' + repo + base
+            + ' -- the only session cleared to merge right now. '
+            + (q.length
+                ? (q.length === 1 ? '1 waiting behind it: ' : q.length + ' waiting behind it: ') + q.join(', ')
+                : 'Nobody is waiting.');
+    }
+    const who = t.holder ? String(t.holder).toUpperCase() : '';
+    const of = Number(t.waiting) > 0 ? ' of ' + t.waiting : '';
+    return 'WAITING for the ' + repo + ' merge lane' + base
+        + ' -- position ' + t.position + of + '. '
+        // A queue with no holder is a lane mid-reap, not a stuck one. Saying so stops the strip reading
+        // as a deadlock Chris has to go and break by hand.
+        + (who ? who + ' holds it.' : 'No holder recorded, so the lane should grant on the next sweep.');
+}
 // Mission rail: the pinned, always-visible objectives panel (#mission, separate from #work).
 // Phase rows toggle done on click; doc chips open via the document-level data-open listener.
 // There is deliberately NO close control — a mission is closed only by the voice gate.
@@ -852,11 +921,20 @@ function renderMissions(list, boards) {
         // and read as a third peer.
         const chip = role === 'coord'
             ? '<span class="coordchip" title="' + escAttr(coordTip(b)) + '">COORD</span>' : '';
+        // ...and whether it is holding or waiting on the MERGE LANE. On the rail as well as the board
+        // card, because the rail is the panel Chris actually keeps pinned: a lane visible only on the
+        // cards is still invisible at the moment two sub-workers under one mission are both claiming to
+        // be ready to land. No waiting strip here -- the row is a single squeezed flex line, so the
+        // queue lives in the chip's tooltip and on the card below.
+        const lrole = batonRole(b);
+        const lane = lrole
+            ? '<span class="batonchip ' + lrole + '" title="' + escAttr(batonTip(b)) + '">' + esc(batonLabel(b)) + '</span>' : '';
         return '<div class="mworker ' + role + (idle ? ' idle' : '') + '" style="display:flex;align-items:baseline;gap:6px;font-size:11px;padding:2px 0' + (sub ? ' 2px 12px' : '') + ';color:' + (idle ? '#6b7a89' : '#9bb0c4') + '">'
             + (sub ? '<span style="color:#3d5568;font-size:10px">&#8627;</span>' : '')
             + '<span style="font-weight:bold;color:' + (idle ? '#6b7a89' : '#c9b98a') + ';letter-spacing:.5px">' + esc(cs) + '</span>'
             + who
             + chip
+            + lane
             + activityIndicator(b)
             + '<span style="opacity:.9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(doing) + '</span>'
             + '</div>';
@@ -1065,7 +1143,22 @@ function renderBoards(d) {
         const act = activityIndicator(b);
         const watch = watchIndicator(b);
         const wedge = wedgeIndicator(b);
-        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + act + worker + ctx + watch + wedge + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
+        // Merge lane, in the card title next to the other state chips. Named laneChip/laneStrip and NOT
+        // `lane`: this scope already binds `lane` to the task-list renderer below, and a const in the
+        // same block would be a TDZ ReferenceError that takes the whole board render down.
+        const lrole = batonRole(b);
+        const laneChip = lrole
+            ? ' <span class="batonchip ' + lrole + '" title="' + escAttr(batonTip(b)) + '">' + esc(batonLabel(b)) + '</span>' : '';
+        // The waiting strip: who is queued behind this holder, in the order they will be served. The
+        // chip says who is MERGING; this says who is BLOCKED, which is the half that decides whether a
+        // lane sitting still for ten minutes is fine or needs Chris to intervene.
+        const lq = batonQueue(b);
+        const laneStrip = lq.length
+            ? '<div class="blane" title="' + escAttr('queued behind ' + cs.toUpperCase() + ' on the '
+                + ((b.baton && b.baton.repo) || 'repo') + ' merge lane, in the order they will be served')
+                + '">&#8627; lane queue: ' + lq.map(n => '<span class="blq">' + esc(n) + '</span>').join(', ') + '</div>'
+            : '';
+        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + act + worker + ctx + watch + wedge + laneChip + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
         const purpose = b.purpose ? '<div class="cpurpose">' + esc(b.purpose) + '</div>' : '';
         const doing = (b.needsYou || b.doing) ? '<div class="bdoing">' + (b.needsYou ? '<span class="needs">NEEDS YOU</span> ' : '') + esc(b.doing || '') + '</div>' : '';
         const counts = (working.length || queued.length || review.length || done.length) ? '<div class="ccount">'
@@ -1159,7 +1252,7 @@ function renderBoards(d) {
         const pcount = b.pendingPermCount || 0;
         const batch = pcount > 1 ? '<div class="permbatch"><span class="pbtn ok" data-act="approveall" data-cs="' + esc(b.callsign) + '">Approve all (' + pcount + ')</span><span class="pbtn no" data-act="denyall" data-cs="' + esc(b.callsign) + '">Deny all</span></div>' : '';
         const perm = pp ? '<div class="permreq' + (pp.klass === 'danger' ? ' permdanger' : '') + '"><div class="permhead">' + (pp.klass === 'danger' ? '&#9888; RISKY: ' : '&#9888; ') + 'wants to run <b>' + esc(pp.tool) + '</b></div><div class="permdetail">' + esc((pp.detail || '').slice(0, 240)) + '</div><div class="permbtns"><span class="pbtn ok" data-act="approve" data-permid="' + esc(pp.id) + '">Approve</span><span class="pbtn no" data-act="deny" data-permid="' + esc(pp.id) + '">Deny</span><span class="pbtn" data-act="always" data-permid="' + esc(pp.id) + '" title="auto-allow this command family from now on">Always: ' + esc(pp.label || pp.tool) + '</span></div>' + batch + '</div>' : '';
-        return '<div class="card' + (focused ? ' cfocus' : '') + (dead ? ' cdead' : '') + ((b.needsYou || b.pendingPerm) ? ' cneeds' : '') + '" data-cs="' + esc(cs) + '">' + head + purpose + perm + doing + pctx + counts + tasks + '</div>';
+        return '<div class="card' + (focused ? ' cfocus' : '') + (dead ? ' cdead' : '') + ((b.needsYou || b.pendingPerm) ? ' cneeds' : '') + '" data-cs="' + esc(cs) + '">' + head + purpose + perm + doing + laneStrip + pctx + counts + tasks + '</div>';
     }).join('');
     const deadN = d.boards.filter(b => b.alive === false && b.callsign !== 'jarvis').length;
     if (deadN > 1) workEl.innerHTML = '<div style="margin-bottom:8px"><span class="cbtn" data-act="continueall" style="opacity:1;color:#5db4d9;font-weight:bold;font-size:12px">🚀 continue all (' + deadN + ')</span></div>' + workEl.innerHTML;
