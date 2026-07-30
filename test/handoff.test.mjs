@@ -451,10 +451,20 @@ test('HANDOFF: what happened to the in-flight work is stated in the RECORD, not 
             return !existsSync(started.C.wt);
         }, 30000);
 
-        // Retire one at a time and read each record BEFORE the next retire lands. The rig's stub worker
-        // registers with its OWN fixed purpose, so all three sessions share one handoffKey(cwd, purpose)
-        // and the durable slot is overwritten on every retire -- read them all at the end and only the
-        // last one exists. (Not a defect in the key: three real jobs carry three purposes.)
+        // Retire one at a time and read each record before the next retire lands. That ordering used to
+        // be load-bearing and INSUFFICIENT: the rig gave every stub the same cwd and the same fixed
+        // purpose, so all three shared one handoffKey(cwd, purpose) and one durable slot. Ordering the
+        // retires only controls the writes this test makes -- and C's host is deliberately killed above,
+        // so the HUB retires charlie on its own schedule and files under that same shared key. When that
+        // landed between B's retire and B's read, B's record was destroyed and this test failed with
+        // "no handoff record filed for B", which reads like a filing bug and is not one.
+        // MEASURED, because the source said a race here should be impossible (retireSession is
+        // synchronous, files in memory, and roster is a const that is never reassigned): three
+        // independent captures, each polling this endpoint 184 times over 20s. The record NEVER
+        // appeared, and the one key on disk held from:charlie every time. So it was destroyed, not late
+        // -- which is why a waitFor here would have hung for 20 seconds and still failed.
+        // The rig now puts the callsign in each stub's purpose, so every session owns its own slot.
+        // Left as three separate reads anyway: it is the stricter assertion, and it is what caught this.
         const recs = {};
         for (const k of ['A', 'B', 'C']) {
             const bye = await hub.post('/retire', {
