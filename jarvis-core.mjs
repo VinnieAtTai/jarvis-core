@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, unlinkSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, renameSync, unlinkSync, rmdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +9,7 @@ import { captureScreen } from './screen.mjs';
 import * as stt from './stt.mjs';
 import { scanUsage, totalsOf, blockStats, burnOf, heatOf } from './tokens.mjs';
 import { fetchRealUsage } from './usage.mjs';
-import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsolate, orphanWorktrees, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
+import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsolate, orphanWorktrees, worktreeRemoval, reconcileRoster, buildIdentity } from './jarvis-text.mjs';
 import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap, isBatonQuestion, speakBaton } from './jarvis-text.mjs';
 import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote, reconstructHandoff, spawnDispatch } from './jarvis-text.mjs';
 import { CMD_LINE_MAX, BOOT_PROMPT_MAX, capBootPrompt } from './jarvis-text.mjs';
@@ -1808,6 +1808,15 @@ function wtDirs(root) {
     try { return readdirSync(root, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => join(root, d.name)); }
     catch { return []; }
 }
+// When a directory was CREATED, for the sweep's age floor (orphanWorktrees). birthtime is the right
+// question and mtime is the wrong one: a directory's own mtime only moves when its entries change, so
+// a gate writing files INSIDE a tree never refreshes it, and a dead tree's mtime is frozen wherever it
+// happened to stop -- neither one tracks "somebody is using this". null when the filesystem will not
+// say, which the age gate reads as unmeasured and falls through on rather than sparing everything.
+function dirBorn(p) {
+    try { const st = statSync(p); return st.birthtimeMs || st.ctimeMs || st.mtimeMs || null; }
+    catch { return null; }
+}
 // The pending worktree for a callsign the hub just spawned, held until that worker registers —
 // mirroring pendingPins/pendingTier/pendingBind, TTL-swept on the same 5-minute window. The worker
 // registers with the cwd it BOOTED in (the worktree), which resolves to no configured repo; this is
@@ -1912,11 +1921,14 @@ function makeWorktree(repo, cs, inheritBranch) {
 function teardownWorktree(s, cs) {
     if (!s || !s.worktree) return null;
     const wtPath = s.worktree, repoCwd = s.cwd || '', branch = s.branch || '?';
+    // Whether the directory was there when we ARRIVED. Captured before anything touches it, because
+    // "already gone" and "we destroyed it" are different facts and the log has to tell them apart.
+    const existedBefore = existsSync(wtPath);
     // 'unknown' until the status check actually runs, never 'none' by default: a missing directory and
     // a clean one are different facts, and only one of them means nobody has to go and look.
     let wip = 'unknown';
     try {
-        if (existsSync(wtPath)) {
+        if (existedBefore) {
             const dirty = gitOut(wtPath, ['status', '--porcelain'], WT_TIMEOUT);
             wip = 'none';
             if (dirty) {
@@ -1933,21 +1945,31 @@ function teardownWorktree(s, cs) {
         if (!repoCwd) { record({ kind: 'sys', text: 'worktree for ' + cs + ' has no home repo to remove it from; KEPT at ' + wtPath }); return { state: 'kept', wip }; }
         const ok = gitOut(repoCwd, ['worktree', 'remove', wtPath, '--force'], WT_TIMEOUT) !== null;
         gitOut(repoCwd, ['worktree', 'prune'], WT_TIMEOUT);
-        // git's exit code is not proof the directory is gone. Measured 2026-07-27 in a throwaway
-        // repo: with a node_modules JUNCTION inside the worktree (what a worker needs to run a hub
-        // from one at all), `worktree remove --force` exits 0, drops the entry from `worktree list`
-        // and deletes every real file -- then leaves the directory, junction included, on disk. And
-        // because git has already forgotten the worktree, the `prune` above cannot finish the job,
-        // so it is stranded for good. It does NOT follow the junction; the real node_modules is
-        // safe. The damage is purely that we logged a removal that did not happen. Ask the
-        // filesystem, which is the thing the claim is actually about.
-        const gone = !existsSync(wtPath);
-        record({ kind: 'sys', text: !ok
-            ? 'worktree remove FAILED for ' + cs + ' at ' + wtPath + '; branch ' + branch + ' kept'
-            : gone
-                ? 'worktree for ' + cs + ' removed; branch ' + branch + ' kept for merge'
-                : 'git reported removing ' + cs + ' worktree but ' + wtPath + ' is STILL THERE (a junction or open handle inside blocks it, and git has already forgotten the worktree so prune cannot help); branch ' + branch + ' kept' });
-        return { state: ok && gone ? 'removed' : 'kept', wip };
+        // git's exit code is not proof of anything this log wants to claim, in EITHER direction, and
+        // both directions have now been measured.
+        //
+        // 2026-07-27, throwaway repo: with a node_modules JUNCTION inside the worktree (what a worker
+        // needs to run a hub from one at all), `worktree remove --force` exits 0, drops the entry from
+        // `worktree list` and deletes every real file -- then leaves the directory, junction included,
+        // on disk. It does NOT follow the junction; the real node_modules is safe.
+        //
+        // 2026-07-30, live hub, the mirror image and the worse one: a remove that exited NON-zero had
+        // still deleted the contents and deregistered the tree, because git drops the administrative
+        // .git/worktrees/<id> entry whether or not the recursive delete succeeded. We logged "FAILED
+        // ... branch kept" over what was already an empty shell. So ask the filesystem, and ask it the
+        // question the claim is actually about: is this still a checkout at all? worktreeRemoval
+        // (jarvis-text.mjs) turns the answer into the line, and carries the measurements.
+        let exists = existsSync(wtPath);
+        // A worktree's .git is a FILE pointing into the parent repo. If it is gone, or git can no
+        // longer resolve the directory, the contents went with it and what is left is a husk.
+        const intact = exists && existsSync(join(wtPath, '.git')) && gitOut(wtPath, ['rev-parse', '--git-common-dir']) !== null;
+        // Collect the husk, because that litter is systematic -- one measured sweep left three of them.
+        // rmdirSync is safe here BY CONSTRUCTION: it refuses a directory that is not empty, so the
+        // worst case is the shell staying exactly where it is and the log saying so.
+        if (exists && !intact) { try { rmdirSync(wtPath); } catch { } exists = existsSync(wtPath); }
+        const out = worktreeRemoval({ ok, existedBefore, exists, intact, cs, path: wtPath, branch });
+        record({ kind: 'sys', text: out.text });
+        return { state: out.state, wip };
     } catch (e) {
         try { record({ kind: 'sys', text: 'worktree teardown errored for ' + cs + ' (' + (e && e.message) + '); ' + wtPath + ' left in place' }); } catch { }
         return { state: 'kept', wip };
@@ -2132,23 +2154,43 @@ function sweepWorktrees(hosts) {
             const root = worktreeRoot(r.cwd, WT_ROOT_ENV);
             if (root && existsSync(root)) roots.set(cwdKey(root), root);
         }
-        const dirs = [];
-        for (const root of roots.values()) dirs.push(...wtDirs(root));
+        // Everything the three session-free gates in orphanWorktrees need, measured once per
+        // directory: when it was created, and what it is checked out on. The branch costs nothing
+        // extra -- the teardown call below has always had to name it -- it is just read early enough
+        // now to PROTECT a tree instead of only labelling its destruction.
+        const entries = [];
+        for (const root of roots.values()) {
+            for (const p of wtDirs(root)) entries.push({ path: p, createdAt: dirBorn(p), branch: gitOut(p, ['rev-parse', '--abbrev-ref', 'HEAD']) || '' });
+        }
         // Two claims that outrank the heartbeat test inside orphanWorktrees: a live host pid (the
         // worker is provably running, whatever its lastSeen says) and a pending worktree (cut for a
         // worker that has not registered yet, so no session row mentions it at all).
         const claimed = [];
         for (const rec of (hosts || new Map()).values()) if (rec && rec.worktree && rec.worktree.path) claimed.push(rec.worktree.path);
         for (const v of pendingWorktree.values()) if (v && v.path) claimed.push(v.path);
-        const orphans = orphanWorktrees(dirs, roster.sessions, Date.now(), { claimed });
+        // `keys` is what arms the name gate: only a directory the hub could itself have minted for one
+        // of these repos is collectable at all. The WHOLE configured set deliberately, not just the
+        // repos that contributed a root, because one WT_ROOT is shared by every repo sitting beside it.
+        const orphans = orphanWorktrees(entries, roster.sessions, Date.now(), { claimed, keys: Object.keys(repos) });
+        const byPath = new Map(entries.map(e => [cwdKey(e.path), e]));
         for (const p of orphans) {
             // A worktree's .git is a FILE pointing at the parent repo. No .git at all means this is
             // some other directory that wandered into WT_ROOT — never touch it.
-            if (!existsSync(join(p, '.git'))) continue;
+            if (!existsSync(join(p, '.git'))) {
+                // No .git means this is not a checkout: either a directory that wandered into WT_ROOT,
+                // or the EMPTY SHELL a part-failed remove left behind -- and those used to accumulate
+                // forever, because this guard skipped them and nothing else ever looked. The name gate
+                // above has already established the name is one the hub mints, so a shell here is our
+                // own litter and ours to finish. rmdirSync refuses a directory that is not empty, so
+                // anything with contents is left exactly where it is, guard intact.
+                try { rmdirSync(p); record({ kind: 'sys', text: 'boot sweep: cleared the empty shell a failed worktree remove left at ' + p }); } catch { }
+                continue;
+            }
             const owner = Object.values(roster.sessions).find(x => x && x.worktree && cwdKey(x.worktree) === cwdKey(p));
             const common = gitOut(p, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
             const repoCwd = (owner && owner.cwd) || (common ? dirname(common.replace(/\\/g, '/').replace(/\/+$/, '')) : '');
-            teardownWorktree({ worktree: p, cwd: repoCwd, branch: (owner && owner.branch) || gitOut(p, ['rev-parse', '--abbrev-ref', 'HEAD']) || '?', purpose: 'left behind by a dead session' },
+            const entry = byPath.get(cwdKey(p));
+            teardownWorktree({ worktree: p, cwd: repoCwd, branch: (owner && owner.branch) || (entry && entry.branch) || '?', purpose: 'left behind by a dead session' },
                 (owner && owner.callsign) || 'a dead session');
         }
         if (orphans.length) record({ kind: 'sys', text: 'boot sweep: collected ' + orphans.length + ' orphaned worktree' + (orphans.length === 1 ? '' : 's') });
