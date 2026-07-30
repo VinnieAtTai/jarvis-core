@@ -133,6 +133,60 @@ export function shortTitle(s) {
     return t.split(/\s+/).slice(0, 7).join(' ').slice(0, 50);
 }
 
+// Board readability: split agent-written prose into a HEADLINE and the DETAIL behind it.
+//
+// The board fills with card text written for the next session rather than for the human reading it
+// -- shas, line numbers, parentheticals, three lines of it per card ("I can not understand half of
+// whats in there" -- Chris, 2026-07-30). The fix is a RENDERER change and deliberately NOT a
+// migration: the stored string is never rewritten, so nothing is lost and a board being watched
+// live does not churn under him mid-read.
+//
+// The split point is the FIRST of:
+//   - ' -- ' (space dash dash space). Already the house separator -- em dashes are banned here
+//     because curl.exe on Windows mangles non-ASCII into tofu, so this is what every session
+//     already types, which is why today's cards split sensibly with no migration.
+//   - a line break, because a "headline" that wraps to three lines IS the defect being fixed.
+// With neither, a long line is truncated on a word boundary; the expander then shows the whole
+// string, which is what makes this work on the cards that already exist.
+//
+// `hasMore` is the caller's only real question: does this line need an expander? Note the two ways
+// it becomes true (there is detail after a separator, OR the headline itself was too long) -- a
+// caller that keys off `detail` alone silently drops the expander on every long unseparated card,
+// which is the majority of what is on the board today.
+export function splitHeadline(text, max = 80) {
+    const s = String(text == null ? '' : text).replace(/\r/g, '').trim();
+    // No early return for the empty string: mutation probing showed the guard that used to sit here
+    // was unreachable-by-behaviour, because '' falls through to exactly the same object (no
+    // separator, no line break, nothing to truncate). It was deleted rather than left as a line no
+    // test could ever fail on.
+    const iSep = s.indexOf(' -- ');
+    const iNl = s.indexOf('\n');
+    // Earliest break wins. The two separators consume different numbers of characters, so the skip
+    // travels with the choice rather than being applied afterwards.
+    let cut = -1, skip = 0;
+    if (iSep >= 0 && (iNl < 0 || iSep < iNl)) { cut = iSep; skip = 4; }
+    else if (iNl >= 0) { cut = iNl; skip = 1; }
+    let headline = cut >= 0 ? s.slice(0, cut).trim() : s;
+    const detail = cut >= 0 ? s.slice(cut + skip).trim() : '';
+    // A card edited down can be left ending in a dangling separator ("Board readability -- "). The
+    // outer trim() eats its trailing space before we ever look for ' -- ', so no split happens and
+    // the dash would render on the card face pointing at nothing. Strip the remnant instead.
+    headline = headline.replace(/\s+--$/, '');
+    // A first clause can itself be a paragraph (plenty of today's cards are), so the headline is
+    // capped whether or not it was separated. Cut on a word boundary, but only if that boundary is
+    // late enough to still be a sentence -- one enormous leading token (a path, a sha) would
+    // otherwise collapse the line to almost nothing.
+    let truncated = false;
+    if (headline.length > max) {
+        const sp = headline.lastIndexOf(' ', max);
+        headline = headline.slice(0, sp > max * 0.6 ? sp : max).trim() + '...';
+        truncated = true;
+    }
+    // `headline` can exceed `max` by the 3 characters of the ellipsis; callers size for the text,
+    // not for an exact budget.
+    return { headline, detail, truncated, hasMore: !!detail || truncated };
+}
+
 // Spoken summary of one board's open work: counts plus a headline task, NOT every task read out
 // verbatim — Chris asked for read-back to be summarized. Returns '' when nothing is open so the
 // caller can say "the list is empty". Scope mirrors the old speakBoard: working + queued only.

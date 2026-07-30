@@ -366,6 +366,9 @@ test('DEAD SPAWN: the hub notices a worker that never registers, and says why',
         const goner = await hub.post('/register', { cwd: hub.REPO, purpose: 'a dispatcher that retires first' });
         for (const r of [lead, plain, goner]) assert.ok(r && r.uid, 'a probe session could not register: ' + JSON.stringify(r));
 
+        // Taken before the three later spawns so step 9 can bound their `at` stamps against a real
+        // instant. Checking timestamps only against EACH OTHER is what let a frozen clock through.
+        const t0 = Date.now();
         writeFileSync(join(hub.BIN, 'claude.cmd'), DYING_CLAUDE);
         // S1 signs with a CALLSIGN and S2 with a uid, so both halves of what `from` accepts are under
         // test. /spawn is generous here on purpose -- POST /send already is -- because a coordinator that
@@ -426,6 +429,52 @@ test('DEAD SPAWN: the hub notices a worker that never registers, and says why',
         assert.match(one.text, /freed/, 'the notification does not say the callsign is reusable: ' + one.text);
         assert.match(one.text, new RegExp('worker-' + S1.callsign + '\\.log'),
             'the notification does not point at the evidence: ' + one.text);
+
+        // ---- 9. /roster's dead-spawn list is NEWEST FIRST, and the cap depends on it ---------------
+        // FOUND BY AN INDEPENDENT PROBE, and this one had already escaped: `deadSpawns.unshift` ->
+        // `push` killed no test, and that exact mutation reached production -- the live hub booted on it
+        // with a dirty tree. Nothing here is cosmetic, because the cap two lines below the unshift is
+        // `deadSpawns.length = 10`, which truncates from the END. Newest-first plus drop-the-end means
+        // the cap forgets the OLDEST death, which is right. Append plus drop-the-end means it forgets
+        // the NEWEST one, so past ten deaths /roster would silently stop showing new failures -- the
+        // exact silence this whole feature was built to end, restored by one word.
+        //
+        // Asserted as the general invariant rather than as a fixed sequence: D died in an earlier sweep
+        // pass, minutes before these three, so it must sit BELOW all of them however a single pass
+        // happens to walk its own Map. That is what makes this independent of insertion order.
+        const deadRows = (await hub.get('/roster')).deadSpawns || [];
+        const posOf = (cs) => deadRows.findIndex(x => x.callsign === cs);
+        for (const cs of [S1.callsign, S2.callsign, S3.callsign, D]) {
+            assert.ok(posOf(cs) >= 0, cs + ' is missing from /roster deadSpawns: ' + JSON.stringify(deadRows.map(x => x.callsign)));
+        }
+        for (const cs of [S1.callsign, S2.callsign, S3.callsign]) {
+            assert.ok(posOf(cs) < posOf(D), 'deadSpawns is not newest-first: ' + cs + ' died after ' + D
+                + ' but sits below it, so the cap would drop the NEWEST failures: '
+                + JSON.stringify(deadRows.map(x => x.callsign)));
+        }
+        // Each row's `at` must be a REAL instant, not just consistent with its neighbours. FOUND BY
+        // PROBE: freezing every `at` to epoch 0 survived the ordering checks below, because a
+        // non-strict descending comparison is vacuously true when every value is identical -- so the
+        // invariant I thought was general was only ever as good as the positions it agreed with. It
+        // matters on its own terms too: `at` is how a human reads WHEN a dispatch died, and a row
+        // that has lost its clock still looks perfectly well-formed on /roster.
+        for (const cs of [S1.callsign, S2.callsign, S3.callsign]) {
+            const t = Date.parse(deadRows[posOf(cs)].at);
+            assert.ok(t >= t0, cs + ' has an `at` before it was even launched (' + deadRows[posOf(cs)].at + ')');
+        }
+        assert.ok(Date.parse(deadRows[posOf(D)].at) < t0,
+            D + ' died in an earlier pass but its `at` is not earlier: ' + deadRows[posOf(D)].at);
+
+        // ...and the same claim stated as the invariant the cap actually relies on, so a future change
+        // to how the list is built has one thing to satisfy rather than one example to match. Non-strict
+        // on purpose -- two spawns can share a millisecond -- which is exactly why the bounds above
+        // have to carry the weight of proving the clock is real.
+        const stamps = deadRows.map(x => Date.parse(x.at)).filter(Number.isFinite);
+        assert.equal(stamps.length, deadRows.length, 'a deadSpawns row has no parseable `at`: ' + JSON.stringify(deadRows));
+        for (let i = 1; i < stamps.length; i++) {
+            assert.ok(stamps[i - 1] >= stamps[i], 'deadSpawns is not ordered newest-first at index ' + i
+                + ': ' + JSON.stringify(deadRows.map(x => ({ cs: x.callsign, at: x.at }))));
+        }
 
         // ONCE each, same discipline as step 5. The sweep ticks every few seconds forever, and a report
         // that is sent but not cleared turns one dead worker into an endless drip on a coordinator's
