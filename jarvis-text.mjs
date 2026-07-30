@@ -855,6 +855,45 @@ export function boardKeyFor(cs, sessions, callsigns) {
     return proj || key;
 }
 
+// Sub-worker wedge grace: unchanged at 5 minutes, and deliberately generous. A worker mid-build is
+// honestly unreachable and nobody is waiting on it the way they wait on a coordinator.
+export const WEDGE_GRACE_WORKER = 300000;
+// Coordinator grace, expressed as a MULTIPLE OF THE POLL HOLD rather than a bare number of seconds.
+// Two measured facts set the floor, and both are easy to miss:
+//   - /poll stamps lastPoll when the request ARRIVES and only then holds it open, so a perfectly
+//     healthy idle worker's lastPoll is routinely a whole hold old.
+//   - `pending` stays >0 for the entire duration of a NORMAL turn: pollCursor is the cursor the
+//     worker last polled WITH, so events already delivered count as pending until it relaunches.
+// Together those mean poll age cannot separate "deaf" from "mid-turn" at a seconds scale -- a chip
+// that fires there cries wolf on ordinary work, which is worse than the blind window it replaced.
+// 3.6 holds = 90s at the 25s default, which is the approved figure; but the MULTIPLE is what is
+// load-bearing. Hard-coding 90000 would silently stop being 3.6x the day someone tunes the hold.
+export const WEDGE_GRACE_COORD_HOLDS = 3.6;
+export function coordGraceMs(pollHoldMs) {
+    const hold = Number(pollHoldMs) > 0 ? Number(pollHoldMs) : 25000;
+    return Math.round(hold * WEDGE_GRACE_COORD_HOLDS);
+}
+// Which grace window applies. Pure and injectable: the CALLER decides the role, because reaching
+// into the roster from in here is exactly what would make it untestable. A coordinator only earns
+// the tighter window when something is actually QUEUED behind it -- deaf with nothing waiting is a
+// curiosity on any role, and the tight window on an idle coordinator would fire every time it
+// spent 90 seconds thinking.
+export function wedgeGraceMs({ coordinator = false, pending = 0, pollHoldMs = 25000 } = {}) {
+    return coordinator && pending > 0 ? coordGraceMs(pollHoldMs) : WEDGE_GRACE_WORKER;
+}
+// Escalation, not a single mention: re-announce on a WIDENING schedule for as long as the condition
+// holds. Immediate, then 1min, 3min, 7min, then every 15min -- so a real outage keeps getting louder
+// while a brief one costs exactly one line. The widening is the point: a flat interval is a nag. It
+// also replaces a 5-minute throttle that was shared with the gone-quiet nag and keyed by callsign,
+// so a gone-quiet line silently ate the next wedge line for the same session, and vice versa.
+export const WEDGE_ESCALATE_MS = [0, 60000, 180000, 420000, 900000];
+// `state` is {count, lastAt} for a condition already announced, or null/undefined for a fresh one.
+export function wedgeEscalateDue(state, now) {
+    if (!state || !state.count) return true;
+    const step = WEDGE_ESCALATE_MS[Math.min(state.count, WEDGE_ESCALATE_MS.length - 1)];
+    return now - state.lastAt >= step;
+}
+
 // A session's liveness has TWO independent signals, and they can disagree. `/heartbeat` is a dumb
 // background timer; `/poll` is the worker's actual event loop -- its ears. When the poll loop dies
 // but the heartbeat timer keeps ticking, the session looks perfectly green while being completely
@@ -874,7 +913,7 @@ export function boardKeyFor(cs, sessions, callsigns) {
 // honestly. That is intended: from the human's side, "busy for 6 minutes with my words queued up"
 // and "wedged" are the same outage. `pending` is what separates them -- 0 means nobody is waiting.
 // `now` injected for deterministic tests. Pure: reads, mutates nothing.
-export function wedgeState(s, now, { graceMs = 300000, staleMs = 120000, pending = 0 } = {}) {
+export function wedgeState(s, now, { graceMs = WEDGE_GRACE_WORKER, staleMs = 120000, pending = 0, pendingPerms = 0 } = {}) {
     if (!s || s.ended) return null;
     const beat = Date.parse(s.lastBeat);
     if (!Number.isFinite(beat) || (now - beat) >= staleMs) return null;
@@ -883,8 +922,23 @@ export function wedgeState(s, now, { graceMs = 300000, staleMs = 120000, pending
     const ref = Date.parse(s.lastPoll || s.started);
     if (!Number.isFinite(ref)) return null;
     const deaf = now - ref;
+    // A pending PERMISSION prompt needs no grace window, because it is not an inference. The session
+    // is provably unable to act on anything queued until the human answers -- that is what the prompt
+    // IS -- so waiting out a poll-age threshold before saying so only delays a certainty. This is the
+    // ONLY path that reports in seconds, and it is why role-aware grace alone could not deliver what
+    // was asked for. It requires something queued: a permission prompt with nobody waiting on the
+    // session is ordinary operation, and announcing that would be the false alarm this exists to avoid.
+    if (pendingPerms > 0 && pending > 0) return wedgeReport(deaf, pending, pendingPerms, 'perm');
     if (deaf < graceMs) return null;
-    return { minutes: Math.floor(deaf / 60000), pending };
+    return wedgeReport(deaf, pending, pendingPerms, 'deaf');
+}
+// `minutes` is FLOORED and kept exactly as it always was -- /board renders it and tests assert on it,
+// so a shape change would land as breakage in surfaces this file does not own. `seconds` is ADDED
+// beside it, because sub-minute outages floor to zero minutes: a 45-second block rendered as
+// "DEAF 0m" and spoke as "has not checked its inbox in 0 minutes", which is how a new threshold
+// ships an old bug. `reason` lets a surface say WHY without re-deriving it.
+function wedgeReport(deaf, pending, pendingPerms, reason) {
+    return { minutes: Math.floor(deaf / 60000), seconds: Math.floor(deaf / 1000), pending, pendingPerms, reason };
 }
 
 // Did this session's poll cursor JUMP -- arrive at an index higher than the one the hub last handed
