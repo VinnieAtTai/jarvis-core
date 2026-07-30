@@ -144,6 +144,21 @@ body{background:#0b0f14;color:#d7e3f0;font:14px/1.5 Consolas,"Segoe UI Emoji","S
 .mdoc{font-size:11px;color:#5db4d9;border:1px solid #1f3340;border-radius:5px;padding:1px 7px;cursor:pointer}
 .mdoc:hover{border-color:#5db4d9}
 .mmsg{font-size:11px;color:#566270;margin-top:6px;font-style:italic}
+/* COORD chip: which row on the rail is the coordinator -- the brain that holds the project context
+   and dispatches the sub-workers indented under it. Deliberately quiet and INFORMATIONAL: the sizing
+   is the board's 3-letter category chip (.tchip), and the colour is the console's plain blue rather
+   than the DEAF amber or the needs-you red, because this states a role, it does not raise an alarm. */
+.coordchip{font:bold 9px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;letter-spacing:.5px;color:#6fa8cc;background:#0d1a24;border:1px solid #24485e;border-radius:3px;padding:0 4px;cursor:help}
+/* The row is a flex line whose doing-text ellipsises to fit, so its siblings must not be squeezed to
+   make room for it. "&#183; ALPHA" contains a space, so its min-content width is only as wide as ALPHA and
+   the middot wraps away without this. The chip needs no such rule and deliberately does not carry one:
+   COORD is a single unbreakable word, so min-content already floors it -- measured, by removing
+   flex:none there and watching the narrow-window check stay green. */
+.mworker .cworker{flex:none}
+/* A coordinator whose session has gone quiet greys with its row: the role is still true, but a dead
+   brain must not read as the authoritative one. */
+.mworker.idle .coordchip{color:#5b7385;background:#0d1420;border-color:#1f2c3a}
+.mworker.idle .cworker{color:#5b6a7d}
 .mission .mitem+.mitem{margin-top:11px;padding-top:11px;border-top:1px solid #1f2c3a}
 #stabs{display:flex;gap:5px;flex-wrap:wrap;align-items:center;padding:0 0 8px;border-bottom:1px solid #1f2c3a;margin-bottom:2px}
 .stab{background:#16202c;border:1px solid #1f2c3a;color:#9bb0c4;border-radius:6px;padding:4px 12px;cursor:pointer;font:bold 12px Consolas,"Segoe UI Emoji","Segoe UI Symbol",monospace;letter-spacing:1px}
