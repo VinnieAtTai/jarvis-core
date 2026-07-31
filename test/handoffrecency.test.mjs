@@ -58,10 +58,40 @@ test('pickHandoff -- an exact hit that IS the newest keeps its own key, and is n
 test('pickHandoff -- STRICTLY newer: an equal timestamp does not displace the exact hit', () => {
     // Whole-second or same-millisecond ties are real (two retires in one pump), and iteration order
     // must not be what decides the answer.
-    const s = STORE();
-    s[handoffKey(CWD, QUEBEC_PURPOSE)].ts = STALE.ts;
+    //
+    // BOTH INSERTION ORDERS, and the second one is the whole test. A mutation probe killed the
+    // first-order-only version of this: with the exact record inserted FIRST it wins the scan anyway,
+    // so dropping the `strictly newer` guard entirely still passed. The fixture never reached the
+    // guard -- it was under-fed, not passing. Only the tied record sitting EARLIER in key order
+    // distinguishes "the guard held" from "the loop happened to see the right one first".
+    const exactFirst = {
+        [handoffKey(CWD, GOLF_PURPOSE)]: { ...STALE },
+        [handoffKey(CWD, QUEBEC_PURPOSE)]: { ...FRESH, ts: STALE.ts },
+    };
+    const otherFirst = {
+        [handoffKey(CWD, QUEBEC_PURPOSE)]: { ...FRESH, ts: STALE.ts },
+        [handoffKey(CWD, GOLF_PURPOSE)]: { ...STALE },
+    };
+    for (const [label, s] of [['exact first', exactFirst], ['other first', otherFirst]]) {
+        const p = pickHandoff(s, CWD, GOLF_PURPOSE);
+        assert.equal(p.rec.from, 'papa', 'a tie flipped the answer (' + label + '), so key order is deciding whose notes a successor reads');
+        assert.equal(p.servedKey, handoffKey(CWD, GOLF_PURPOSE), 'the tie was served under the wrong key (' + label + ')');
+        assert.equal(p.viaRecency, false);
+    }
+});
+
+test('pickHandoff -- an exact record that is not a cwd candidate still beats an OLDER one', () => {
+    // The other input class that reaches the strictly-newer guard. A record with no `cwd` field is
+    // excluded from the recency scan (it is not on any cwd), so `best` can be genuinely OLDER than
+    // the exact hit -- the one arrangement where the comparison, not the scan, decides. Legacy and
+    // half-written records really do lack cwd; the exact slot is still this job's own answer.
+    const s = {
+        [handoffKey(CWD, GOLF_PURPOSE)]: { from: 'papa', purpose: GOLF_PURPOSE, notes: 'mine, and newer', ts: '2026-07-30T23:00:00.000Z' },
+        [handoffKey(CWD, QUEBEC_PURPOSE)]: { ...FRESH },
+    };
+    delete s[handoffKey(CWD, GOLF_PURPOSE)].cwd;
     const p = pickHandoff(s, CWD, GOLF_PURPOSE);
-    assert.equal(p.rec.from, 'papa', 'a tie flipped the answer, so key order is deciding whose notes a successor reads');
+    assert.equal(p.rec.from, 'papa', 'an OLDER record on the cwd displaced a NEWER exact hit');
     assert.equal(p.viaRecency, false);
 });
 
