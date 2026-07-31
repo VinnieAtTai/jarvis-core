@@ -13,7 +13,7 @@ import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsola
 import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap, isBatonQuestion, speakBaton } from './jarvis-text.mjs';
 import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote, reconstructHandoff, spawnDispatch } from './jarvis-text.mjs';
 import { CMD_LINE_MAX, BOOT_PROMPT_MAX, capBootPrompt } from './jarvis-text.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, wedgeGraceMs, wedgeEscalateDue, cursorGap, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, pickHandoff, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, wedgeGraceMs, wedgeEscalateDue, cursorGap, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // What code is actually RUNNING, resolved once at load and stated out loud.
@@ -1395,13 +1395,24 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
     // Hand every worker the running build. This is the cheapest place to kill the "merged means
     // deployed" error for good: a session learns what code it is talking to before it does any work.
     const out = { uid, callsign: cs, build: BUILD };
-    // Tell a fresh session if a predecessor on this SAME JOB (cwd + purpose) left a handoff —
-    // covers the manual "kill the terminal and start over" path that never goes through
-    // spawnWorker. Scoping by purpose stops a new worker inheriting a different job's notes when
-    // several jobs share one cwd. The hint carries the purpose so the follow-up GET resolves.
+    // Tell a fresh session if a predecessor on this cwd left a handoff — covers the manual "kill the
+    // terminal and start over" path that never goes through spawnWorker. WHICH record is pickHandoff's
+    // decision, not this line's: the per-job (cwd + purpose) slot is preferred, but it does NOT
+    // outrank a strictly newer record on the same cwd, because a purpose that differs by one word
+    // used to strand a predecessor's notes where nobody could reach them. GET /handoff below asks the
+    // same function, so the hint and the follow-up fetch cannot resolve to different records; and
+    // servedKey travels with the answer, since being handed another job's notes is otherwise silent.
     roster.handoffs = roster.handoffs || {};
-    const h = cwd ? roster.handoffs[handoffKey(cwd, purpose)] : null;
-    if (h) out.handoff = { summary: h.summary, from: h.from, ts: h.ts, hint: 'GET /handoff?cwd=' + encodeURIComponent(cwd) + '&purpose=' + encodeURIComponent(purpose || '') + ' for full notes, then resume.' };
+    const h = cwd ? pickHandoff(roster.handoffs, cwd, purpose) : null;
+    if (h) out.handoff = {
+        summary: h.rec.summary, from: h.rec.from, ts: h.rec.ts, servedKey: h.servedKey,
+        ...(h.viaRecency ? {
+            servedViaRecency: true,
+            note: 'This is the NEWEST handoff on this cwd, filed under a different purpose than yours ('
+                + (h.rec.purpose || '(none)') + '). Read it before you assume it is your own job.',
+        } : {}),
+        hint: 'GET /handoff?cwd=' + encodeURIComponent(cwd) + '&purpose=' + encodeURIComponent(purpose || '') + ' for full notes, then resume.',
+    };
     if (proj) { try { out.project = projectContextFor(proj); } catch { } }   // rehydrate on register (model B)
     return out;
 }
@@ -3166,10 +3177,15 @@ function handleUtterance(rawText, typed) {
         const hit = findTaskAll(w, m[1].trim(), ['working', 'queued', 'done'], w.focus);
         if (!hit) { enqueueSay('Nothing matching ' + m[1].trim() + '.', 'jarvis'); return; }
         const [t] = w.sessions[hit.cs][hit.list].splice(hit.i, 1);
-        ensureBoard(w, to).queued.push(t);
+        // csFrom answers a SESSION -- it has to, only a live callsign is a legal destination -- and a
+        // bound coordinator's session is not its board. Speak the BOARD rather than the name Chris
+        // used: "moved to juliet" while the card landed on the primeng column is the same false green
+        // as minting the second board was.
+        const dest = boardKey(to);
+        ensureBoard(w, dest).queued.push(t);
         saveWork(w);
-        record({ kind: 'task', op: 'move', task: textOf(t), from: hit.cs, board: to });
-        enqueueSay('Moved to ' + to + '.', 'jarvis');
+        record({ kind: 'task', op: 'move', task: textOf(t), from: hit.cs, board: dest });
+        enqueueSay('Moved to ' + dest + '.', 'jarvis');
         return;
     }
     if (after(/read (?:everyone'?s'?|all)(?: the)? (?:list|lists|tasks)\b/)) {
@@ -3188,6 +3204,11 @@ function handleUtterance(rawText, typed) {
             const cs = csFrom(fm[2]);
             if (cs) { target = cs; body = fm[1].trim(); }
         }
+        // "...for juliet" names a session; its work belongs on the column that session is bound to.
+        // w.focus is already a board key and boardKey is idempotent, so this is safe on both arms --
+        // and the "Added." vs "Added to X." choice below now compares BOARDS, which is the question
+        // it was always asking: did this land somewhere other than what Chris is looking at.
+        target = boardKey(target);
         ensureBoard(w, target).queued.push(makeTask(body));
         saveWork(w);
         record({ kind: 'task', op: 'add', board: target, task: body });
@@ -4485,9 +4506,15 @@ async function handleRequest(req, res) {
             const hit = findTaskAll(w, needle, ['working', 'queued', 'done'], cs);
             if (!hit) return json(res, 404, { error: 'no task matching ' + needle });
             const [t] = w.sessions[hit.cs][hit.list].splice(hit.i, 1);
-            ensureBoard(w, String(b.to).toLowerCase()).queued.push(t);
+            // The DESTINATION needs boardKey exactly as much as the POSTER did -- see the comment at
+            // the top of this route, which explained the bug and then fixed only one of the two ends.
+            // Moving a card onto a bound coordinator's NATO callsign minted the second board all over
+            // again, and `owner` below is not just a log line: it keys the record and the store row,
+            // so a raw destination there files the task under a board it does not live on.
+            const to = boardKey(String(b.to).toLowerCase());
+            ensureBoard(w, to).queued.push(t);
             task = t;
-            owner = String(b.to).toLowerCase();   // the row follows the task to its new board
+            owner = to;                           // the row follows the task to its new board
             from = hit.cs;                        // ...and the record still says where it came from
             lane = 'queued';
         } else if (b.op === 'clear-done') {
@@ -4624,17 +4651,15 @@ async function handleRequest(req, res) {
             saveRoster();
         } else if (cwdq) {
             // Durable per-job record, keyed by cwd + purpose (register hands back a hint that
-            // carries the purpose). Bare legacy calls with no purpose fall back to the most recent
-            // record on that cwd so an old-style GET /handoff?cwd=... still resolves.
+            // carries the purpose). pickHandoff owns the ordering: an exact hit does not outrank a
+            // strictly NEWER record on the same cwd -- that is what served golf a day-old record
+            // belonging to another session -- and a bare legacy call with no purpose still resolves
+            // to the most recent record on the cwd, which was the fallback's original job.
             const purposeq = u.searchParams.get('purpose');
-            rec = roster.handoffs[handoffKey(cwdq, purposeq)] || null;
-            if (!rec && purposeq == null) {
-                const pref = cwdKey(cwdq);
-                rec = Object.entries(roster.handoffs)
-                    .filter(([k, r]) => !k.startsWith('cs:') && r && cwdKey(r.cwd) === pref)
-                    .map(([, r]) => r)
-                    .sort((a, b2) => Date.parse(b2.ts) - Date.parse(a.ts))[0] || null;
-            }
+            const p = pickHandoff(roster.handoffs, cwdq, purposeq);
+            // COPY before annotating. These records are roster state; a field written onto the
+            // original would be persisted by the next saveRoster and outlive the response.
+            if (p) rec = { ...p.rec, servedKey: p.servedKey, ...(p.viaRecency ? { servedViaRecency: true } : {}) };
         } else if (csq) {
             rec = Object.entries(roster.handoffs)
                 .filter(([k, r]) => !k.startsWith('cs:') && r && r.from === csq)
