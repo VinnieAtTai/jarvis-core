@@ -356,6 +356,18 @@ test('HANDOFF RECENCY: both read paths apply the window, and neither branch is s
         assert.equal(got.servedViaRecency, true);
         assert.ok(got.auto, 'the auto block is a stated invariant of every handoff record and is missing');
 
+        // ---- the annotation is written onto a COPY ----------------------------------------------
+        // These records are roster state. A field written onto the original would be persisted by the
+        // next saveRoster and leak into every later read. Ask for the record the read above served VIA
+        // RECENCY, by its OWN purpose: that is the record that got annotated, so it is the only place
+        // the leak can show. Getting this target wrong is not a theoretical worry -- an earlier cut of
+        // this test checked a record that had never been annotated at all, and the mutant that writes
+        // in place walked straight through it.
+        const rightOwn = await getHandoff(QUEBEC_PURPOSE);
+        assert.equal(rightOwn.from, right.callsign);
+        assert.equal(rightOwn.servedKey, handoffKey(hub.REPO, QUEBEC_PURPOSE));
+        assert.equal(rightOwn.servedViaRecency, undefined, 'the stored record was MUTATED by the annotated read above');
+
         // ---- ARMS 1 + 3: a RECENT exact hit is kept, and the newer record is NAMED --------------
         const MINE = 'the job whose own checkpoint is recent';
         const THEIRS = 'an unrelated job sharing this repo';
@@ -383,13 +395,11 @@ test('HANDOFF RECENCY: both read paths apply the window, and neither branch is s
         assert.equal(keptGet.newerKey, handoffKey(hub.REPO, THEIRS), 'GET /handoff dropped the suppressed-newer report');
         assert.equal(keptGet.servedViaRecency, undefined);
 
-        // ---- the annotation is written onto a COPY ----------------------------------------------
-        // These records are roster state. A field written onto the original would be persisted by the
-        // next saveRoster and leak into every later read -- including this one.
+        // The newest record on the cwd has nothing newer to report about itself, and is served plainly.
         const theirsGet = await getHandoff(THEIRS);
         assert.equal(theirsGet.from, theirs.callsign);
         assert.equal(theirsGet.servedKey, handoffKey(hub.REPO, THEIRS));
-        assert.equal(theirsGet.servedViaRecency, undefined, 'the stored record was MUTATED by an annotated read above');
+        assert.equal(theirsGet.servedViaRecency, undefined);
         assert.equal(theirsGet.newerKey, undefined, 'the newest record on the cwd reported something newer than itself');
 
         // An unknown purpose on a known cwd resolves to the newest rather than 404ing, which is the
