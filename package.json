@@ -31,7 +31,8 @@
         "verify:searchbox": "node test-support/verify-searchbox-browser.mjs",
         "verify:coordchip": "node test-support/verify-coordchip-browser.mjs",
         "verify:batonchip": "node test-support/verify-batonchip-browser.mjs",
-        "verify:headline": "node test-support/verify-headline-browser.mjs"
+        "verify:headline": "node test-support/verify-headline-browser.mjs",
+        "verify:boardnest": "node test-support/verify-boardnest-browser.mjs"
     },
     "dependencies": {
         "node-pty": "^1.1.0",

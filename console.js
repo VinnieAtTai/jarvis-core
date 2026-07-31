@@ -19,6 +19,15 @@ let lastArchive = null;
 let archFilter = '';
 let lastHold = null;
 let activeTab = 'all';
+// The tab Chris last opened HIMSELF (clicked a tab, or clicked a card), as opposed to one the console
+// picked for him. Tracked separately because it is what has to survive the retirement of the session
+// behind it: a tab he chose is not the console's to close out from under him. See deadTabsFor.
+let stickyTab = '';
+// Every explicit open goes through here so no call site can record one half and forget the other --
+// the sticky half is the whole of the fix, and it is easy to drop when adding a third way to open a tab.
+// Deliberately does NOT re-render: the two call sites do different things around the render (the tab
+// strip also drops out of search results), so the render stays theirs.
+function openTab(id) { activeTab = stickyTab = id; }
 // —— Pane-lock (view pin). When 2+ workers are live and posting, the console follows the newest
 // activity: the chat auto-scrolls to the last poster, a retiring session bounces the tab back to
 // "all", and the highlighted board focus drifts as the server refocuses. A latched LOCK freezes
@@ -1139,6 +1148,58 @@ function spinUpMorning() {
         .then(() => uiToast('Spinning up JARVIS — press ☀ again in a few seconds to run the morning routine.', 'ok'))
         .catch(() => uiToast('Spin-up request failed.', 'error'));
 }
+// Group the board the way the mission rail already nests it: each top-level card followed by the
+// sub-workers hanging off it. Returns [{card, subs:[...]}] in render order.
+//
+// THE DEFECT: the board rendered d.boards FLAT, so every sub-worker spawn or retire added or removed a
+// TOP-LEVEL card and every card below it jumped -- Chris's "cards bouncing". The nastier half was prio():
+// it floats a needs-you/pendingPerm card to position 0, so a sub-worker raising a permission prompt used
+// to catapult itself out of its coordinator's neighbourhood to the head of the column, shoving everything
+// down, then drop back the instant the prompt resolved. Nesting makes the top-level SET stable -- it is
+// the coordinators plus the unparented workers, which does not change when a sub-worker comes or goes.
+//
+// A group therefore sorts by the highest priority ANYWHERE inside it, so a sub-worker that needs Chris
+// still pulls its group to the top and cannot be missed -- it just does it without leaving home.
+//
+// THE INVARIANT, and it is the one that matters: every card renders EXACTLY ONCE. A card whose
+// parentProject names nothing on the board stays top-level rather than disappearing -- a live sub-worker
+// outlives its coordinator's card routinely (the coordinator retires, or Chris closes it), and vanishing
+// from the board is strictly worse than sitting at the top level. Pure + named so the gate can lift it
+// out of this browser script (test/boardnest.test.mjs), the same way railRole/missionIdOfCard are.
+function groupBoards(boards, prio) {
+    const rows = (boards || []).filter(Boolean);
+    const p = typeof prio === 'function' ? prio : () => 0;
+    const byCs = new Map();
+    for (const b of rows) { const k = String(b.callsign || '').toLowerCase(); if (k && !byCs.has(k)) byCs.set(k, b); }
+    // Nest only ONE level, and only under a card that is itself top-level: parentProject names a PROJECT
+    // and project cards carry no parentProject of their own, so a deeper chain means the data is wrong
+    // and flattening that card is the safe reading. Self-parenting is rejected for the same reason.
+    const parentOf = (b) => {
+        const pp = b.parentProject;
+        if (!pp) return null;
+        const key = String(pp).toLowerCase();
+        if (!key || key === String(b.callsign || '').toLowerCase()) return null;
+        const owner = byCs.get(key);
+        if (!owner || owner === b || owner.parentProject) return null;
+        return owner;
+    };
+    const groups = [], byOwner = new Map();
+    for (const b of rows) { if (parentOf(b)) continue; const g = { card: b, subs: [] }; groups.push(g); byOwner.set(b, g); }
+    for (const b of rows) {
+        const owner = parentOf(b);
+        if (!owner) continue;
+        const g = byOwner.get(owner);
+        // parentOf only ever returns a card that is itself top-level, so the group is always there. The
+        // else branch is therefore unreachable today and stays anyway: it is the invariant's last line of
+        // defence, and the failure it prevents is a live session silently missing from the board.
+        if (g) g.subs.push(b); else groups.push({ card: b, subs: [] });
+    }
+    const gp = (g) => g.subs.reduce((m, s) => Math.max(m, p(s)), p(g.card));
+    // Array.sort is stable, so equal-priority groups keep /board order -- same as the flat sort did.
+    groups.sort((a, b) => gp(b) - gp(a));
+    for (const g of groups) g.subs.sort((a, b) => p(b) - p(a));
+    return groups;
+}
 function renderBoards(d) {
     if (!viewLock) focusCS = d.focus;   // locked -> hold the highlighted focus, don't adopt the server's
     lastBoard = d;
@@ -1229,7 +1290,10 @@ function renderBoards(d) {
     np.classList.toggle('imminent', imminent);
     const schedOut = _staleHint + sched; sp.innerHTML = schedOut; sp.style.display = schedOut ? 'block' : 'none';
     const prio = b => b.pendingPerm ? 2 : b.needsYou ? 1 : 0;   // float perm/needs-you cards to the top
-    workEl.innerHTML = d.boards.slice().sort((a, b) => prio(b) - prio(a)).map(b => {
+    // One card's HTML. `sub` means it is nested under a coordinator (see groupBoards) and only changes
+    // how it is marked -- an indent class plus the rail's own arrow glyph, so the board and the mission
+    // rail say "hangs off this one" the same way.
+    const cardHtml = (b, sub) => {
         const queued = b.queued || [], done = b.done || [], working = b.working || [], review = b.review || [];
         const cs = b.callsign;
         const dead = b.alive === false && cs !== 'jarvis';
@@ -1289,7 +1353,8 @@ function renderBoards(d) {
                 + ((b.baton && b.baton.repo) || 'repo') + ' merge lane, in the order they will be served')
                 + '">&#8627; lane queue: ' + lq.map(n => '<span class="blq">' + esc(n) + '</span>').join(', ') + '</div>'
             : '';
-        const head = '<div class="chead"><span class="ctitle">' + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + act + worker + ctx + watch + wedge + laneChip + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
+        const nest = sub ? '<span class="csubarrow">&#8627;</span> ' : '';
+        const head = '<div class="chead"><span class="ctitle">' + nest + (focused ? '&#9733; ' : '') + esc(cs.toUpperCase()) + act + worker + ctx + watch + wedge + laneChip + '</span>' + cwdChip + '<span class="cbtns">' + btns + '</span></div>';
         const purpose = b.purpose ? '<div class="cpurpose">' + esc(b.purpose) + '</div>' : '';
         const dh = headlineHtml(b.doing || '', 'doing:' + cs, boardExpand.has('doing:' + cs));
         const doing = (b.needsYou || b.doing) ? '<div class="bdoing">' + (b.needsYou ? '<span class="needs">NEEDS YOU</span> ' : '') + dh.text + dh.caret + dh.body + '</div>' : '';
@@ -1390,8 +1455,11 @@ function renderBoards(d) {
         const pcount = b.pendingPermCount || 0;
         const batch = pcount > 1 ? '<div class="permbatch"><span class="pbtn ok" data-act="approveall" data-cs="' + esc(b.callsign) + '">Approve all (' + pcount + ')</span><span class="pbtn no" data-act="denyall" data-cs="' + esc(b.callsign) + '">Deny all</span></div>' : '';
         const perm = pp ? '<div class="permreq' + (pp.klass === 'danger' ? ' permdanger' : '') + '"><div class="permhead">' + (pp.klass === 'danger' ? '&#9888; RISKY: ' : '&#9888; ') + 'wants to run <b>' + esc(pp.tool) + '</b></div><div class="permdetail">' + esc((pp.detail || '').slice(0, 240)) + '</div><div class="permbtns"><span class="pbtn ok" data-act="approve" data-permid="' + esc(pp.id) + '">Approve</span><span class="pbtn no" data-act="deny" data-permid="' + esc(pp.id) + '">Deny</span><span class="pbtn" data-act="always" data-permid="' + esc(pp.id) + '" title="auto-allow this command family from now on">Always: ' + esc(pp.label || pp.tool) + '</span></div>' + batch + '</div>' : '';
-        return '<div class="card' + (focused ? ' cfocus' : '') + (dead ? ' cdead' : '') + ((b.needsYou || b.pendingPerm) ? ' cneeds' : '') + '" data-cs="' + esc(cs) + '">' + head + purpose + perm + doing + laneStrip + pctx + counts + tasks + '</div>';
-    }).join('');
+        return '<div class="card' + (sub ? ' csub' : '') + (focused ? ' cfocus' : '') + (dead ? ' cdead' : '') + ((b.needsYou || b.pendingPerm) ? ' cneeds' : '') + '" data-cs="' + esc(cs) + '">' + head + purpose + perm + doing + laneStrip + pctx + counts + tasks + '</div>';
+    };
+    workEl.innerHTML = groupBoards(d.boards, prio)
+        .map(g => '<div class="cgroup">' + cardHtml(g.card, false) + g.subs.map(s => cardHtml(s, true)).join('') + '</div>')
+        .join('');
     const deadN = d.boards.filter(b => b.alive === false && b.callsign !== 'jarvis').length;
     if (deadN > 1) workEl.innerHTML = '<div style="margin-bottom:8px"><span class="cbtn" data-act="continueall" style="opacity:1;color:#5db4d9;font-weight:bold;font-size:12px">🚀 continue all (' + deadN + ')</span></div>' + workEl.innerHTML;
     renderChat();
@@ -1404,7 +1472,7 @@ workEl.onclick = (e) => {
         if (card) {
             const cs = card.getAttribute('data-cs');
             const valid = cs === 'jarvis' || (lastBoard && lastBoard.boards.some(b => b.callsign === cs && b.alive !== false));
-            if (valid && cs && cs !== activeTab) { activeTab = cs; renderChat(); }
+            if (valid && cs && cs !== activeTab) { openTab(cs); renderChat(); }
         }
         return;
     }
@@ -1953,6 +2021,21 @@ function missionManagerCallsign(mid) {
     const live = boards.find(b => b && b.projectContext?.missionId === mid && b.uid && b.alive !== false);
     return live ? live.callsign : '';
 }
+// Every chat identity a session tab answers to. A PROJECT card's tab id is the project KEY ('waterfall'),
+// but the session bound to it speaks under its own NATO callsign, so the two have to be bridged or the
+// tab renders empty. That bridge existed only as a hardcode for 'jarvis' plus mission aggregation, which
+// left one hole exactly the shape of a BOUND project that has no mission and is not named jarvis --
+// clicking its tab showed nothing at all. Same rule the jarvis hardcode already encodes, applied to
+// every project card instead of one.
+//
+// Pure + named so the gate can lift it out of this browser script (test/deadtabs.test.mjs).
+function tabIdentities(tabId, boards) {
+    const id = String(tabId == null ? '' : tabId);
+    if (!id) return [];
+    const b = (boards || []).find(x => x && x.callsign === id);
+    const w = b && b.worker;
+    return (w && w !== id) ? [id, w] : [id];
+}
 function eventsForTab() {
     if (activeTab === 'ask') return [];   // ASK is a separate model chat, not the speech transcript
     if (activeTab === 'all') return chatEvts;
@@ -1981,7 +2064,46 @@ function eventsForTab() {
             ids.has(e.who) || (e.who === 'you' && ids.has(e.to))
         ));
     }
-    return chatEvts.filter(e => e.kind !== 'sys' && (e.who === activeTab || (e.who === 'you' && e.to === activeTab)));
+    // A plain NATO worker answers to one name and this is a no-op for it; a bound project card answers
+    // to its key AND the session driving it (see tabIdentities).
+    const ids = tabIdentities(activeTab, (lastBoard && lastBoard.boards) || []);
+    return chatEvts.filter(e => e.kind !== 'sys' && (ids.includes(e.who) || (e.who === 'you' && ids.includes(e.to))));
+}
+// How many retired sessions keep a greyed history tab. It was 4, and that is half of the tab-reset
+// defect: 21 sessions retired here in ONE day, so a tab Chris was reading fell out of a 4-deep cache
+// within minutes and took its history with it. chatEvts is already the bounded transcript window, so
+// the real ceiling is what is in memory either way -- 4 bought nothing.
+const DEAD_TAB_CAP = 12;
+// Which retired callsigns keep a greyed, clickable history tab, most-recently-heard first.
+//
+// THE DEFECT: renderTabs bounced activeTab to 'all' the moment its session's callsign left this list,
+// which happens on every retirement -- Chris's open chat tab reset itself under him while he was
+// reading it, and with 21 retirements a day it fired constantly. `sticky` is the tab he opened
+// HIMSELF (see openTab): it is retained past the cap, and past a transcript window that no longer
+// holds any of its messages, because it is a RETIRED session rather than a missing one. Worst case it
+// renders empty and he clicks away -- which is his call to make, not the console's.
+//
+// `covered` is every id already renderable some other way (base tabs, live sessions, mission tabs, and
+// every mission-OWNED identity, which is reachable under its mission tab). A sticky already covered
+// must not be appended: that would put a duplicate greyed tab beside its live or mission one, and that
+// exact duplicate pair is what missionChatSets was written to kill.
+//
+// Pure + named so the gate can lift it out of this browser script (test/deadtabs.test.mjs), the same
+// way railRole and missionIdOfCard are.
+function deadTabsFor(deadLast, sticky, cap, covered) {
+    const last = deadLast || {};
+    // The old inline sort was `Date.parse(last[x] || 0)`, which has two teeth: Date.parse(0) parses the
+    // STRING "0" as the year 2000, and an unparseable stamp yields NaN, so the comparator returned NaN
+    // and the ranking became engine-defined. Missing or unreadable sorts last, deterministically.
+    const at = (k) => { const t = Date.parse(last[k]); return Number.isFinite(t) ? t : 0; };
+    const out = Object.keys(last)
+        .sort((a, b) => at(b) - at(a))
+        .slice(0, Math.max(0, cap || 0));
+    // Mission tabs are excluded from the retention: 'm:<id>' has no callsign to render as a dead tab,
+    // and a mission is closed deliberately (by the voice gate), so its tab going away is intended.
+    const keep = sticky && typeof sticky === 'string' && !sticky.startsWith('m:');
+    if (keep && !out.includes(sticky) && !(covered || []).includes(sticky)) out.push(sticky);
+    return out;
 }
 function renderTabs() {
     // Order session tabs the same way the cards are ordered (perm/needs-you float to the top,
@@ -2004,8 +2126,9 @@ function renderTabs() {
     claimed.forEach(id => _skip.add(id));
     const _deadLast = {};
     for (const e of chatEvts) { const w = e.who; if (!w || _skip.has(w) || _liveSet.has(w)) continue; _deadLast[w] = e.ts || _deadLast[w]; }
-    const deadTabs = Object.keys(_deadLast).sort((a, b) => Date.parse(_deadLast[b] || 0) - Date.parse(_deadLast[a] || 0)).slice(0, 4);
-    const ids = base.concat(missionTabs.map(m => m.id)).concat(sessions.map(b => b.callsign)).concat(deadTabs);
+    const _shown = base.concat(missionTabs.map(m => m.id)).concat(sessions.map(b => b.callsign));
+    const deadTabs = deadTabsFor(_deadLast, stickyTab, DEAD_TAB_CAP, _shown.concat(Array.from(claimed)));
+    const ids = _shown.concat(deadTabs);
     if (!ids.includes(activeTab) && !viewLock) activeTab = 'all';   // locked -> hold the pinned tab, don't bounce to "all"
     let html = base.map(id => '<span class="stab' + (id === activeTab ? ' active' : '') + '" data-tab="' + id + '">' + id.toUpperCase() + '</span>').join('');
     // One tab per mission — the single chat for that whole project (mission color token #c9b98a).
@@ -2045,7 +2168,7 @@ document.getElementById('stabs').onclick = (e) => {
     if (plus) { toggleNewSession(); return; }
     const t = e.target.closest ? e.target.closest('[data-tab]') : null;
     if (!t) return;
-    activeTab = t.getAttribute('data-tab');
+    openTab(t.getAttribute('data-tab'));
     qboxEl.value = ''; exitSearch();   // a tab click means 'show me that chat', not 'stay in results'
     renderChat();
 };
