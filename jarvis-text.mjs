@@ -872,6 +872,24 @@ export function coordinatorSlotHolder(sessions, booting, name, now, staleMs = 12
 // could read a bus event, and its boot brief is built after this fires, so it learns the new
 // coordinator from the brief itself.
 //
+// A KNOWN HOLE, LEFT OPEN ON PURPOSE -- READ THIS BEFORE YOU WIDEN THE WINDOW. If the hub is down for
+// more than `staleMs` and a coordinator is buried during boot reconcile, a sub-worker that SURVIVED
+// the restart still carries a pre-restart `lastSeen`, so it is judged stale here and never told.
+// Widening the window just for this fan-out is the obvious fix and it is the WRONG one, twice over:
+// liveness would then mean two different things inside a single retire (the same drift that put
+// boardKeyFor and nextFocusKey out of step in 14f3ad4), and a bus event addressed to a session that
+// is actually gone is not free -- pending events count against it and feed the wedge detector, which
+// is exactly why the upward push next to this one only ever messages a LIVE holder. One honest rule
+// with a documented hole beats two rules that disagree.
+//
+// The real fix is not a wider window but a SECOND delivery point, and it is carded rather than built
+// here: both arms above assume the notice has to be PUSHED at retire time, which is what makes it
+// hostage to whether `lastSeen` happens to be fresh at that instant. A sub-worker learns just as well
+// at PULL time -- on its next /poll, if its parentProject has no live coordinator and it has not been
+// told, hand it the notice then. That is immune to the race entirely (a restart survivor polls
+// seconds later) and costs the retire path nothing. This push stays as the common case; the pull is
+// the backstop.
+//
 // Returns [{ uid, callsign }] sorted by uid -- ordered so a caller's fan-out is deterministic and a
 // test can assert on the whole set rather than on whichever key order a JSON reload happened to
 // produce. Pure: reads the sessions map, mutates nothing.
