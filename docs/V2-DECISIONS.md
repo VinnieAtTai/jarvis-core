@@ -4,23 +4,56 @@ Eight things nobody but Chris (or the coordinator) can settle. They are collecte
 answered **once**, in one sitting, instead of being rediscovered one at a time by whoever writes the
 next piece of v2.
 
-**Nothing here is answered.** Each entry gives the question, the realistic options, what each one
-costs, and a recommendation. The recommendation is input, not a substitute — especially D1, which has
-been left open deliberately.
+**ALL EIGHT ARE ANSWERED — Chris, by voice, 2026-07-31 10:10 CDT.** Each entry keeps the question,
+the options and the original recommendation so the reasoning stays auditable, and now carries the
+ruling. Where the ruling departs from the recommendation it says so and says why; **D1 does, and it
+is the most consequential line in this file.**
 
 Sources: `docs/V2-SCHEMA.md` part D, plus three added by `docs/V2-SCHEMA-REVIEW.md`.
 
 ---
 
-## Answer these first
+## The answers
 
-| # | Decision | Urgency |
+| # | Decision | Ruling |
 | --- | --- | --- |
-| **D5** | Does the old reporting store survive? | **Blocking.** Deleting it first destroys data permanently. |
-| **D8** | How are calendar times stored? | **Blocking the DDL.** Changes a column type. |
-| **D1** | Node or .NET? | Not blocking the schema. Blocks the first line of real code. |
-| D7 | Where do reactions live? | Before the transcript migration runs. |
-| D2, D3, D4, D6 | Retention, `gap`, broadcast, `text_raw` | Can wait. None of them move a foreign key. |
+| **D1** | Node or .NET? | **.NET** — latest .NET, latest EF Core, latest Angular + PrimeNG. **Overrides the recommendation below.** |
+| **D5** | Does the old reporting store survive? | **Backfill from it, then retire it.** Order is binding. |
+| **D8** | How are calendar times stored? | **`DATETIMEOFFSET(3)`**, `calendar_event` only. Already applied. |
+| **D7** | Where do reactions live? | **`reaction` table only**; drop `'react'` from `message.kind`. |
+| **D2** | Event retention | **Keep everything**, partition later. |
+| **D3** | Is `gap` durable? | **Yes**, make it a stored event. |
+| **D4** | Broadcast `to:'all'` | **Drop it.** |
+| **D6** | When can `text_raw` go? | **After a human audit** of the 28 ambiguous cards. |
+
+### What D1 changes, and what it does not
+
+It does **not** change the schema. `docs/V2-SCHEMA.md` was written to be stack-independent and it
+survives this ruling unedited — the DDL is T-SQL either way.
+
+It **does** change the shape of the project. Node would have been a restructure; .NET is a rebuild of
+the hub and every worker-facing endpoint from `docs/V2-CURRENT-SYSTEM.md`. That document stops being
+a reference and becomes the specification.
+
+**One consequence needs naming, and it is smaller than it first looks.** The instinct is that .NET
+costs us the voice path. Measured against the code, it does not:
+
+| Piece | Where it actually lives | Cost under .NET |
+| --- | --- | --- |
+| Google STT | `webkitSpeechRecognition`, `console.js:2201` — **the browser** | **None.** Angular inherits it. |
+| Text-to-speech | `speechSynthesis`, `console.js:2259` — **the browser** | **None.** |
+| Mic capture, VAD, echo-drop, barge-in | `console.js:2289`–`2310` — **the browser** | **None.** |
+| Local whisper | `stt.mjs`, 131 lines: spawn `whisper-server.exe`, POST a WAV to `127.0.0.1:8125` | **Low.** `Process.Start` + `HttpClient`. |
+
+Nearly the whole voice *surface* is front-end JavaScript that survives the back-end swap untouched,
+and the one Node piece is subprocess plumbing that .NET does as readily as Node.
+
+The real rewrite is **`handleUtterance`** — 24 inline regex intent dispatches and 71 `enqueueSay`
+sites in `jarvis-core.mjs` (find it with `grep -n "^function handleUtterance"`; the line number
+drifts). That is server-side dispatch logic, not voice technology, and it is the same rewrite every
+other endpoint faces. It is real work, but it is not a reason to reconsider .NET, and no separate
+decision is needed. **D9 is therefore closed as answered rather than left open** — recorded because
+the question was asked and the measured answer is worth not re-deriving.
 
 ---
 
