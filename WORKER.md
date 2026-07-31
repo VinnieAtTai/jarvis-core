@@ -241,14 +241,22 @@ distinction matters when you decide how far to trust it.
 - Keep `/send` text compact too: it lands in another model's context. Send paths, ids, and
   conclusions, not file contents or logs.
 - Report context health AND what you are doing: chain
-  `POST /health {"uid":"<uid>","context":<0-100>,"doing":"<short phrase>"}` into a bash call
-  you are already making (after handling a batch, alongside board updates). `context` is your
-  best estimate of how full your context window is — the board shows it and the hub warns the
-  human at 80 so a fresh session can take over before you degrade; report high (85+) if you
-  were recently summarized or compacted. `doing` is one short phrase of your current state —
-  "working: F19 verify", "waiting on Chris for query results", "standing by" — it renders
-  under your callsign so the human can tell waiting from working at a glance. Update it
-  whenever your state changes, especially when you become blocked on the human.
+  `POST /health {"uid":"<uid>","context":<0-100>,"doing":"<short phrase, or headline -- detail>"}`
+  into a bash call you are already making (after handling a batch, alongside board updates).
+  `context` is your best estimate of how full your context window is — the board shows it and the
+  hub warns the human at 80 so a fresh session can take over before you degrade; report high (85+)
+  if you were recently summarized or compacted. `doing` is your current state — "working: F19
+  verify", "waiting on Chris for query results", "standing by" — it renders under your callsign
+  so the human can tell waiting from working at a glance. Update it whenever your state changes,
+  especially when you become blocked on the human.
+- **A long `doing` line needs the separator.** A short phrase on its own is still perfectly good;
+  never pad one to earn the space. When your state genuinely needs a sentence of detail, write
+  `headline -- detail` (space-dash-dash-space, the same shape as a board card): the console shows
+  only the headline — 60 characters of it on the mission rail — and opens the rest on a click. So
+  keep the HEADLINE short, because that is the part that lands on the human's screen, and put the
+  length behind it. Without a separator there is nothing to open and a long line is merely a
+  truncated one, which is the thing he complained about. The hub stores 400 characters and cuts
+  the rest.
 - **Permissions / self-sufficiency.** Read-only and routine build commands run WITHOUT bothering
   the human: git status/diff/log/show/branch, ls/cat/grep/rg/find, node --check, npm run
   lint/build/test, dotnet build/test. Only risky or out-of-repo actions raise a prompt. So favor

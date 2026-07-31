@@ -22,6 +22,7 @@
 // Run with:  npm run test:doingcap
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { splitHeadline } from '../jarvis-text.mjs';
 import { createScratchHub } from '../test-support/scratch-hub.mjs';
 
@@ -109,3 +110,38 @@ test('DOING CAP: a stored line at the cap still renders as a bounded headline', 
     assert.equal(p.truncated, false, 'a headline that fits must not be ellipsised');
     assert.ok(p.detail.includes(TAIL), 'and the detail behind the caret carries the rest');
 });
+
+test('DOING CAP: the instruction workers actually read matches the cap the hub enforces',
+    { skip: SKIP, timeout: 120000 }, async (t) => {
+        // A raised cap nobody is told about is inert: every worker was being instructed to send "one
+        // short phrase", so the space would never have been used. This asserts the instruction exists
+        // AND that the number in it is the number the code enforces -- a documented constant drifting
+        // from its implementation is the rot this repo keeps rediscovering, and a doc cannot fail a
+        // test on its own.
+        //
+        // Fetched from a LIVE HUB rather than read off disk, deliberately: GET /protocol serves
+        // WORKER.md verbatim, and that being ONE file rather than two is precisely the kind of fact
+        // that rots. If the route is ever rewired to a second copy, this stops proving anything about
+        // what a worker reads -- so read it the way a worker does.
+        const hub = await createScratchHub({ graceMs: 5000 });
+        t.after(() => hub.dispose());
+        await hub.start('protocol-doc hub');
+
+        const proto = await (await fetch(hub.origin + '/protocol')).text();
+        assert.ok(proto.includes('POST /health'), 'GET /protocol is not serving the worker doc at all');
+        assert.match(proto, /headline -- detail/,
+            'the protocol never tells a worker the long doing-line shape, so the cap is unusable');
+        assert.match(proto, /needs the separator/,
+            'and it must say the separator is REQUIRED for the long form -- an unseparated 400-char'
+            + ' line is just a truncated one, which is the complaint this all came from');
+
+        // The two numbers, each measured from its own source.
+        const doc = proto.match(/stores (\d+) characters/);
+        assert.ok(doc, 'the protocol no longer states the stored length, so nothing pins it to the code');
+        const code = readFileSync(new URL('../jarvis-core.mjs', import.meta.url), 'utf8')
+            .match(/s\.doing = String\(b\.doing \|\| ''\)\.slice\(0, (\d+)\)/);
+        assert.ok(code, 'the /health clamp is no longer spelled the way this test looks for it -- update it');
+        assert.equal(Number(doc[1]), Number(code[1]),
+            'the protocol promises ' + doc[1] + ' characters and the hub stores ' + code[1]);
+        assert.equal(Number(code[1]), CAP, 'and both should be the cap this file pins');
+    });
