@@ -268,6 +268,25 @@ export function handoffKey(cwd, purpose) {
     return cwdKey(cwd) + String.fromCharCode(10) + p;
 }
 
+// The purpose half of a handoffKey, for the one thing that has to NAME the other job in prose: the
+// message telling a session a newer handoff exists beside its own. Lives here, next to the writer,
+// because the joiner belongs to exactly one function -- a reader of these keys that spells the
+// separator itself is free to drift from the writer, and nothing would say so.
+export function purposeOfHandoffKey(key) {
+    const s = key == null ? '' : String(key);
+    const i = s.indexOf(String.fromCharCode(10));
+    return (i < 0 ? '' : s.slice(i + 1).trim()) || '(no purpose)';
+}
+
+// How long a job's OWN handoff checkpoint stays authoritative against a newer record filed on the
+// same cwd by some other job. A JUDGEMENT CALL, not a measurement, and named here rather than left
+// inline so the next session tunes it deliberately instead of discovering it: 12 hours is roughly
+// "since I last checkpointed, within a working day". Raising it favours the exact hit (better where
+// one cwd hosts many long-lived unrelated jobs); lowering it favours recency (better where a cwd is
+// one job handed down a chain of successors). Both directions stay visible in the answer -- see
+// pickHandoff's newerKey -- so a wrong setting is a nuisance, never a silent loss.
+export const HANDOFF_EXACT_FRESH_MS = 43200000;   // 12h
+
 // WHICH handoff record a session on (cwd, purpose) should be served, and under WHICH KEY it was
 // found. The ordering rule lives here, once, so the register hint and GET /handoff cannot answer
 // differently for the same job -- the way boardKeyFor and nextFocusKey drifted apart in 14f3ad4.
@@ -286,24 +305,34 @@ export function handoffKey(cwd, purpose) {
 // newest and equal timestamps never flip the answer. An unparseable ts sorts as -Infinity -- a
 // record with a broken clock can lose to a good one but can never beat one.
 //
-// KNOW THE COST BEFORE YOU EXTEND THIS. It is a partial walk-back of the scoping handoffKey exists
-// for: where one cwd hosts several unrelated jobs (d:/code/tms is the standing example), a job's own
-// record is now shadowed by any NEWER record on that cwd, whoever filed it. That is deliberate --
-// /handoff's overwhelming caller is a successor whose predecessor just retired, and for that caller
-// "the newest one here" is right far more often than "the one whose purpose string matches" -- but it
-// is a trade, not a free win. `servedKey` is the mitigation: a session handed another job's notes can
-// SEE that and disregard them, which is precisely what golf could not do. If this misfires the other
-// way in practice, the fix is to bound the override by an absolute freshness window (a predecessor
-// retires minutes before its successor registers), NOT to go back to exact-hit-wins.
+// THE OVERRIDE IS BOUNDED, and the bound is on the EXACT HIT rather than on the candidate. Unbounded,
+// this was a walk-back of the scoping handoffKey exists for: where one cwd hosts several unrelated
+// jobs (d:/code/tms, Chris's daily repo, genuinely does), "any newer record on this cwd wins" is the
+// bug we just fixed with its sign flipped -- a successor served somebody else's notes. So a job that
+// checkpointed RECENTLY is trusted outright: whatever other jobs did on that cwd since, your own
+// fresh checkpoint is almost certainly the record you want. Only a STALE exact hit can be displaced,
+// and golf's -- a full day old -- clears any sane window comfortably.
 //
-// Returns { rec, servedKey, viaRecency } | null. `servedKey` is what turns a misfire from invisible
-// into visible: the caller hands it to the successor, so a session served another job's notes can
-// SEE that instead of acting on them as its own. `cs:` stash entries are never candidates -- those
-// are one-shot, addressed to a callsign, and consumed on read. Pure: reads, mutates nothing (the
-// record is returned by reference, so a caller annotating it must copy first -- these live in
-// roster.handoffs and saveRoster would persist the annotation).
-export function pickHandoff(handoffs, cwd, purpose) {
+// NEITHER BRANCH IS ALLOWED TO BE SILENT. That silence is what cost a session: golf could not tell it
+// had been handed another job's notes. So when the window SUPPRESSES an override and a strictly newer
+// record on the cwd does exist, the answer still carries `newerKey` naming it -- a successor whose
+// notes read like someone else's job has somewhere to go. Same plumbing as `servedKey`, deliberately,
+// rather than a second mechanism.
+//
+// Returns { rec, servedKey, viaRecency, newerKey? } | null. `servedKey` is what turns a misfire from
+// invisible into visible: the caller hands it to the successor, so a session served another job's
+// notes can SEE that instead of acting on them as its own. `newerKey` is the mirror of it -- present
+// only when the freshness window kept the exact hit and something newer on the cwd went unserved.
+// `cs:` stash entries are never candidates -- those are one-shot, addressed to a callsign, and
+// consumed on read. Pure: reads, mutates nothing (the record is returned by reference, so a caller
+// annotating it must copy first -- these live in roster.handoffs and saveRoster would persist it).
+//
+// `now` is injected for deterministic tests, and FALLS BACK to Date.now() rather than trusting a
+// caller to pass it: a missing `now` would make every age NaN, quietly switching the window off and
+// restoring the unbounded rule with nothing to show for it.
+export function pickHandoff(handoffs, cwd, purpose, now, freshMs = HANDOFF_EXACT_FRESH_MS) {
     if (!handoffs || typeof handoffs !== 'object' || !cwd) return null;
+    const t0 = Number.isFinite(now) ? now : Date.now();
     const exactKey = handoffKey(cwd, purpose);
     const exact = (handoffs[exactKey] && typeof handoffs[exactKey] === 'object') ? handoffs[exactKey] : null;
     const pref = cwdKey(cwd);
@@ -315,10 +344,16 @@ export function pickHandoff(handoffs, cwd, purpose) {
         if (!r || typeof r !== 'object' || !r.cwd || cwdKey(r.cwd) !== pref) continue;
         if (!best || at(r) > at(best)) { best = r; bestKey = k; }
     }
-    // A tie leaves `best` as whichever came first in key order, so the exact hit is only displaced by
-    // a strictly greater timestamp -- never by iteration order.
-    if (best && (!exact || at(best) > at(exact))) return { rec: best, servedKey: bestKey, viaRecency: bestKey !== exactKey };
-    return exact ? { rec: exact, servedKey: exactKey, viaRecency: false } : null;
+    if (!exact) return best ? { rec: best, servedKey: bestKey, viaRecency: bestKey !== exactKey } : null;
+    // STRICTLY newer, and `best !== exact` said out loud rather than left to the comparison: a tie
+    // leaves `best` as whichever came first in key order, so nothing here may turn on iteration order.
+    const exactAt = at(exact);
+    const newer = !!best && best !== exact && at(best) > exactAt;
+    // An undateable exact hit is never fresh. It cannot prove it is, and the whole point of the window
+    // is that freshness has been demonstrated.
+    const exactIsFresh = exactAt > -Infinity && (t0 - exactAt) < freshMs;
+    if (newer && !exactIsFresh) return { rec: best, servedKey: bestKey, viaRecency: true };
+    return { rec: exact, servedKey: exactKey, viaRecency: false, ...(newer ? { newerKey: bestKey } : {}) };
 }
 
 // "on the job 4h 28m (start -> end)" for the line above. Private: it exists for that one line, and a

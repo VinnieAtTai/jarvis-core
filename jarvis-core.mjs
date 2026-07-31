@@ -13,7 +13,7 @@ import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsola
 import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap, isBatonQuestion, speakBaton } from './jarvis-text.mjs';
 import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote, reconstructHandoff, spawnDispatch } from './jarvis-text.mjs';
 import { CMD_LINE_MAX, BOOT_PROMPT_MAX, capBootPrompt } from './jarvis-text.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, pickHandoff, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, wedgeGraceMs, wedgeEscalateDue, cursorGap, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, pickHandoff, purposeOfHandoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, wedgeGraceMs, wedgeEscalateDue, cursorGap, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // What code is actually RUNNING, resolved once at load and stated out loud.
@@ -1410,6 +1410,15 @@ function registerSession(cwd, purpose, pin, project, parentProject) {
             servedViaRecency: true,
             note: 'This is the NEWEST handoff on this cwd, filed under a different purpose than yours ('
                 + (h.rec.purpose || '(none)') + '). Read it before you assume it is your own job.',
+        } : {}),
+        // The other half of the same promise: the freshness window kept YOUR record, but something
+        // newer exists on this cwd and you are told so rather than left to wonder. Mutually exclusive
+        // with the branch above -- an override that happened has nothing left to suppress.
+        ...(h.newerKey ? {
+            newerKey: h.newerKey,
+            note: 'This is your own job\'s record and it is recent, so it was kept. A NEWER handoff'
+                + ' exists on this cwd under a different purpose (' + purposeOfHandoffKey(h.newerKey)
+                + '); read that one if these notes look like somebody else\'s job.',
         } : {}),
         hint: 'GET /handoff?cwd=' + encodeURIComponent(cwd) + '&purpose=' + encodeURIComponent(purpose || '') + ' for full notes, then resume.',
     };
@@ -4659,7 +4668,11 @@ async function handleRequest(req, res) {
             const p = pickHandoff(roster.handoffs, cwdq, purposeq);
             // COPY before annotating. These records are roster state; a field written onto the
             // original would be persisted by the next saveRoster and outlive the response.
-            if (p) rec = { ...p.rec, servedKey: p.servedKey, ...(p.viaRecency ? { servedViaRecency: true } : {}) };
+            if (p) rec = {
+                ...p.rec, servedKey: p.servedKey,
+                ...(p.viaRecency ? { servedViaRecency: true } : {}),
+                ...(p.newerKey ? { newerKey: p.newerKey } : {}),
+            };
         } else if (csq) {
             rec = Object.entries(roster.handoffs)
                 .filter(([k, r]) => !k.startsWith('cs:') && r && r.from === csq)
