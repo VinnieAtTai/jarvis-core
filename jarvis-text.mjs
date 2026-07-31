@@ -814,6 +814,83 @@ export function coordinatorSlotHolder(sessions, booting, name, now, staleMs = 12
     return null;
 }
 
+// Every LIVE sub-worker nested under a project -- the set that has to be TOLD when that project's
+// coordinator changes hands. The mirror of coordinatorSlotHolder: that answers "who runs this
+// project", this answers "who is working under it and would not otherwise find out".
+//
+// THE INCIDENT, 2026-07-31 20:13:58. bravo retired off jarvis having briefed two sub-workers, and
+// nothing told either of them. Ninety seconds later uniform sent its completion report to oscar
+// opening with "(Routing to you because bravo briefed me and has since retired ... if this belongs
+// somewhere else, say so.)" -- it had to GUESS its own coordinator and hedge the guess. whiskey,
+// still live, still believed it reported to bravo. The sub-worker retire path already pushes "your
+// sub-worker X retired" UP to the coordinator; nothing pushed the change back DOWN.
+//
+// A sub-worker qualifies when it is unended, carries .parentProject === name, and was seen inside
+// `staleMs`. Three exclusions, each load-bearing:
+//   - `.project` set: that is a COORDINATOR, not a sub-worker. registerSession makes the two fields
+//     mutually exclusive, so this can only fire if that invariant is ever relaxed -- and the cost of
+//     getting it wrong is telling the incoming coordinator that its own arrival replaced it.
+//   - stale lastSeen: a session the hub has already stopped believing in. Same 2-minute window as
+//     gone-quiet, and the same window coordinatorSlotHolder uses, so liveness never means two things.
+//   - `exclude`: the retiring session's own uid, so no notification is ever addressed to a corpse.
+// BOOTING sub-workers are deliberately NOT included: one that has not registered has nothing that
+// could read a bus event, and its boot brief is built after this fires, so it learns the new
+// coordinator from the brief itself.
+//
+// Returns [{ uid, callsign }] sorted by uid -- ordered so a caller's fan-out is deterministic and a
+// test can assert on the whole set rather than on whichever key order a JSON reload happened to
+// produce. Pure: reads the sessions map, mutates nothing.
+export function liveSubWorkers(sessions, name, now, staleMs = 120000, exclude = null) {
+    const n = name ? String(name).toLowerCase().trim() : '';
+    if (!n || !sessions || typeof sessions !== 'object') return [];
+    const out = [];
+    for (const uid in sessions) {
+        const s = sessions[uid];
+        if (!s || s.ended || s.project) continue;
+        if (s.parentProject !== n) continue;
+        if (uid === exclude) continue;
+        const t = Date.parse(s.lastSeen);
+        if (!Number.isFinite(t) || (now - t) >= staleMs) continue;
+        out.push({ uid, callsign: s.callsign || null });
+    }
+    return out.sort((a, b) => (a.uid < b.uid ? -1 : a.uid > b.uid ? 1 : 0));
+}
+
+// What to actually SAY to those sub-workers. Split out from the fan-out because the wording is the
+// deliverable: this text lands in another model's context as its only notice that the session it has
+// been reporting to no longer exists, so it has to name the replacement rather than merely announce
+// a departure. "bravo retired" alone reproduces the incident -- uniform knew that much and still had
+// to guess.
+//
+// `next` is the branch the retire actually took, as {kind, callsign}:
+//   - 'successor': one was spawned inside this same retire. It is BOOTING, not yet registered, so the
+//     line says so -- a sub-worker that fires a report at it immediately would be writing to a
+//     session that cannot poll yet.
+//   - 'holder':    somebody already held the slot, so no successor was spawned. Report there now.
+//   - 'none':      nothing replaced it. Said plainly and with a fallback, because "you have no
+//     coordinator" is itself actionable -- it means send findings to the human instead of upward.
+// Anything else (or a kind with no callsign where one is required) degrades to 'none': a wrong-shaped
+// verdict must still produce a usable sentence, never "your new coordinator is null".
+//
+// ASCII only and no markup: it rides curl.exe-adjacent JSON and is read as plain text. Pure.
+export function coordinatorChangeNote(project, retiring, next) {
+    const proj = project ? String(project).toLowerCase().trim() : 'the project';
+    const gone = retiring ? String(retiring) : 'your coordinator';
+    const kind = next && next.kind, who = next && next.callsign ? String(next.callsign) : '';
+    const head = 'YOUR COORDINATOR CHANGED: ' + gone + ' retired off ' + proj + ' and ';
+    if (kind === 'successor' && who) {
+        return head + who + ' was spawned as its successor. Report to ' + who + ' from now on -- it inherits '
+            + gone + "'s handoff and board, and it is still BOOTING, so give it a moment to register before you send.";
+    }
+    if (kind === 'holder' && who) {
+        return head + who + ' already holds the coordinator slot, so no successor was spawned. Report to '
+            + who + ' from now on.';
+    }
+    return head + 'nothing replaced it: you currently have NO coordinator and the ' + proj
+        + ' card is idle. Finish what you are on, then send your findings to the human (to:"human") rather than upward, '
+        + 'and retire with a summary -- that append is what the next coordinator rebuilds from.';
+}
+
 // Resolve a project name to the cwd its coordinator last lived in, so an auto-revived coordinator
 // (T2) spawns in the RIGHT repo even when the previous one is a dead ghost. Unlike pickProjectWorker
 // this deliberately includes ENDED sessions: once a coordinator retires or dies the durable project
