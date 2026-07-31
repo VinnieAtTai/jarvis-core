@@ -1,20 +1,26 @@
 # JARVIS v1 — the current system, as built
 
-**Audience: the agents building v2.** This is a description of what EXISTS at `main` bfcedcf, not a
-design for what comes next. It is deliberately stack-independent: the v2 back-end language (Node vs
-.NET) is still open with Chris, so nothing here assumes one. Where v1 makes a choice that v2 will
-have to re-make, this says so and stops.
+**Audience: the agents building v2.** This is a description of what EXISTS, not a design for what
+comes next. It is deliberately stack-independent: the v2 back-end language (Node vs .NET) is still
+open with Chris, so nothing here assumes one. Where v1 makes a choice that v2 will have to re-make,
+this says so and stops.
 
-**Every claim carries a `file:line`.** Check it rather than trusting this doc — it was written by
-reading the code, and the code moves. When a line has drifted, the surrounding function name is the
-stable anchor; all of them are named.
+> **Line numbers are pinned to `main` 43d5828.** They were re-derived against that tree, and 45
+> spot-checks confirm each cited line still holds the thing claimed of it.
+>
+> **When they drift — and they will — grep the anchor, not the number.** Every citation names a
+> function, a route key, or a distinctive comment alongside its line, and that anchor is what
+> survives. A merge that touches `jarvis-core.mjs` above line 1808 or `jarvis-text.mjs` above 1347
+> moves everything below it; the previous revision of this file was written against bfcedcf and
+> needed a +42 / +117 correction one merge later. Re-pin by anchor and update this header, rather
+> than letting the numbers rot into the confidently-wrong state §9 catches three other documents in.
 
-Sizes, so you know what you are reading against (measured 2026-07-30):
+Sizes, so you know what you are reading against (`main` 43d5828, measured 2026-07-31):
 
 | File | Lines | Role |
 | --- | --- | --- |
-| `jarvis-core.mjs` | 5009 | the hub: HTTP server, voice dispatch, roster, spawn, TTS pump. All side effects live here. |
-| `jarvis-text.mjs` | 1909 | pure helpers, no I/O. Predicates and shaping only — see §5 for the trap. |
+| `jarvis-core.mjs` | 5051 | the hub: HTTP server, voice dispatch, roster, spawn, TTS pump. All side effects live here. |
+| `jarvis-text.mjs` | 2026 | pure helpers, no I/O. Predicates and shaping only — see §5 for the trap. |
 | `console.js` | 2407 | the whole browser UI. Vanilla JS, no framework, no build step. |
 | `console.html` | 33 | the region skeleton (§7). |
 | `console.css` | ~1000 | styling. |
@@ -32,14 +38,14 @@ Sizes, so you know what you are reading against (measured 2026-07-30):
 
 One Node process (`jarvis-core.mjs`) is the hub. It:
 
-1. Serves HTTP on `127.0.0.1:8124` (`main`, `jarvis-core.mjs:4875`; bind at 4881-4893).
+1. Serves HTTP on `127.0.0.1:8124` (`main`, `jarvis-core.mjs:4917`; bind at 4881-4893).
 2. Owns a Playwright-driven Chrome window that IS the console — and the microphone, and the
-   text-to-speech voice (`openConsole`, `jarvis-core.mjs:4919-4940`).
+   text-to-speech voice (`openConsole`, `jarvis-core.mjs:4961-4982`).
 3. Holds all state in memory and mirrors it to JSON files in `JARVIS_DATA` (§6). No external DB.
 4. Spawns Claude Code worker sessions, each of which talks back over the same HTTP API (§4).
 
 There is no auth, no user model, and no network exposure: it binds `127.0.0.1` explicitly
-(`jarvis-core.mjs:4883`) and every mutating request must pass an origin/host check (§1.1).
+(`jarvis-core.mjs:4925`) and every mutating request must pass an origin/host check (§1.1).
 
 The single event loop is load-bearing. `GET /poll` long-polls for up to 25s
 (`POLL_HOLD_MS`, `jarvis-core.mjs:1080`) by parking the `res` object in an in-memory array
@@ -50,11 +56,11 @@ inbox. `GET /search` explicitly breaks its archive scan across `await`s for this
 ### 0.1 Processes around the hub
 
 - **The watchdog / supervisor** relaunches the hub on hard exit. `POST /restart` clears the `STOP`
-  sentinel then sets `running = false` (`jarvis-core.mjs:4858-4864`); `POST /winddown` *writes*
-  `STOP` so the watchdog stops instead of relaunching (`jarvis-core.mjs:4850`). The sentinel file is
+  sentinel then sets `running = false` (`jarvis-core.mjs:4900-4906`); `POST /winddown` *writes*
+  `STOP` so the watchdog stops instead of relaunching (`jarvis-core.mjs:4892`). The sentinel file is
   `join(DATA, 'STOP')` and is cleared on every boot (`jarvis-core.mjs:123`).
 - **A worker host** (`pty-host.mjs`) owns a ConPTY per console-less worker and deliberately outlives
-  the hub, which is why retire must kill it explicitly (`killWorkerHost`, `jarvis-core.mjs:2442`,
+  the hub, which is why retire must kill it explicitly (`killWorkerHost`, `jarvis-core.mjs:2484`,
   called from `retireSession` at 1436).
 - **The permission hook** runs inside each worker's Claude Code process and POSTs to `/permission`,
   blocking until the human answers (§2.20).
@@ -71,10 +77,10 @@ Complete list, from a grep of `process.env` across the hub and its helpers:
 | `JARVIS_POLL_HOLD_MS` | 25000 | long-poll hold (`jarvis-core.mjs:1080`) |
 | `JARVIS_SPEECH_DEBOUNCE` | 4000 | speech batching window (`jarvis-core.mjs:1593`) |
 | `JARVIS_WEDGE_SWEEP_MS` | 15000 | deaf-coordinator sweep (`jarvis-core.mjs:1267`) |
-| `JARVIS_BATON_STALE_MS` | 300000 | merge-lane reclaim (`jarvis-core.mjs:2258`) |
+| `JARVIS_BATON_STALE_MS` | 300000 | merge-lane reclaim (`jarvis-core.mjs:2300`) |
 | `JARVIS_WORKTREES` | on | `=0` disables worktree isolation (`jarvis-core.mjs:1794`) |
 | `JARVIS_WT_ROOT` | `<repo>/../.jarvis-wt` | where worktrees are cut (`jarvis-core.mjs:1793`) |
-| `JARVIS_CONSOLELESS` | on | `=0` reverts to visible `wt` tabs (`jarvis-core.mjs:2352`) |
+| `JARVIS_CONSOLELESS` | on | `=0` reverts to visible `wt` tabs (`jarvis-core.mjs:2394`) |
 | `JARVIS_AI_CAP` | 20 (USD) | monthly cap for the ASK tab (`jarvis-core.mjs:70`) |
 | `JARVIS_ARCHIVE_SCAN_CAP` | 64 MiB | `/search` archive read bound (`jarvis-core.mjs:104`) |
 | `JARVIS_SESSION_BUDGET`, `JARVIS_REAL_USAGE` | 0 / off | token-meter tuning (`jarvis-core.mjs:241,269`) |
@@ -93,27 +99,27 @@ Complete list, from a grep of `process.env` across the hub and its helpers:
 
 ### 1.1 Request handling, common to every route
 
-- One function dispatches everything: `handleRequest` (`jarvis-core.mjs:3269`). Routing is a flat
+- One function dispatches everything: `handleRequest` (`jarvis-core.mjs:3311`). Routing is a flat
   chain of `if (key === 'METHOD /path')` on `key = req.method + ' ' + u.pathname`
-  (`jarvis-core.mjs:3271`). There is no router, no middleware, and **no path parameters anywhere** —
+  (`jarvis-core.mjs:3313`). There is no router, no middleware, and **no path parameters anywhere** —
   every identifier travels as a query string or a JSON body field.
 - **Mutation guard.** Any method other than GET/HEAD must satisfy `localRequestOk`
-  (`jarvis-core.mjs:3261-3267`): `Host` must be exactly `127.0.0.1:<PORT>` or `localhost:<PORT>`,
+  (`jarvis-core.mjs:3303-3309`): `Host` must be exactly `127.0.0.1:<PORT>` or `localhost:<PORT>`,
   and `Origin`, *if present*, must match. Failure is `403 {error:'forbidden: request must originate
-  from the local console'}` (3273-3275). Worker/`curl` traffic sends no `Origin`, so it passes
+  from the local console'}` (3315-3317). Worker/`curl` traffic sends no `Origin`, so it passes
   untouched; this exists to stop a visited web page firing `fetch()` at the hub, and DNS rebinding.
-- **Bodies** are collected as Buffers and decoded once (`readBody`, `jarvis-core.mjs:3244-3254`) —
+- **Bodies** are collected as Buffers and decoded once (`readBody`, `jarvis-core.mjs:3286-3296`) —
   concatenating decoded chunks would corrupt a multibyte character split across a chunk boundary.
-  Hard cap 30 MB, enforced by destroying the socket (3251). Parsing is *lenient*
+  Hard cap 30 MB, enforced by destroying the socket (3293). Parsing is *lenient*
   (`parseBodyLenient`, `jarvis-text.mjs:1163`), so a slightly malformed body may still be accepted.
 - **Responses** are `application/json; charset=utf-8` via `json(res, code, obj)`
-  (`jarvis-core.mjs:3240-3243`), except `/protocol` (text/plain), `/att` (image), and the three
+  (`jarvis-core.mjs:3282-3285`), except `/protocol` (text/plain), `/att` (image), and the three
   console assets.
-- **Unmatched paths fall through to the console HTML** (`jarvis-core.mjs:4871-4872`) with
+- **Unmatched paths fall through to the console HTML** (`jarvis-core.mjs:4913-4914`) with
   `cache-control: no-store, no-cache, must-revalidate`. There is **no 404 for an unknown path** —
   a typo'd endpoint returns the console page with status 200. v2 should not inherit this.
 - **Errors** are caught at the server callback and returned as `500 {error: message}`
-  (`jarvis-core.mjs:4877-4879`).
+  (`jarvis-core.mjs:4919-4921`).
 - Console assets are read fresh from disk per request (`freshAsset`, `jarvis-core.mjs:202`;
   served at 4869-4870), so a console-only change is live after a browser **reload** — only
   server-side changes need a hub restart.
@@ -125,93 +131,93 @@ below. Ordered as they appear in `handleRequest` so the file reads top-to-bottom
 
 | Line | Route | One-line purpose |
 | --- | --- | --- |
-| 3276 | `GET /worklist` | raw `worklist.json`, unprojected |
-| 3277 | `GET /board` | **the console's main view.** Projected cards; see §1.3 |
-| 3349 | `GET /missions` | raw `missions.json` |
-| 3350 | `GET /projects` | projected project list (`projectsView`, 826) |
-| 3351 | `GET /project?name=` | one project's compact context; 404 if unknown |
-| 3358 | `POST /project-context` | manager checkpoints curated context + appends a log line |
-| 3367 | `POST /project` | `op: rename \| bind` — structural project ops |
-| 3438 | `POST /trust` | flip one live session's trust tier (`trusted`/`guarded`) |
-| 3455 | `GET /roster` | live + last-20-retired sessions, plus `build` and `deadSpawns` |
-| 3504 | `GET /archive` | retired-session epitaphs; `?uid=` for one full entry |
-| 3532 | `GET /report` | SQLite reporting store read: `?view=work\|sessions\|tasks` |
-| 3611 | `GET /baton` | merge-lane state (reaps stale holders first) |
-| 3622 | `POST /baton` | `op: request \| release \| cancel \| force` |
-| 3713 | `GET /repos` | registered repo list for the console's `+` composer |
-| 3719 | `GET /hold` | parked projects (On Hold) |
-| 3728 | `POST /hold` | park a live session or a bare cwd+purpose |
-| 3756 | `POST /unhold` | pull a parked project back (respawns it) or `{drop:true}` |
-| 3794 | `GET /att?n=` | serve a saved attachment by filename |
-| 3804 | `GET /transcript?limit=` | chat feed projection. **Excludes `msg`** — see §3.5 |
-| 3844 | `GET /search?q=` | full-history chat search across cache + archive |
-| 3931 | `GET /mission-chat?missionId=` | durable mission-keyed conversation |
-| 3960 | `GET /tokens` | token burn / heat / session % |
-| 3963 | `GET /screen?uid=` | follow-up screenshot. **Voice-gated**, 403 otherwise |
-| 3977 | `GET /protocol` | serves `WORKER.md` as text/plain — every worker's boot read |
-| 3982 | `GET /poll?uid=&cursor=` | **the worker inbox.** Long-poll; see §3 |
-| 4022 | `GET /heartbeat?uid=` | liveness only; never blocks, returns no events |
-| 4038 | `POST /register` | create a session; see §4.1 |
-| 4046 | `POST /away` | away mode on/off (auto-trusts live sessions) |
-| 4051 | `POST /health` | `{context:0-100, doing}` — the board's context bar + doing line |
-| 4068 | `POST /watch` | a watcher session reports it is watching a channel |
-| 4080 | `GET /notify` | ntfy push URL + configured flag |
-| 4083 | `POST /notify` | set the ntfy URL |
-| 4089 | `POST /notify-test` | fire a test push |
-| 4095 | `POST /describe` | change a session's `purpose` |
-| 4105 | `POST /send` | worker→human (transcript) or worker→worker (bus). Receipt; see §2.5 |
-| 4138 | `POST /say` | speak a line aloud |
-| 4153 | `POST /react` | append a reaction to a message by its `ts` |
-| 4164 | `POST /focus` | set the single global focus |
-| 4185 | `POST /spawn` | launch a worker; the third of three spawn sites |
-| 4235 | `POST /permission` | **blocking.** The hook asks; the human answers |
-| 4259 | `POST /permission-answer` | answer one pending permission |
-| 4280 | `POST /permission-answer-all` | answer every pending permission for one session |
-| 4303 | `POST /attach` | base64 file → disk + a `screenshot` bus event |
-| 4321 | `POST /forget` | delete a board column (guarded; see §2.9) |
-| 4391 | `POST /worklist` | **the board mutation endpoint.** 8 ops; see §2.7 |
-| 4488 | `POST /mission` | `op: add\|phase\|unphase\|title\|doc\|undoc\|archive\|reactivate` |
-| 4534 | `POST /retire` | end a session, optionally spawning a successor |
-| 4547 | `POST /handoff` | checkpoint a handoff while live (latest wins) |
-| 4572 | `GET /handoff?cs=\|cwd=&purpose=` | read a predecessor's handoff |
-| 4605 | `POST /repos` | register/amend a repo |
-| 4620 | `POST /voices` | console reports which TTS voices exist (log only) |
-| 4625 | `POST /mute` | global mute |
-| 4630 | `POST /pause` | pause listening (discard speech) |
-| 4636 | `POST /stt-backend` | switch google ↔ local whisper |
-| 4643 | `POST /stt` | transcribe one base64 WAV via the local backend |
-| 4659 | `POST /voicemute` | silence one session's spoken lines |
-| 4670 | `POST /open` | open a URL/path in work Chrome |
-| 4678 | `POST /reveal` | `explorer.exe /select,` a path |
-| 4690 | `GET /ai/threads` | ASK tab: thread list + spend + models |
-| 4701 | `GET /ai/thread?id=` | one ASK thread with messages |
-| 4707 | `POST /ai/newthread` | create an ASK thread |
-| 4716 | `POST /ai/deletethread` | delete an ASK thread |
-| 4722 | `POST /ai/send` | call the Anthropic API directly; spend-capped |
-| 4760 | `GET /schedule` | today's meetings + reminders + `next`/`current`/`stale` |
-| 4776 | `POST /schedule` | load a schedule from an events array or pasted text |
-| 4805 | `POST /remind` | create a reminder (`{title,start}` or NL `{text}`) |
-| 4822 | `POST /hear` | **inject an utterance.** The typed-input path into §5 |
-| 4827 | `POST /winddown` | retire everyone and stop the hub; `{dry:true}` to preview |
-| 4858 | `POST /restart` | stop for the watchdog to relaunch |
-| 4869 | `GET /console.css` | asset, no-store |
-| 4870 | `GET /console.js` | asset, no-store |
-| 4871 | *(fallthrough)* | `console.html` for **every** other path |
+| 3318 | `GET /worklist` | raw `worklist.json`, unprojected |
+| 3319 | `GET /board` | **the console's main view.** Projected cards; see §1.3 |
+| 3391 | `GET /missions` | raw `missions.json` |
+| 3392 | `GET /projects` | projected project list (`projectsView`, 826) |
+| 3393 | `GET /project?name=` | one project's compact context; 404 if unknown |
+| 3400 | `POST /project-context` | manager checkpoints curated context + appends a log line |
+| 3409 | `POST /project` | `op: rename \| bind` — structural project ops |
+| 3480 | `POST /trust` | flip one live session's trust tier (`trusted`/`guarded`) |
+| 3497 | `GET /roster` | live + last-20-retired sessions, plus `build` and `deadSpawns` |
+| 3546 | `GET /archive` | retired-session epitaphs; `?uid=` for one full entry |
+| 3574 | `GET /report` | SQLite reporting store read: `?view=work\|sessions\|tasks` |
+| 3653 | `GET /baton` | merge-lane state (reaps stale holders first) |
+| 3664 | `POST /baton` | `op: request \| release \| cancel \| force` |
+| 3755 | `GET /repos` | registered repo list for the console's `+` composer |
+| 3761 | `GET /hold` | parked projects (On Hold) |
+| 3770 | `POST /hold` | park a live session or a bare cwd+purpose |
+| 3798 | `POST /unhold` | pull a parked project back (respawns it) or `{drop:true}` |
+| 3836 | `GET /att?n=` | serve a saved attachment by filename |
+| 3846 | `GET /transcript?limit=` | chat feed projection. **Excludes `msg`** — see §3.5 |
+| 3886 | `GET /search?q=` | full-history chat search across cache + archive |
+| 3973 | `GET /mission-chat?missionId=` | durable mission-keyed conversation |
+| 4002 | `GET /tokens` | token burn / heat / session % |
+| 4005 | `GET /screen?uid=` | follow-up screenshot. **Voice-gated**, 403 otherwise |
+| 4019 | `GET /protocol` | serves `WORKER.md` as text/plain — every worker's boot read |
+| 4024 | `GET /poll?uid=&cursor=` | **the worker inbox.** Long-poll; see §3 |
+| 4064 | `GET /heartbeat?uid=` | liveness only; never blocks, returns no events |
+| 4080 | `POST /register` | create a session; see §4.1 |
+| 4088 | `POST /away` | away mode on/off (auto-trusts live sessions) |
+| 4093 | `POST /health` | `{context:0-100, doing}` — the board's context bar + doing line |
+| 4110 | `POST /watch` | a watcher session reports it is watching a channel |
+| 4122 | `GET /notify` | ntfy push URL + configured flag |
+| 4125 | `POST /notify` | set the ntfy URL |
+| 4131 | `POST /notify-test` | fire a test push |
+| 4137 | `POST /describe` | change a session's `purpose` |
+| 4147 | `POST /send` | worker→human (transcript) or worker→worker (bus). Receipt; see §2.5 |
+| 4180 | `POST /say` | speak a line aloud |
+| 4195 | `POST /react` | append a reaction to a message by its `ts` |
+| 4206 | `POST /focus` | set the single global focus |
+| 4227 | `POST /spawn` | launch a worker; the third of three spawn sites |
+| 4277 | `POST /permission` | **blocking.** The hook asks; the human answers |
+| 4301 | `POST /permission-answer` | answer one pending permission |
+| 4322 | `POST /permission-answer-all` | answer every pending permission for one session |
+| 4345 | `POST /attach` | base64 file → disk + a `screenshot` bus event |
+| 4363 | `POST /forget` | delete a board column (guarded; see §2.9) |
+| 4433 | `POST /worklist` | **the board mutation endpoint.** 8 ops; see §2.7 |
+| 4530 | `POST /mission` | `op: add\|phase\|unphase\|title\|doc\|undoc\|archive\|reactivate` |
+| 4576 | `POST /retire` | end a session, optionally spawning a successor |
+| 4589 | `POST /handoff` | checkpoint a handoff while live (latest wins) |
+| 4614 | `GET /handoff?cs=\|cwd=&purpose=` | read a predecessor's handoff |
+| 4647 | `POST /repos` | register/amend a repo |
+| 4662 | `POST /voices` | console reports which TTS voices exist (log only) |
+| 4667 | `POST /mute` | global mute |
+| 4672 | `POST /pause` | pause listening (discard speech) |
+| 4678 | `POST /stt-backend` | switch google ↔ local whisper |
+| 4685 | `POST /stt` | transcribe one base64 WAV via the local backend |
+| 4701 | `POST /voicemute` | silence one session's spoken lines |
+| 4712 | `POST /open` | open a URL/path in work Chrome |
+| 4720 | `POST /reveal` | `explorer.exe /select,` a path |
+| 4732 | `GET /ai/threads` | ASK tab: thread list + spend + models |
+| 4743 | `GET /ai/thread?id=` | one ASK thread with messages |
+| 4749 | `POST /ai/newthread` | create an ASK thread |
+| 4758 | `POST /ai/deletethread` | delete an ASK thread |
+| 4764 | `POST /ai/send` | call the Anthropic API directly; spend-capped |
+| 4802 | `GET /schedule` | today's meetings + reminders + `next`/`current`/`stale` |
+| 4818 | `POST /schedule` | load a schedule from an events array or pasted text |
+| 4847 | `POST /remind` | create a reminder (`{title,start}` or NL `{text}`) |
+| 4864 | `POST /hear` | **inject an utterance.** The typed-input path into §5 |
+| 4869 | `POST /winddown` | retire everyone and stop the hub; `{dry:true}` to preview |
+| 4900 | `POST /restart` | stop for the watchdog to relaunch |
+| 4911 | `GET /console.css` | asset, no-store |
+| 4912 | `GET /console.js` | asset, no-store |
+| 4913 | *(fallthrough)* | `console.html` for **every** other path |
 
 ### 1.3 `GET /board` — the projection v2 has to reproduce
 
-`jarvis-core.mjs:3277-3348`. This is the endpoint that matters most for a PrimeNG rebuild: the
+`jarvis-core.mjs:3319-3390`. This is the endpoint that matters most for a PrimeNG rebuild: the
 console polls it every 1.5s and renders almost everything from it. It is a **join** across five
-stores, done in-process, with a documented one-read-per-request discipline (3279, 3283) and **no git
-calls** (3282).
+stores, done in-process, with a documented one-read-per-request discipline (3321, 3325) and **no git
+calls** (3324).
 
-Response envelope (3347):
+Response envelope (3389):
 
 ```
 { focus, muted, paused, sttBackend, sttReady, awayUntil, missions:[...], boards:[ card, ... ] }
 ```
 
-Card ordering (3298-3301): focus first, then live non-project callsigns, then `jarvis`, then any
+Card ordering (3340-3343): focus first, then live non-project callsigns, then `jarvis`, then any
 remaining board column. Note the filter at 3298 — a session carrying `.project` is **excluded** from
 the live list, because it renders as its project's card instead.
 
@@ -229,7 +235,7 @@ Per-card fields, with why each exists:
 | `context` | 3329 | last `POST /health` value, or null — **never absent** |
 | `doing` | 3330 | last `POST /health` phrase, `''` if never posted |
 | `watching` | 3331 | channel label while `/watch` pings are fresh (TTL 5 min, 977) |
-| `needsYou` | 3332 | set by a `Need you:` `/say` (4146) or a pending permission (4254) |
+| `needsYou` | 3332 | set by a `Need you:` `/say` (4188) or a pending permission (4296) |
 | `voiceMuted` | 3333 | per-session spoken-line mute |
 | `pendingPerm`, `pendingPermCount` | 3334-3335 | the blocking permission request, if any |
 | `projectContext` | 3338 | `compactProjectContext` — summary/currentFocus/openThreads/docs/recentLog tail |
@@ -237,7 +243,7 @@ Per-card fields, with why each exists:
 | `baton` | 3343 | merge-lane state, holder or queue position |
 | `working`,`queued`,`done`,`review` | 3344 | the four lanes, full task objects |
 
-`GET /roster` (3455) deliberately spells the same expressions the same way (rationale 3466-3471)
+`GET /roster` (3497) deliberately spells the same expressions the same way (rationale 3466-3471)
 because the two endpoints disagreeing about one session has already produced a false defect report.
 **If v2 splits these, keep one projection function.**
 
@@ -246,24 +252,24 @@ because the two endpoints disagreeing about one session has already produced a f
 Rather than repeat per route:
 
 - **`400`** — missing/invalid required field. Notable: `/register` demands both `cwd` and `purpose`
-  and says why (4040-4042); `/health` rejects a context outside 0-100 (4056); `/search` rejects a
-  blank `q` **rather than returning `[]`** (3864) and rejects an unknown `kinds` value (3874), on the
+  and says why (4082-4084); `/health` rejects a context outside 0-100 (4098); `/search` rejects a
+  blank `q` **rather than returning `[]`** (3906) and rejects an unknown `kinds` value (3916), on the
   stated ground that a confident empty result is worse than an error.
-- **`403`** — the origin/host guard (3273), and `/screen` when not voice-gated (3966).
+- **`403`** — the origin/host guard (3315), and `/screen` when not voice-gated (4008).
 - **`404`** — unknown uid (`/poll` 3986, `/heartbeat` 4032, `/health` 4054, `/baton` 3662), unknown
-  recipient (`/send` 4114), unknown project (3355, 3384), no task matching a needle (`/worklist`
-  4418, 4435, 4444), not on hold (3766), no pending permission (4262).
+  recipient (`/send` 4114), unknown project (3397, 3426), no task matching a needle (`/worklist`
+  4418, 4435, 4444), not on hold (3808), no pending permission (4304).
 - **`409`** — `assignCallsign` exhausted, i.e. all 26 callsigns live (`/register` 4044 wrapping the
-  throw at 1001); project rename onto an existing name (3414); `/baton op:cancel` while holding
-  (3703); `/stt` when the backend is not local (4649); **`/forget` with work in flight** (4359).
-- **`410`** — retired uid on `/poll` (3987), `/heartbeat` (4033), `/baton op:request` (3667). This is
+  throw at 1001); project rename onto an existing name (3456); `/baton op:cancel` while holding
+  (3745); `/stt` when the backend is not local (4691); **`/forget` with work in flight** (4401).
+- **`410`** — retired uid on `/poll` (4029), `/heartbeat` (4075), `/baton op:request` (3709). This is
   the signal that means *stop polling*, distinct from 404.
-- **`402`** — ASK monthly spend cap reached (4730).
-- **`500`** — unwritable `batons.json` (3650, 3677, 3692, 3706), unreadable archive entry (3514),
-  spawn failure on unhold (3786), store read failure (3608), screenshot failure (3974).
-- **`503`** — reporting store off (3556); no Anthropic key (4744-4748).
-- **No response at all** — `POST /permission` (4257) parks the response and returns nothing until the
-  human answers or a 300s timer fires `{decision:'timeout'}` (4251). `GET /poll` does the same for up
+- **`402`** — ASK monthly spend cap reached (4772).
+- **`500`** — unwritable `batons.json` (3692, 3719, 3734, 3748), unreadable archive entry (3556),
+  spawn failure on unhold (3828), store read failure (3650), screenshot failure (4016).
+- **`503`** — reporting store off (3598); no Anthropic key (4786-4790).
+- **No response at all** — `POST /permission` (4299) parks the response and returns nothing until the
+  human answers or a 300s timer fires `{decision:'timeout'}` (4293). `GET /poll` does the same for up
   to 25s. **Any v2 client library must tolerate a deliberately-hung request on these two routes.**
 
 ---
@@ -273,7 +279,7 @@ Rather than repeat per route:
 ### 2.1 `POST /register` → `registerSession` (4038 → 1277)
 
 Body: `{cwd, purpose, pin?, project?, parentProject?}`. Both `cwd` and `purpose` are **required**
-(4040).
+(4082).
 
 Response: `{uid, callsign, build:{commit,short,dirty,bootedAt,pid}}` plus optionally
 `handoff:{summary,from,ts,hint}` (1404) and `project:<context>` (1405).
@@ -301,11 +307,11 @@ What happens inside, in order (1277-1406):
 10. A stale schedule triggers a `msg` event asking this worker to pull the calendar (1377-1394),
     stamped once per day before queueing so a delivery failure cannot double-ask.
 
-### 2.2 `POST /worklist` (4391) — the board's only mutation path
+### 2.2 `POST /worklist` (4433) — the board's only mutation path
 
 Body: `{op, callsign?, text, to?}` plus optional task fields on `add`.
 
-`callsign` resolves through `boardKey` (4397) so a bound coordinator posting as itself lands on its
+`callsign` resolves through `boardKey` (4439) so a bound coordinator posting as itself lands on its
 **project** column — without this it minted a second tracker for one session.
 
 | op | From lanes | To | Notes |
@@ -322,19 +328,19 @@ Body: `{op, callsign?, text, to?}` plus optional task fields on `add`.
 
 **Matching is by case-insensitive substring, first hit wins, across EVERY board**
 (`findTaskAll`, 613-625, with the poster's board preferred). A short needle silently moves someone
-else's card. A needle matching nothing is `404 no task matching <text>` (4418).
+else's card. A needle matching nothing is `404 no task matching <text>` (4460).
 
 Two subtleties v2 must preserve or deliberately drop:
 
-- **Credit the board holding the task, not the poster** (4457-4468). `record({kind:'task', board:
+- **Credit the board holding the task, not the poster** (4499-4510). `record({kind:'task', board:
   owner})` — `db.mjs`'s `taskTimesFromTranscript` keys on `(board, text)`, so crediting the poster
   produced a key matching nothing and the timestamp was *lost*, not misplaced.
 - **Lane is current truth; `startedAt`/`doneAt` are history, and they are allowed to disagree**
-  (4469-4474). `db.mjs` COALESCEs, so a timestamp once written can never be cleared — `ready` on a
+  (4511-4516). `db.mjs` COALESCEs, so a timestamp once written can never be cleared — `ready` on a
   finished task leaves `doneAt` standing beside `lane='queued'`. **"What is finished" means
   `lane='done'`, never `doneAt IS NOT NULL`.**
 
-### 2.3 `POST /baton` (3622) — the serialized merge lane
+### 2.3 `POST /baton` (3664) — the serialized merge lane
 
 One lane per repo key (`batonRepoKey`, 2213), so another repo never blocks yours. Pure lane
 transitions live in `jarvis-text.mjs` (`batonRequest` 1482, `batonRelease` 1501, `batonCancel` 1520,
@@ -342,82 +348,82 @@ transitions live in `jarvis-text.mjs` (`batonRequest` 1482, `batonRelease` 1501,
 
 - `request` → `{granted, position, holder, already, repo, base, waiting}`. `granted:false` means
   queued — **the caller must go back to its poll loop**, and a `baton` event wakes it when its turn
-  comes (`notifyBatonGrant`, 2227-2237). The lane's `base` is re-resolved on every request (3672)
+  comes (`notifyBatonGrant`, 2227-2237). The lane's `base` is re-resolved on every request (3714)
   because Chris moves the integration branch.
 - `release` → hands to the next in queue and announces it.
-- `cancel` while **holding** is `409` (3703) — doing nothing quietly would leave the lane shut by a
+- `cancel` while **holding** is `409` (3745) — doing nothing quietly would leave the lane shut by a
   worker that believes it let go.
-- `force` is the console's override: no uid, because Chris is not a session (3629-3631). Always
+- `force` is the console's override: no uid, because Chris is not a session (3671-3673). Always
   announced, spoken and recorded.
-- **Reap-on-read**: both `GET` and `POST /baton` call `reapBatons()` first (3616, 3625) so a lane
+- **Reap-on-read**: both `GET` and `POST /baton` call `reapBatons()` first (3658, 3667) so a lane
   whose holder died is never *served* as busy. Stale threshold 300s (`BATON_STALE`, 2258).
 - Retiring releases for you (`releaseBatonsFor`, 2302, called at 1449) — **before** the successor
   spawn, and the successor does **not** inherit: it re-requests.
 
-### 2.4 `GET /search` (3844) — the one endpoint that reads history
+### 2.4 `GET /search` (3886) — the one endpoint that reads history
 
 Params: `q` (required, terms ANDed, case-insensitive substring), `kinds` (default
 `speech,chat,tts,msg`; `all` for all seven), `from`, `missionId`, `limit` (default 50, max 200).
 
-It reads the in-memory cache backwards, then the archive backwards (3894-3910) — every archived line
+It reads the in-memory cache backwards, then the archive backwards (3936-3952) — every archived line
 is older than every cached one by construction, so the two walks concatenated are already newest-first
-and nothing sorts. `total` keeps counting past `limit` so a caller can say "50 of 347" (3888-3890).
+and nothing sorts. `total` keeps counting past `limit` so a caller can say "50 of 347" (3930-3932).
 
 The archive scan is bounded at 64 MiB and **says so** in the response (`archive.capped`,
 `archive.oldestScannedTs`, 3917-3925) — a bounded read that does not report its bound is
 indistinguishable from a complete one. A raw-substring prefilter avoids `JSON.parse` on ~99% of
 lines, but terms containing `"` or `\` are excluded from the prefilter because they appear escaped in
-the line (3897-3903).
+the line (3939-3945).
 
-### 2.5 `POST /send` (4105) — two completely different behaviours
+### 2.5 `POST /send` (4147) — two completely different behaviours
 
 - `to === 'human'`: `record({kind:'chat'})` and return `{ok:true}` — **no `cursor`**, because it never
-  touches the bus (4133-4135).
+  touches the bus (4175-4177).
 - `to === <uid or callsign>`: `busAppend` a `msg` event **and** `record({kind:'msg'})`, returning a
-  receipt `{ok:true, cursor, to, uid}` (4136). `cursor` is the absolute bus index the message landed
+  receipt `{ok:true, cursor, to, uid}` (4178). `cursor` is the absolute bus index the message landed
   at — re-readable via `GET /poll?uid=<uid>&cursor=<it>`.
 
-**The `to` field means different things in the two records.** On the bus it is a **uid** (4117); in
-the transcript it is a **callsign** (4128). Same field name, two key spaces. This is the single most
+**The `to` field means different things in the two records.** On the bus it is a **uid** (4159); in
+the transcript it is a **callsign** (4170). Same field name, two key spaces. This is the single most
 likely v2 schema landmine in the whole system.
 
-### 2.6 `GET /handoff` (4572) — three lookup paths
+### 2.6 `GET /handoff` (4614) — three lookup paths
 
-1. `?cs=<callsign>` and a `cs:<callsign>` stash exists → return it and **delete it** (4579-4582).
+1. `?cs=<callsign>` and a `cs:<callsign>` stash exists → return it and **delete it** (4621-4624).
    One-shot, written by `spawnWorker` at 2600.
 2. `?cwd=<path>[&purpose=<p>]` → the durable per-job record keyed by
    `handoffKey(cwd, purpose)` = `cwdKey(cwd) + "\n" + normalized purpose`
    (`jarvis-text.mjs:266-269`). Without `purpose`, falls back to the most recent record on that cwd
-   (4589-4595) — legacy support.
-3. `?cs=` with no stash → most recent durable record authored by that callsign (4596-4600).
+   (4631-4637) — legacy support.
+3. `?cs=` with no stash → most recent durable record authored by that callsign (4638-4642).
 
-Miss returns `200 {none:true}`, **not** a 404 (4602).
+Miss returns `200 {none:true}`, **not** a 404 (4644).
 
-### 2.7 `POST /permission` (4235) — the blocking one
+### 2.7 `POST /permission` (4277) — the blocking one
 
 Called by `perm-hook.mjs` inside a worker. Auto-allow paths, in order: a stored `autoAllow` signature
-(4242), then — for non-`danger` classes only — an active `trustUntil` window or `tier === 'trusted'`
-(4245-4248). Otherwise it registers a pending record, sets `needsYou`, records a `sys` line, speaks
-`"Need you: …"`, and **returns nothing** (4257). A 300s timer answers `{decision:'timeout'}` (4251).
+(4284), then — for non-`danger` classes only — an active `trustUntil` window or `tier === 'trusted'`
+(4287-4290). Otherwise it registers a pending record, sets `needsYou`, records a `sys` line, speaks
+`"Need you: …"`, and **returns nothing** (4299). A 300s timer answers `{decision:'timeout'}` (4293).
 
 `POST /permission-answer` with `decision:'always'` stores the signature on the session so the same
-call auto-allows thereafter (4266-4272). `permSig`/`permLabel` (`jarvis-text.mjs:639,648`) collapse a
+call auto-allows thereafter (4308-4314). `permSig`/`permLabel` (`jarvis-text.mjs:639,648`) collapse a
 command to a stable signature, with `PERM_MULTIWORD` (636) keeping `git commit` distinct from
 `git status`.
 
-### 2.8 `POST /forget` (4321) — guarded destruction
+### 2.8 `POST /forget` (4363) — guarded destruction
 
-Deletes a whole board column. **The guard runs before the retire** (4325-4327) — a check bolted on
-afterwards would kill the session and only then refuse. It counts `working + queued` only (4356);
+Deletes a whole board column. **The guard runs before the retire** (4367-4369) — a check bolted on
+afterwards would kill the session and only then refuse. It counts `working + queued` only (4398);
 `done`/`review` are deliberately excluded because they are recoverable from the transcript and a
-guard that cries wolf gets forced past by reflex (4340-4343). With work in flight and no
-`force:true`, `409` with a body naming the alternatives (4359-4367). A forced call names the cost in
-its `sys` line (4384-4388).
+guard that cries wolf gets forced past by reflex (4382-4385). With work in flight and no
+`force:true`, `409` with a body naming the alternatives (4401-4409). A forced call names the cost in
+its `sys` line (4426-4430).
 
-### 2.9 `POST /retire` (4534) → `retireSession` (1411)
+### 2.9 `POST /retire` (4576) → `retireSession` (1411)
 
 Body `{uid, summary, notes?, successor?}`. `notes` is stored as the session's handoff before
-retiring (4537). Successor decision: `shouldSpawnSuccessor(requested, hasWork)`
+retiring (4579). Successor decision: `shouldSpawnSuccessor(requested, hasWork)`
 (`jarvis-text.mjs:352`) — `true` always spawns, `false` never, omitted spawns iff `working+queued`
 is non-empty.
 
@@ -440,15 +446,15 @@ is non-empty.
    the successor via `transferBoard` (1570) and focus follows the work (1572).
 9. Bus a `retired` event to the retiring uid (1546/1579/1590) — the worker's stop signal.
 
-### 2.10 `POST /spawn` (4185) — one of three spawn sites
+### 2.10 `POST /spawn` (4227) — one of three spawn sites
 
 The other two are the retire auto-successor (1519, 1561) and the mission auto-revive
 (`reviveMissionCoordinator`, 1690). All three now ask `coordinatorHeld` before minting a coordinator;
-`/spawn` was the last door left open to two brains on one project (4193-4198). An explicit human ask
-is **not refused** — the new session nests as a sub-worker instead (4204).
+`/spawn` was the last door left open to two brains on one project (4235-4240). An explicit human ask
+is **not refused** — the new session nests as a sub-worker instead (4246).
 
-`from` is accepted as a uid *or* a callsign (4211-4213) so a spawn that dies before registering can
-be reported back to whoever asked (`spawnDispatch`, `jarvis-text.mjs:1796`; death detection at
+`from` is accepted as a uid *or* a callsign (4253-4255) so a spawn that dies before registering can
+be reported back to whoever asked (`spawnDispatch`, `jarvis-text.mjs:1913`; death detection at
 `sweepDeadSpawns`, 2543, timeout 90s at `SPAWN_REGISTER_TIMEOUT_MS`, 1777).
 
 ---
@@ -481,16 +487,16 @@ written by none.
   works only because `?cursor=i` is inclusive.
 - **Advancing past an event makes it unreachable through `/poll` forever.** No error; both ends read
   healthy. Recovery is `GET /poll?uid=<uid>&cursor=<the missed index>`, and **the uid is not
-  optional** — `/poll` reads it first and 404s without it (3986).
+  optional** — `/poll` reads it first and 404s without it (4028).
 - The hub watches for this. `gapNotice` (1099-1122) compares the cursor you polled with the one it
   last handed you (`lastPollCursor`, stamped in `pollRespond`, 1086) via `cursorGap`
   (`jarvis-text.mjs:1141`). It is **silent unless something addressed to you was inside the jumped
   window** (1108) — an absolute-index gap alone is meaningless on a shared bus.
-- **An idle timeout answers with the waiter's OWN cursor, never the bus head** (4008-4013). Speech is
+- **An idle timeout answers with the waiter's OWN cursor, never the bus head** (4050-4055). Speech is
   bused with a 4s debounce, so an event addressed to that very waiter can be sitting at the head
   un-released when the hold expires; handing back the head would tell the worker to skip the human's
   own words, and the gap detector could not see it because the baseline it compares against *is* that
-  number. Same rule on shutdown (4995-5002).
+  number. Same rule on shutdown (5037-5044).
 
 ### 3.3 The six bus event kinds
 
@@ -508,14 +514,14 @@ Verified by enumerating every `busAppend` call site. There are exactly six:
 ### 3.4 `gap` is NOT a bus event
 
 `gapNotice` returns a fully-formed event object — `{from:'jarvis', to:uid, kind:'gap', text, ts}`
-(1121) — but it is **never bused**. `GET /poll` unshifts it onto the response array (3998-4000).
+(1121) — but it is **never bused**. `GET /poll` unshifts it onto the response array (4040-4042).
 Consequences a v2 implementation must know:
 
 - It has no bus index, so it cannot be re-read.
 - It is synthesized per-poll from in-memory state (`lastPollCursor`), so it **does not survive a hub
   restart**.
 - It is delivered as an event rather than a side field precisely because the documented wrapper loop
-  only exits on a non-empty `events` array (3995-3997).
+  only exits on a non-empty `events` array (4037-4039).
 
 **`sys` is also not a bus kind.** It is a transcript kind only (§6.7). Measured on the live bus —
 5029 retained events, `busBase` 2002 — the kind histogram is `speech 3639, msg 758, retired 346,
@@ -531,12 +537,12 @@ yet exercised on this bus).
   events.
 - `pendingFor(uid)` (1168-1177) counts events past the session's last-polled cursor. Zero for a
   session that has never polled — we cannot claim it is ignoring anything until it says where it is.
-- `GET /transcript` and `GET /mission-chat` both **exclude `msg`** (3810, 3946). The reasons differ
+- `GET /transcript` and `GET /mission-chat` both **exclude `msg`** (3852, 3988). The reasons differ
   and both are load-bearing: the console routes a line by its `who`, so a worker-authored message
-  would render in the *sender's* tab as if said to Chris (3806-3809); and a booting coordinator is
+  would render in the *sender's* tab as if said to Chris (3848-3851); and a booting coordinator is
   told to treat the newest mission-chat as its live prompt, so admitting delegation briefs would feed
   a sub-worker's own instructions back to the coordinator as though the human had said them
-  (3942-3945). Net effect: **worker-to-worker traffic is recorded and searchable but invisible in
+  (3984-3987). Net effect: **worker-to-worker traffic is recorded and searchable but invisible in
   every chat view.**
 
 ---
@@ -558,9 +564,9 @@ POST /register  ->  {uid, callsign, build}
 POST /retire {uid, summary, notes}  ->  archive + handoff + maybe a successor
 ```
 
-The two loops are **separate on purpose** (`jarvis-core.mjs:4023-4029`). Both `/poll` and
-`/heartbeat` bump `lastSeen`, but only `/poll` bumps `lastPoll` (3992) and only `/heartbeat` bumps
-`lastBeat` (4034). Keeping them apart *is* the wedge detector: the heartbeat proves a timer is alive,
+The two loops are **separate on purpose** (`jarvis-core.mjs:4065-4071`). Both `/poll` and
+`/heartbeat` bump `lastSeen`, but only `/poll` bumps `lastPoll` (4034) and only `/heartbeat` bumps
+`lastBeat` (4076). Keeping them apart *is* the wedge detector: the heartbeat proves a timer is alive,
 `/poll` proves the worker's ears are. Without the heartbeat, one long agent turn leaves the poll loop
 un-relaunched, `lastSeen` goes stale, and at 120s (`aliveNow`, 969) the hub marks the session gone.
 
@@ -592,9 +598,9 @@ spawn as holding the slot for 120s, so the three spawn sites cannot race.
 
 Two ways a handoff is created:
 
-- **`POST /handoff`** (4547) while live — a checkpoint, safe to repeat, latest wins. Stores
-  `summary`, `notes`, an `auto` block, and a `{working, queued}` board snapshot (4562-4568).
-- **`POST /retire`** (4534) — stores the same plus **all four lanes** (1466) and the WIP verdict.
+- **`POST /handoff`** (4589) while live — a checkpoint, safe to repeat, latest wins. Stores
+  `summary`, `notes`, an `auto` block, and a `{working, queued}` board snapshot (4604-4610).
+- **`POST /retire`** (4576) — stores the same plus **all four lanes** (1466) and the WIP verdict.
 
 `roster.handoffs` is keyed by `handoffKey(cwd, purpose)` (§2.6). A coarser cwd-only key was wrong: one
 directory hosts many unrelated jobs, so whoever retired last overwrote the single slot and the next
@@ -618,7 +624,7 @@ state only**, in this order:
    `git log --oneline -20 && git status` in the shared cwd (340-342). On an inherited branch **that
    diff IS the handoff nobody wrote**.
 
-**A live-data caveat the code comment does not cover.** `jarvis-core.mjs:4558` says "every handoff
+**A live-data caveat the code comment does not cover.** `jarvis-core.mjs:4600` says "every handoff
 record carries an `auto` block" is an invariant a reader can rely on. Measured on the live store:
 **7 of 106 records have one.** It is an invariant for records written from now on, not a property of
 the store — a successor inheriting an older job gets `auto: undefined`. Likewise 6 of 106 keys are
@@ -636,25 +642,25 @@ Console "relaunch" is `POST /retire {successor:true}` with a fixed summary and *
 ### 4.5 Spawning a worker (`spawnWorker`, 2570-2742)
 
 1. Pin the callsign (`pendingPins`, 2573) with a 300s TTL (994).
-2. Strip shell/`wt` specials from the purpose (2579) — a `;` chopped the `wt` command in half.
+2. Strip shell/`wt` specials from the purpose (2621) — a `;` chopped the `wt` command in half.
 3. Stash the intended binding (`pendingBind`, 2587) so nesting is deterministic even if the worker
    drops the field.
 4. **Cut a worktree** if `shouldIsolate` says so (2591 → `jarvis-text.mjs:1306`). Best-effort: any
    git failure leaves `wt` null and the worker shares the repo cwd, with a `sys` line saying which
-   (1866-1895).
-5. **Compose the boot prompt** (2595-2668) — a single string, assembled from up to eight paragraphs:
+   (1875-1904).
+5. **Compose the boot prompt** (2637-2710) — a single string, assembled from up to eight paragraphs:
    base, successor-handoff, project-coordinator, delegation, mission-link, sub-worker story,
    meeting, worktree, permissions.
-6. **Cap it** (`capBootPrompt`, 2682 → `jarvis-text.mjs:1740`). `BOOT_PROMPT_MAX` is 24000 chars
-   against `CMD_LINE_MAX` 32767 (`jarvis-text.mjs:1709,1723`), because the prompt is re-parsed as a
+6. **Cap it** (`capBootPrompt`, 2682 → `jarvis-text.mjs:1857`). `BOOT_PROMPT_MAX` is 24000 chars
+   against `CMD_LINE_MAX` 32767 (`jarvis-text.mjs:1826,1723`), because the prompt is re-parsed as a
    `cmd.exe` command line and `CreateProcess` refuses anything longer — silently, as a worker that
    never registers with an empty log. A cut prompt gets a `sys` line naming both lengths and a spoken
-   headline (2683-2689).
-7. Launch: console-less via `pty-host.mjs` (2703) if `CONSOLELESS`, else a `wt new-tab` running a
-   generated `.cmd` (2711-2721) with a `cmd /c start` fallback (2723).
-8. `watchSpawn` (2469) arms death detection; `sweepDeadSpawns` (2543) reports it to whoever asked.
+   headline (2725-2731).
+7. Launch: console-less via `pty-host.mjs` (2745) if `CONSOLELESS`, else a `wt new-tab` running a
+   generated `.cmd` (2753-2763) with a `cmd /c start` fallback (2765).
+8. `watchSpawn` (2511) arms death detection; `sweepDeadSpawns` (2585) reports it to whoever asked.
 
-**No angle brackets in the boot prompt** (2624-2629): `cmd.exe` reads `<` and `>` as redirection, and
+**No angle brackets in the boot prompt** (2666-2671): `cmd.exe` reads `<` and `>` as redirection, and
 an angle-bracketed placeholder made cmd answer "The system cannot find the file specified" with the
 worker never registering.
 
@@ -668,7 +674,7 @@ worker never registering.
 | wedge, no grace at all | `pendingPerms > 0` **AND** `pending > 0` — both required. A permission prompt with nothing queued behind it is ordinary operation | `jarvis-text.mjs:1108` |
 | wedge escalation | 0, 60s, 180s, 420s, 900s | `WEDGE_ESCALATE_MS`, `jarvis-text.mjs:1064` |
 | watching light | `/watch` ping within 5 min AND alive | `watchingNow`, 978-984 |
-| spawn death | no register within 90s | `jarvis-text.mjs:1777` |
+| spawn death | no register within 90s | `jarvis-text.mjs:1894` |
 | baton stale | holder unseen 300s | 2258 |
 
 `announceWedge` (1234-1260) answers four questions the human used to have to ask: **who** is deaf,
@@ -681,16 +687,16 @@ chases deaf **coordinators** even when the human has stopped talking to them.
 
 After a hub restart, run **after** `listen` so a slow git call never delays the port:
 
-1. `liveWorkerHosts` (1965) reads `worker-<cs>.pid` files and checks each pid.
+1. `liveWorkerHosts` (1987) reads `worker-<cs>.pid` files and checks each pid.
 2. `reconcileRoster` (`jarvis-text.mjs:1332`) classifies: re-adopt survivors, bury ghosts.
    `launch:'wt'` sessions get a grace window — they outlive the hub on their own.
-3. `buryGhosts` (2014) retires them `{quiet:true}` so the human hears one summary, not a casualty list.
-4. `restoreBootingState` (2034) puts in-flight spawns back into `pendingPins`/`pendingBind`.
-5. **`sweepWorktrees` is deferred** (2123-2156) until survivors have had a chance to check in —
+3. `buryGhosts` (2036) retires them `{quiet:true}` so the human hears one summary, not a casualty list.
+4. `restoreBootingState` (2056) puts in-flight spawns back into `pendingPins`/`pendingBind`.
+5. **`sweepWorktrees` is deferred** (2145-2198) until survivors have had a chance to check in —
    calling it directly used to delete live workers' directories.
 
 **The sweep hazard, still live:** it collects every directory under `WT_ROOT` that no live session
-claims (`orphanWorktrees`, `jarvis-text.mjs:1370`). A manager's ad-hoc worktree under
+claims (`orphanWorktrees`, `jarvis-text.mjs:1413`). A manager's ad-hoc worktree under
 `d:/claude/.jarvis-wt` is claimable by nothing and gets eaten. Put scratch trees elsewhere.
 
 ---
@@ -705,32 +711,32 @@ claims (`orphanWorktrees`, `jarvis-text.mjs:1370`). A manager's ad-hoc worktree 
 `enqueueSay`. Shipping a helper without wiring it into `handleUtterance` ships nothing.
 
 **Two corrections to the map every session has been using.** The project's own open-threads note says
-"handleSpeech in jarvis-core.mjs (~2462-2790)". At `main` bfcedcf:
+"handleSpeech in jarvis-core.mjs (~2462-2790)". At `main` 43d5828:
 
-- The function is named **`handleUtterance`**, not `handleSpeech` (`jarvis-core.mjs:2746`).
+- The function is named **`handleUtterance`**, not `handleSpeech` (`jarvis-core.mjs:2788`).
 - Its range is **2746-3238**, not 2462-2790.
 
 `handleUtterance(rawText, typed)` is reached from exactly two places: the Playwright bridge
-`__jarvisHear` (4931), and `POST /hear` (4822-4826) which the console's type box uses. The `typed`
-flag matters: a typed line bypasses mute (2749), pause (2792), and meeting-mode gating (2767).
+`__jarvisHear` (4973), and `POST /hear` (4864-4868) which the console's type box uses. The `typed`
+flag matters: a typed line bypasses mute (2791), pause (2834), and meeting-mode gating (2809).
 
-Text is canonicalized once via `canon` (`jarvis-text.mjs:658`) and lowercased into `lower` (2748).
-Most patterns go through `after(re)` (2872), which prepends an optional `jarvis[,.! ]+` prefix —
+Text is canonicalized once via `canon` (`jarvis-text.mjs:658`) and lowercased into `lower` (2790).
+Most patterns go through `after(re)` (2914), which prepends an optional `jarvis[,.! ]+` prefix —
 so nearly every command works with or without the wake word.
 
-### 5.2 Modal gates, in evaluation order (2749-2797)
+### 5.2 Modal gates, in evaluation order (2791-2839)
 
 | Order | Pattern | Effect |
 | --- | --- | --- |
-| 1 | *muted* + `unmute` / `resume listening` / `start listening` | unmute; **everything else while muted is dropped** (2749-2755) |
-| 2 | `^(jarvis )?mute( yourself\|listening\|the mic)?$` | global mute (2756) |
-| 3 | *meeting mode* + `end meeting( mode)` / `jarvis … back` | leave meeting mode (2761) |
-| 4 | *meeting mode* + no `^jarvis` prefix | **dropped** (2767) |
-| 5 | `meeting mode` (without `end`) | enter meeting mode (2768) |
-| 6 | `jarvis … shut ?down` / `end (the )?session` | `running = false` — stops the hub (2774) |
-| 7 | `(pause\|stop) listening` | discard mode on (2780) |
-| 8 | `(resume\|start) listening` | discard mode off (2786) |
-| 9 | *discard* + not typed | **dropped** (2792) |
+| 1 | *muted* + `unmute` / `resume listening` / `start listening` | unmute; **everything else while muted is dropped** (2791-2797) |
+| 2 | `^(jarvis )?mute( yourself\|listening\|the mic)?$` | global mute (2798) |
+| 3 | *meeting mode* + `end meeting( mode)` / `jarvis … back` | leave meeting mode (2803) |
+| 4 | *meeting mode* + no `^jarvis` prefix | **dropped** (2809) |
+| 5 | `meeting mode` (without `end`) | enter meeting mode (2810) |
+| 6 | `jarvis … shut ?down` / `end (the )?session` | `running = false` — stops the hub (2816) |
+| 7 | `(pause\|stop) listening` | discard mode on (2822) |
+| 8 | `(resume\|start) listening` | discard mode off (2828) |
+| 9 | *discard* + not typed | **dropped** (2834) |
 
 ### 5.3 The intent table
 
@@ -738,42 +744,42 @@ Everything below is inside `handleUtterance`. `after(…)` = optional `jarvis` p
 
 | Line | Phrase pattern | What it does |
 | --- | --- | --- |
-| 2802 | *(armed gate)* `yes` / `no` | confirm or cancel a pending mission close; 60s window, anything else drops the gate |
-| 2822 | `isMissionCloseIntent` ("mission accomplished") | arms the two-step close; names the mission or asks which |
-| 2833 | `parseNewMissionTitle` ("new mission …") | creates a mission, pinned to the rail |
-| 2849 | `do you know what nemesis means`, `it's been emotional`, `guns for show`, `all bets are off` / `five minutes turkish`, `guy ritchie` | Guy Ritchie easter egg |
-| 2859 | `screen ?shot` / `look at (my\|the\|this) screen` | capture now, grant `/screen` for 120s, bus a `screenshot` to the focused session. `all\|both\|every monitors` for every display |
-| 2877 | `remind me …` / `set a timer …` / `timer for …` | `parseReminder` → a calendar reminder that announces once |
-| 2890 | `focus( on)? X` / `switch to X` / `talk to X` | set focus (via `boardKey`, so a coordinator lands on its project card) |
-| 2907 | `who's running/up/alive/online` | read the live roster aloud |
-| 2920 | `isBatonQuestion` ("who holds the merge lane") | speak lane state (`speakBaton`) |
-| 2924 | `what's next` / `when's my next meeting` | now + next from today's schedule |
-| 2937 | `context check/health/report` / `how's the context` | each session's last reported context % |
-| 2946 | `what did the old/previous/last X do` | that callsign's most recent retired summary; arms "one before that" |
-| 2955 | `(and) (the) one before that` | walk back through that callsign's history |
-| 2963 | `who's X` | X's purpose, live or retired |
-| 2975 | `call this one/this session/it X` | rename the focused session's callsign (NATO only, must be free) |
-| 2996 | `describe X as …` | rewrite X's purpose |
-| 3005 | `retire X( anyway)` | ask X to wrap up; refuses if it has working tasks unless `anyway`; retires it outright if not alive |
-| 3022 | `start/spin up/launch (a\|a new\|new) [cheap\|haiku\|fast\|trusted\|guarded\|autonomous] session in/on/at/for <repo> [for <purpose>]` | spawn a worker; adjectives pick model + tier |
-| 3038 | `stop trusting X` / `untrust X` / `distrust X` / `don't trust X` | clear `trustUntil` |
-| 3045 | `trust X [for N min\|hour]` | temporary auto-approve (default 30 min) |
-| 3056 | `stepping away` / `step away` / `going away` / `away mode on` / `I'm heading out` | away mode on — sessions auto-trusted except destructive |
-| 3062 | `I'm back` / `away mode off` / `back at my desk` | away mode off |
-| 3068 | `(let's) start (working on) [cs] (item\|number\|#) N` | move board item N to `working` **and bus a speech event telling the session to start it**. A `review` item is bumped to the top instead, agent not pinged |
-| 3097 | `(complete\|finish\|done\|approve\|drop\|scratch\|top\|bump\|prioritise) [cs] (item) N` | lane move by ordinal |
-| 3120 | `(give\|move\|send) (the) <text> task to X` | move a task across boards by substring |
-| 3133 | `read (everyone's\|all) (the) list(s)/tasks` | summarize every board |
-| 3141 | `(add\|new) task[,:] <text> [for <cs>]` | add to the focused board, or to `<cs>` |
-| 3155 | `(start\|begin) task[,:] <text>` | substring-match → `working` |
-| 3167 | `(done with\|finish task\|complete task\|finish\|complete)[,:] <text>` | substring-match → `done`, and speak the remaining count |
-| 3180 | `(scratch\|drop) task[,:] <text>` | delete by substring |
-| 3191 | `clear done` | empty the focused board's done lane |
-| 3201 | `(read\|what is\|what's) (the\|on\|my) (list\|worklist\|tasks)` | read the focused board |
-| 3212 | `on mission <id-or-title>, <text>` | route to a mission thread. **Must precede the generic `on X`** below |
-| 3221 | `on <callsign>, <text>` | route to that session |
-| 3226 | `^jarvis[,.! ] <text>` | route to the jarvis brain; if nothing is bound, record as plain speech |
-| 3231 | *(fallthrough)* | route to whatever holds focus; if nothing does, `record({kind:'speech'})` and log `HEARD "…"` |
+| 2844 | *(armed gate)* `yes` / `no` | confirm or cancel a pending mission close; 60s window, anything else drops the gate |
+| 2864 | `isMissionCloseIntent` ("mission accomplished") | arms the two-step close; names the mission or asks which |
+| 2875 | `parseNewMissionTitle` ("new mission …") | creates a mission, pinned to the rail |
+| 2891 | `do you know what nemesis means`, `it's been emotional`, `guns for show`, `all bets are off` / `five minutes turkish`, `guy ritchie` | Guy Ritchie easter egg |
+| 2901 | `screen ?shot` / `look at (my\|the\|this) screen` | capture now, grant `/screen` for 120s, bus a `screenshot` to the focused session. `all\|both\|every monitors` for every display |
+| 2919 | `remind me …` / `set a timer …` / `timer for …` | `parseReminder` → a calendar reminder that announces once |
+| 2932 | `focus( on)? X` / `switch to X` / `talk to X` | set focus (via `boardKey`, so a coordinator lands on its project card) |
+| 2949 | `who's running/up/alive/online` | read the live roster aloud |
+| 2962 | `isBatonQuestion` ("who holds the merge lane") | speak lane state (`speakBaton`) |
+| 2966 | `what's next` / `when's my next meeting` | now + next from today's schedule |
+| 2979 | `context check/health/report` / `how's the context` | each session's last reported context % |
+| 2988 | `what did the old/previous/last X do` | that callsign's most recent retired summary; arms "one before that" |
+| 2997 | `(and) (the) one before that` | walk back through that callsign's history |
+| 3005 | `who's X` | X's purpose, live or retired |
+| 3017 | `call this one/this session/it X` | rename the focused session's callsign (NATO only, must be free) |
+| 3038 | `describe X as …` | rewrite X's purpose |
+| 3047 | `retire X( anyway)` | ask X to wrap up; refuses if it has working tasks unless `anyway`; retires it outright if not alive |
+| 3064 | `start/spin up/launch (a\|a new\|new) [cheap\|haiku\|fast\|trusted\|guarded\|autonomous] session in/on/at/for <repo> [for <purpose>]` | spawn a worker; adjectives pick model + tier |
+| 3080 | `stop trusting X` / `untrust X` / `distrust X` / `don't trust X` | clear `trustUntil` |
+| 3087 | `trust X [for N min\|hour]` | temporary auto-approve (default 30 min) |
+| 3098 | `stepping away` / `step away` / `going away` / `away mode on` / `I'm heading out` | away mode on — sessions auto-trusted except destructive |
+| 3104 | `I'm back` / `away mode off` / `back at my desk` | away mode off |
+| 3110 | `(let's) start (working on) [cs] (item\|number\|#) N` | move board item N to `working` **and bus a speech event telling the session to start it**. A `review` item is bumped to the top instead, agent not pinged |
+| 3139 | `(complete\|finish\|done\|approve\|drop\|scratch\|top\|bump\|prioritise) [cs] (item) N` | lane move by ordinal |
+| 3162 | `(give\|move\|send) (the) <text> task to X` | move a task across boards by substring |
+| 3175 | `read (everyone's\|all) (the) list(s)/tasks` | summarize every board |
+| 3183 | `(add\|new) task[,:] <text> [for <cs>]` | add to the focused board, or to `<cs>` |
+| 3197 | `(start\|begin) task[,:] <text>` | substring-match → `working` |
+| 3209 | `(done with\|finish task\|complete task\|finish\|complete)[,:] <text>` | substring-match → `done`, and speak the remaining count |
+| 3222 | `(scratch\|drop) task[,:] <text>` | delete by substring |
+| 3233 | `clear done` | empty the focused board's done lane |
+| 3243 | `(read\|what is\|what's) (the\|on\|my) (list\|worklist\|tasks)` | read the focused board |
+| 3254 | `on mission <id-or-title>, <text>` | route to a mission thread. **Must precede the generic `on X`** below |
+| 3263 | `on <callsign>, <text>` | route to that session |
+| 3268 | `^jarvis[,.! ] <text>` | route to the jarvis brain; if nothing is bound, record as plain speech |
+| 3273 | *(fallthrough)* | route to whatever holds focus; if nothing does, `record({kind:'speech'})` and log `HEARD "…"` |
 
 Ordinals accept digits or the words one–ten (`NUMWORDS`, 937) and tolerate filler words
 (`IDX_FILLER`, 938). Board ordinals index `orderedTasks` (`jarvis-text.mjs:664`), which is
@@ -781,13 +787,13 @@ Ordinals accept digits or the words one–ten (`NUMWORDS`, 937) and tolerate fil
 
 ### 5.4 Output side: speech
 
-`enqueueSay(text, from)` (1030-1036) pushes to `sayQueue`. The `pump` in `main` (4945-4957) shifts one
-at a time, always `record({kind:'tts'})` **even when muted** (4949), and speaks via
+`enqueueSay(text, from)` (1030-1036) pushes to `sayQueue`. The `pump` in `main` (4987-4999) shifts one
+at a time, always `record({kind:'tts'})` **even when muted** (4991), and speaks via
 `consolePage.evaluate(t => window.__speak(t))` only if not muted (or `force`) and the sender is not
 voice-muted (`voiceMutedFrom`, 1062). So the transcript is a complete record of what the hub *would*
 have said.
 
-There is also a **file interface** the solo brain uses (4975-4988): the loop drains `say.txt` every
+There is also a **file interface** the solo brain uses (5017-5030): the loop drains `say.txt` every
 250ms and speaks each line, and drains `commands.txt` looking for `stop`. Both files are truncated on
 boot (113-114). This is how a hub-driver Claude session speaks without going through HTTP.
 
@@ -866,7 +872,7 @@ tells you which columns are nullable:
 | `callsign`, `cwd`, `purpose`, `started`, `ended`, `lastSeen` | 461 | always present; `ended` is `null` while live |
 | `summary` | 456 | the epitaph from `/retire` |
 | `ctx`, `ctxTs`, `ctxWarned` | 435 | `POST /health` context %, when, and whether the 80% warning fired |
-| `doing` | 425 | `POST /health` phrase, truncated to 80 chars (4059) |
+| `doing` | 425 | `POST /health` phrase, truncated to 80 chars (4101) |
 | `tier` | 402 | `trusted` \| `guarded` |
 | `needsYou` | 290 | set by `Need you:` or a pending permission |
 | `autoAllow` | 224 | array of permission signatures answered with "always" |
@@ -893,7 +899,7 @@ A live row, verbatim:
 ```
 
 `HandoffRecord`: `{summary, notes, auto, board:{working,queued,review,done}, from, fromUid, cwd,
-purpose, ts}` (1462-1469). `HeldProject`: `{key, callsign, cwd, purpose, summary, parkedAt}` (3751).
+purpose, ts}` (1462-1469). `HeldProject`: `{key, callsign, cwd, purpose, summary, parkedAt}` (3793).
 
 ### 6.4 `projects.json` — durable project context
 
@@ -943,7 +949,7 @@ to be data, not code.
 
 A mission is **closed only via the two-step voice gate**; there is no console close button
 (comment at 4489-4492). `POST /mission op:archive` exists for programmatic recovery, and archive is
-a status flip, never a delete (4523-4525).
+a status flip, never a delete (4565-4567).
 
 ### 6.6 `schedule.json`
 
@@ -955,13 +961,13 @@ a status flip, never a delete (4523-4525).
 ```
 
 - **`date` is a `Date.toDateString()` string, and it gates everything.** `GET /schedule` blanks
-  `events` when `date !== today` and reports `stale:true` (4763-4774) so the console can flag a missed
+  `events` when `date !== today` and reports `stale:true` (4805-4816) so the console can flag a missed
   morning pull rather than hiding the panel.
 - **`announced` is keyed by title + suffix** — a title change re-announces, and two same-titled
   meetings share one key. The 15s ticker (276-322) fires T-5min, T-0 (auto-**mute**, 306), and end.
 - **Chris is never auto-unmuted** (311-317): the meeting-over line is pushed with `force:true` so it
   speaks through the mute, then the hub drops its claim. Encode that rule in v2.
-- Reminders survive a schedule re-paste (4794-4797) and self-clean 6h past due (`pruneReminders`, 855).
+- Reminders survive a schedule re-paste (4836-4839) and self-clean 6h past due (`pruneReminders`, 855).
 
 ### 6.7 `transcript.jsonl` — the append-only conversation record
 
@@ -975,18 +981,18 @@ Seven kinds. Live counts (5960 lines in the cache, 2002 in the archive):
 | Kind | Live | Shape | Written by |
 | --- | --- | --- | --- |
 | `sys` | 1637 | `{kind,text,ts}` | ~90 sites — every register, retire, board move, spawn, worktree op |
-| `tts` | 1521 | `{kind,text,from,ts}` | the say pump (4949), **even when muted** |
-| `task` | 1134 | `{kind,op,board,task,from?,count?,ts}` | `/worklist` (4468) + every voice board op |
+| `tts` | 1521 | `{kind,text,from,ts}` | the say pump (4991), **even when muted** |
+| `task` | 1134 | `{kind,op,board,task,from?,count?,ts}` | `/worklist` (4510) + every voice board op |
 | `speech` | 728 | `{kind,text,to?,missionId?,img?,command?,ts}` | the human. `to` is a **callsign** or `m:<missionId>` |
 | `chat` | 707 | `{kind,from,text,ts}` | `/send to:human`, and hub-authored chat (1252, 300) |
 | `msg` | 232 | `{kind,from,to,text,ts}` | `/send` worker→worker. **`from`/`to` are callsigns** |
 | `react` | 1 | `{kind,target,reaction,from:'you',text,ts}` | `/react`; `target` is the **`ts`** of the reacted message |
 
-`GET /transcript` projects these into a uniform `{ts, kind, who, to, missionId, img, text}` (3811-3820)
+`GET /transcript` projects these into a uniform `{ts, kind, who, to, missionId, img, text}` (3853-3862)
 where `kind` collapses to `sys` \| `react` \| `msg` and `who` becomes `'you'` for speech, `'sys'` for
-sys, else `from`. `GET /search` adds `srcKind` to preserve the distinction (3834-3837).
+sys, else `from`. `GET /search` adds `srcKind` to preserve the distinction (3876-3879).
 
-**A message's identity is its `ts`.** `POST /react` targets by timestamp (4156), and the console keys
+**A message's identity is its `ts`.** `POST /react` targets by timestamp (4198), and the console keys
 pins by `who|ts` (`msgKey`, console 363). There are no message ids. v2 needs them.
 
 ### 6.8 `bus.jsonl` + `bus.base`
@@ -995,7 +1001,7 @@ Events as in §3. `bus.base` is a single integer — the count dropped off the f
 retained, `busBase` 2002, so 7031 events total. **1.83 MB.**
 
 One shape warning: a live `msg` event has **no `from` field** —
-`{"to":"s_0114","kind":"msg","text":"Chris's answer is B…"}`. `POST /send` always sets it (4117), so
+`{"to":"s_0114","kind":"msg","text":"Chris's answer is B…"}`. `POST /send` always sets it (4159), so
 this predates the current writer. Anything consuming the bus must treat `from` as optional.
 
 ### 6.9 `batons.json`
@@ -1005,7 +1011,7 @@ this predates the current writer. Anything consuming the bus must treat `from` a
                  queue: [entry], lastHandoff } }
 ```
 
-`normalizeLane` (`jarvis-text.mjs:1455`). Live, verbatim:
+`normalizeLane` (`jarvis-text.mjs:1572`). Live, verbatim:
 
 ```json
 {"jarvis":{"base":"main","holder":null,"queue":[],"lastHandoff":"2026-07-30T22:18:46.468Z"},
@@ -1026,7 +1032,7 @@ repo fell through to `adhoc` and silently lost `permissionMode` and `tier` (comm
 ### 6.11 `ai-threads.json`, `ai-spend.json`, `notify.json`
 
 - `{ threads: { "th_<id>": {title, model, messages:[{role,content,ts,model?}]} } }` — the ASK tab.
-  **Deliberately outside `/search`'s reach** (3839-3841): a separate chat surface.
+  **Deliberately outside `/search`'s reach** (3881-3883): a separate chat surface.
 - `{ month: "2026-06", usd: 0.00327 }` — `rollSpend` (`jarvis-text.mjs:429`) zeroes on a month change
   at read time, so a stale file reads as $0 with no separate reset step. Cap check at 4729.
 - `{ url: "<ntfy topic>" }` — phone push (`pushPhone`, 1050).
@@ -1038,7 +1044,7 @@ adaptive thinking. v2 should externalize these.
 ### 6.12 `archive/<uid>.json` — one epitaph per retired session
 
 `{uid, callsign, cwd, purpose, started, ended, summary, handoff, board}` (1472-1476). **456 files
-live.** `GET /archive` lists them, hiding any whose cwd is currently On Hold (3516-3529).
+live.** `GET /archive` lists them, hiding any whose cwd is currently On Hold (3558-3571).
 
 ### 6.13 `jarvis.db` — the SQLite reporting store (`db.mjs`)
 
@@ -1054,15 +1060,15 @@ tasks   ( id PK, callsign, text, tag, lane, addedAt, startedAt, doneAt )
 Three rules keep it non-load-bearing (`jarvis-core.mjs:161-168`): the import is **dynamic and
 guarded** (a static `node:sqlite` import would stop the hub booting on a runtime without it); every
 write is best-effort inside `store()` (187-195), which turns the store **off for the process after
-three consecutive failures**; and nothing in the hub's decision logic reads it. `GET /report` (3532)
+three consecutive failures**; and nothing in the hub's decision logic reads it. `GET /report` (3574)
 is the one read, and it is a pure serializer that answers **503 when the store is off** rather than an
-empty 200 (3555-3557) — "history is switched off" and "nothing was ever worked on" must not look alike.
+empty 200 (3597-3599) — "history is switched off" and "nothing was ever worked on" must not look alike.
 
 Two modelling notes v2 inherits:
 
 - **`tasks` links to a session only by `callsign`**, and callsigns are reused, so a task row can
   straddle successive sessions (`db.mjs:36-39`). This is the join v2 should fix with a real FK.
-- **`lane='dropped'` exists only in the store** (4427-4429) — a dropped task is gone from
+- **`lane='dropped'` exists only in the store** (4469-4471) — a dropped task is gone from
   `worklist.json`, so a backfill can never produce one. It is the only place abandoned work is visible.
 
 ---
@@ -1154,7 +1160,7 @@ one of them has to become a column, an id, or an explicit order field.
 
 | Where | Position means | Read by |
 | --- | --- | --- |
-| `roster.callsigns[cs][0]` | **the current holder** of that callsign; the rest is history, newest-first | `liveUidOf` 939-944, written at 1318 and re-spliced on voice rename (2983-2985) |
+| `roster.callsigns[cs][0]` | **the current holder** of that callsign; the rest is history, newest-first | `liveUidOf` 939-944, written at 1318 and re-spliced on voice rename (3025-3027) |
 | `worklist.sessions[cs][lane][i]` | priority within the lane. `op:top` means `unshift` | 4438, voice 3082/3114 |
 | `orderedTasks(board)` | the **spoken ordinal**: review → working → queued → done, concatenated | `jarvis-text.mjs:664`; voice 3074, 3104; console offsets 1188 |
 | `mission.phases[i]` | the phase's identity — `POST /mission op:phase/unphase` addresses it by **`index`** | 4508-4515 |
@@ -1181,7 +1187,7 @@ Kept as a list because it is the part with the shortest shelf life.
    `/permission*`, `/hold`/`/unhold`, `/report`, `/search`, `/mission-chat`, `/attach`, `/react`,
    `/watch`, `/away`, `/trust`, `/notify*`, `/open`, `/reveal`, `/hear`, `/winddown`, `/restart`.
 2. **There is no 404 for an unknown path.** Anything unmatched returns `console.html` with status 200
-   (4871). A typo'd endpoint looks like a successful fetch of an HTML page.
+   (4913). A typo'd endpoint looks like a successful fetch of an HTML page.
 3. **`sys` is not a bus event kind** — transcript only. The bus has exactly six kinds (§3.3).
 4. **`gap` is never bused** (§3.4): synthesized per-poll, no index, does not survive a restart.
 5. **`to:'all'` is read by three functions and written by none** — a dead broadcast capability
@@ -1191,7 +1197,7 @@ Kept as a list because it is the part with the shortest shelf life.
 8. **`POST /permission` and `GET /poll` deliberately never respond** until an external event or a
    timer. Any generated client will need per-route timeout policy.
 9. **`/protocol` never mentions `/spawn`.** The delegation contract reaches a coordinator only
-   through its boot prompt (2612-2630), so a worker reading `WORKER.md` learns nothing about
+   through its boot prompt (2654-2672), so a worker reading `WORKER.md` learns nothing about
    dispatching sub-workers — which is why the capability existed and went unused for months.
 10. **`openThreads` is uncapped at write and truncated at read** (§6.4) — the mechanism that bricked
     dispatch on 2026-07-30.
@@ -1199,26 +1205,26 @@ Kept as a list because it is the part with the shortest shelf life.
 12. **Two different definitions of "dirty".** `BUILD` uses `git diff --name-only HEAD` +
     `git ls-files --others` and explicitly **not** `git status --porcelain` (38-47), because porcelain
     reported a phantom modification off cached stat data. But `POST /winddown`'s dry run uses
-    `git status --porcelain` (4838). The same word answers differently in the same process.
+    `git status --porcelain` (4880). The same word answers differently in the same process.
 13. **`GET /report` is a read of a store the code calls write-only.** The rule at 167-168 is qualified
     at 3540-3544: rows go straight out and no hub decision is taken on them. Worth stating because the
     invariant as written no longer holds literally.
 14. **Seed data is hardcoded in the hub** — `seedMissions` 676 and `seedProjects` 732 write specific
     missions and projects when the files are absent.
-15. **`/forget` guards on `working + queued` only** (4356). `review` and `done` are destroyed without
+15. **`/forget` guards on `working + queued` only** (4398). `review` and `done` are destroyed without
     a prompt.
 16. **`say.txt` / `commands.txt`** are a live file-based control interface drained every 250 ms
-    (4975-4988), truncated on boot (113-114). Not part of the HTTP surface at all.
-17. **`GET /board` never calls git** (3282) but `POST /winddown` shells out to `git status` per live
-    session with an 8s timeout each (4838) — a slow synchronous stall on the shared event loop.
+    (5017-5030), truncated on boot (113-114). Not part of the HTTP surface at all.
+17. **`GET /board` never calls git** (3324) but `POST /winddown` shells out to `git status` per live
+    session with an 8s timeout each (4880) — a slow synchronous stall on the shared event loop.
 18. **The register response's `cwd` is not the directory the worker booted in** for an isolated
     session (§2.1 step 2) — it is the repo. The worktree path is a separate field.
 
 **Claims that no longer hold**
 
-19. **`handleSpeech` does not exist.** The function is `handleUtterance` at `jarvis-core.mjs:2746`,
+19. **`handleSpeech` does not exist.** The function is `handleUtterance` at `jarvis-core.mjs:2788`,
     spanning **2746-3238**, not "~2462-2790". Both the name and the range in the project's open
-    threads are wrong at bfcedcf, and that note is the map every session uses to find voice intents.
+    threads are wrong, and that note is the map every session uses to find voice intents.
 20. **"Every handoff record carries an `auto` block" is not true of the store.** The comment at 4558
     presents it as a reliable invariant; **7 of 106 live records have one** (§4.4). It holds for
     records written from now on only.
@@ -1228,24 +1234,24 @@ Kept as a list because it is the part with the shortest shelf life.
 22. **The repo-directory `repos.json` is dead** (§6.0) — untracked, 6 weeks stale, and not read by
     anything.
 
-**Two of the project's own open threads are now stale — verified against bfcedcf**
+**Two of the project's own open threads are now stale**
 
 These are recorded here because the threads are the map every session navigates by, and a stale map
 costs more than no map.
 
 23. **`diagnoseSpawnLog` HAS been fixed.** The open thread says it matches only `/trust the files/i`
     — the pre-2026-07 folder-trust wording that appears zero times in a real log — and so returns
-    null for the exact death it exists to name. At bfcedcf the predicate is
+    null for the exact death it exists to name. The predicate is now
     `/trust the files|is this a project you created|trust this folder/i`
-    (`jarvis-text.mjs:1861`), and the comment above it (1852-1858) explicitly documents keeping the
+    (`jarvis-text.mjs:1978`), and the comment above it (1969-1975) explicitly documents keeping the
     old wording so an older Claude Code still reads correctly. **The thread should be moved to
     history.** The general lesson it carries — a fixture and the code sharing an assumption about the
     outside world only prove they agree — is still worth keeping; the specific defect is closed.
 24. **The line-ending map is wrong, and the whole repo is CRLF.** The thread says "each FILE here is
     internally pure and the REPO is mixed across files: jarvis-core.mjs, jarvis-text.mjs, console.js,
-    console.css and package.json are CRLF; db.mjs and docs/\*.md are LF." Measured at bfcedcf by
+    console.css and package.json are CRLF; db.mjs and docs/\*.md are LF." Measured by
     counting `0x0a` bytes and checking the preceding byte, which is the only method the thread itself
-    trusts: **every file is pure CRLF.** All 14 pre-existing `docs/*.md`, `db.mjs`, `WORKER.md`,
+    trusts: **every file is pure CRLF** -- re-measured at 43d5828 after a merge changed two of them, and still uniform. All 14 pre-existing `docs/*.md`, `db.mjs`, `WORKER.md`,
     `README.md`, `CLAUDE.md`, and all five files the thread lists — CRLF throughout, LF count exactly
     equal to CRLF count in each. There is **no `.gitattributes`**, so nothing normalizes on checkout;
     the uniformity is real, not a working-tree artifact. **This file is CRLF to match.** The thread's
