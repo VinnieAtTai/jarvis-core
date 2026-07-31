@@ -840,9 +840,17 @@ export function coordinatorSlotHolder(sessions, booting, name, now, staleMs = 12
 // Returns [{ uid, callsign }] sorted by uid -- ordered so a caller's fan-out is deterministic and a
 // test can assert on the whole set rather than on whichever key order a JSON reload happened to
 // produce. Pure: reads the sessions map, mutates nothing.
+//
+// NO SHAPE GUARD on `sessions`, deliberately, and it is not an oversight: `for...in` over null,
+// undefined, a number or a string yields nothing usable and cannot throw, so a
+// `typeof sessions !== 'object'` arm is unreachable-by-consequence -- it was written, then mutation
+// probing showed nothing could tell whether it was there (M9, and pickProjectWorker carries the same
+// dead arm). The junk-input test below stays, because what it now guards is the FUTURE refactor: an
+// Object.entries/map rewrite of this loop would throw on a null roster, mid-retire, after s.ended is
+// already stamped. That is the failure worth a test, and the guard was never what prevented it.
 export function liveSubWorkers(sessions, name, now, staleMs = 120000, exclude = null) {
     const n = name ? String(name).toLowerCase().trim() : '';
-    if (!n || !sessions || typeof sessions !== 'object') return [];
+    if (!n) return [];
     const out = [];
     for (const uid in sessions) {
         const s = sessions[uid];

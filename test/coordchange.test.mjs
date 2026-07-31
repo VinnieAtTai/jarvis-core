@@ -113,6 +113,9 @@ test('liveSubWorkers -- `exclude` keeps a notification off the retiring session 
 
 test('liveSubWorkers -- junk degrades to nobody rather than throwing on the retire path', () => {
     // This runs mid-retire, after s.ended is stamped. A throw here strands a session half-retired.
+    // What this actually guards is a REFACTOR: `for...in` tolerates a null or non-object roster on its
+    // own, so the explicit shape guard this file once asserted was dead code and was deleted (see the
+    // note on liveSubWorkers). An Object.entries/map rewrite of that loop would throw here instead.
     for (const bad of [null, undefined, 'nope', 42]) assert.deepEqual(liveSubWorkers(bad, 'jarvis', NOW), []);
     for (const bad of [null, undefined, '', '   ']) assert.deepEqual(liveSubWorkers(FLEET(), bad, NOW), []);
     assert.deepEqual(liveSubWorkers({ s_1: null, s_2: 7, s_3: { parentProject: 'jarvis' } }, 'jarvis', NOW), []);
