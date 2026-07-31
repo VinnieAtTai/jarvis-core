@@ -232,17 +232,41 @@ const sentinel = (i) => NUL + i + NUL;
 
 // The same function with ONLY the guard removed -- lifted from source and textually mutated rather
 // than reimplemented, so it cannot go on "proving" these fixtures are dangerous after the masking
-// scheme has changed underneath it. The two assertions are what stop the mutation from quietly
-// becoming a no-op, which is the failure mode that makes a fixture-validity check worthless.
+// scheme has changed underneath it. Two things have to hold for that mutant to be worth anything: the
+// guard is spelled in console.js exactly once, and removing it really did change the body.
+//
+// THOSE TWO CHECKS USED TO RUN AT MODULE SCOPE, inside the IIFE that built the mutant, WHICH PUT THEM
+// IN FRONT OF EVERY TEST IN THIS FILE. Any edit to the masking scheme threw during IMPORT, so the run
+// read "tests 1 pass 0 fail 1" -- one failure, which every fail>0 harness scores as a kill. bravo
+// probed four mutants of console.js against this file on 2026-07-30 and all four reported fail=1
+// without one targeted assertion ever executing; re-probed with this rig stubbed out they died to the
+// assertions they were actually aimed at, so the verdict had been right by luck and worthless as
+// evidence. A self-check that guards a test can also stand in front of it.
+//
+// Hence the shape below. Building the mutant ASSERTS NOTHING and is called from inside tests, the two
+// checks live in a test() of their own so a broken rig fails by NAME, and the consumer skips rather
+// than piling on a second failure -- one report, and the run still says which surface moved. It does
+// not go silent: skipped != 0 fails this project's gate on its own.
 const GUARD = '+i < held.length ? held[+i] : m';
-const unguardedFix = (() => {
+const RIG_TEST = 'the rig that removes the unmask guard still has a guard to remove';
+function unguardedRig() {
     const body = lift('fixEscapedBreaks');
-    assert.equal(body.split(GUARD).length - 1, 1,
-        'console.js no longer spells the unmask guard exactly once as ' + JSON.stringify(GUARD) + ' -- update this test');
     const mutated = body.replace(GUARD, 'held[+i]');
-    assert.notEqual(mutated, body, 'the guard removal did nothing -- this check would prove nothing');
-    return new Function(mutated + '\nreturn fixEscapedBreaks;')();
-})();
+    return {
+        spellings: body.split(GUARD).length - 1,
+        // No mutant at all rather than an unmutated copy: handing the consumer the REAL function would
+        // fail it too (the fixtures are not corrupted, which is precisely what the guard is for), and
+        // that second failure is the noise this whole rearrangement exists to remove.
+        fix: mutated === body ? null : new Function(mutated + '\nreturn fixEscapedBreaks;')(),
+    };
+}
+
+test(RIG_TEST, () => {
+    const rig = unguardedRig();
+    assert.equal(rig.spellings, 1,
+        'console.js no longer spells the unmask guard exactly once as ' + JSON.stringify(GUARD) + ' -- update this test');
+    assert.ok(rig.fix, 'the guard removal did nothing -- the mutant below would prove nothing');
+});
 
 const FORGED = [
     // held is EMPTY here -- no path span to mask -- so index 0 is already out of range.
@@ -268,12 +292,17 @@ test('fixEscapedBreaks -- a forged mask sentinel is left alone, never resolved',
         'a real path must still round-trip through the mask alongside a forged sentinel');
 });
 
-test('fixEscapedBreaks -- and without the guard these fixtures really are corrupted', () => {
+test('fixEscapedBreaks -- and without the guard these fixtures really are corrupted', (t) => {
     // Guards the guard, the way the oldBehaviour test above does for the path fixtures. If a later
     // edit made a forged sentinel harmless, the test above would keep passing while reaching nothing
     // -- which is exactly the state this section was written to end.
+    const rig = unguardedRig();
+    if (!rig.fix) {
+        t.skip('no mutant to test with -- "' + RIG_TEST + '" is the failure to read');
+        return;
+    }
     for (const [label, , msg] of FORGED) {
-        assert.match(unguardedFix(msg), /undefined/,
+        assert.match(rig.fix(msg), /undefined/,
             label + ': fixture no longer reaches the guard, so the test above proves nothing');
     }
 });
