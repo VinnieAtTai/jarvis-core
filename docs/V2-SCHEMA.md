@@ -16,6 +16,16 @@ that choice, it is called out as a fork rather than decided.
 **Anchors, not line numbers.** Per the lesson this repo just paid for: every reference below names a
 *function, table, or field*, never a line in `jarvis-core.mjs`. Those drift; names do not.
 
+**Reviewed and corrected.** `docs/V2-SCHEMA-REVIEW.md` is an independent adversarial review of this
+document, validated against the **real data in `JARVIS_DATA`** rather than against
+`docs/V2-CURRENT-SYSTEM.md` — both were written by the same session, so an assumption wrong in both
+was invisible from inside either. It attacked all six rulings in part A: five survive intact, and A6's
+*ruling* survives while its original reasoning did not. Ten defects it found are fixed here — the
+column types, the FK ordering, `ux_actor_session`, M1, M4, M9, M10 and the notes in B2/B4/B5/B6 all
+changed as a result. **The review is the audit record and is deliberately not updated to match this
+document**; where the two differ, the review says what was believed before the fix and this file says
+what is true now.
+
 ---
 
 ## A. The decisions
@@ -36,9 +46,12 @@ In a relational store it becomes two incompatible foreign keys on what a reader 
 **Decision: the session is the identity. `session_id` is the FK everywhere. Callsign is a display
 label resolved by join, and is never itself a key.**
 
-**Reasoning, and this is the part that settles it:** a callsign is **not unique over time**. There
-are 26 NATO names and the live roster has 461 sessions — `oscar` alone has been 19 different
-sessions. v1 already encodes this: `roster.callsigns[cs]` is an *array*, newest first, and
+**Reasoning, and this is the part that settles it:** a callsign is **not unique over time**. There are
+26 NATO names and the live roster has **464 sessions** — a mean reuse of **17.8x**, a maximum of
+**20x** (alpha, papa, quebec), so a foreign key built on callsign would collide on **438** of them.
+And the collision is not only across time: **all 26 callsigns have served more than one `cwd`**, so
+that key would merge rows from unrelated projects as readily as from unrelated sessions. v1 already
+encodes this: `roster.callsigns[cs]` is an *array*, newest first, and
 `liveUidOf` returns element 0 only if it has not ended. So a callsign identifies a session **only
 when qualified by "currently live"**, which is a runtime predicate, not a key. Any FK built on
 callsign is a bug with a delay on it: it resolves correctly until the callsign is recycled, and then
@@ -126,11 +139,18 @@ were trimmed off the front so indices stay valid forever.
 
 **Reasoning, two parts.**
 
-*Why a sequence, not IDENTITY:* the cursor's whole contract is monotonicity. `IDENTITY` is not
-rollback-safe — a failed insert consumes a value and leaves a permanent gap. Gaps do not break
-`seq > @cursor`, but they do break anything that treats the cursor as a **count** of events, and v1's
-`busBase + bus.length` arithmetic is exactly that. A `SEQUENCE` makes the gap behaviour explicit and
-configurable rather than an engine detail.
+*Why a sequence, not IDENTITY:* **not because of gaps.** A sequence gaps exactly as an identity does
+— SQL Server generates sequence values outside transaction scope and consumes them whether the
+transaction commits or rolls back, and the default `CACHE` makes gaps *larger* on an unclean shutdown,
+not smaller. Anyone who reaches for "sequences are rollback-safe" as the justification will be
+refuted, so it is not the justification.
+
+The two real reasons: **the value is obtainable before the insert**, which is what lets a `POST /send`
+receipt return the `seq` its event landed at without `SCOPE_IDENTITY()` plumbing threaded through the
+write path; and `NO CACHE` makes the gap behaviour **bounded and declared** rather than an engine
+detail you discover after a crash. Note the consequence either way: gaps do not break `seq > @cursor`,
+but they do break anything that treats the cursor as a **count** of events, and v1's
+`busBase + bus.length` arithmetic is exactly that. A v2 reader must stop counting.
 
 *Why flip to exclusive:* v1 is inclusive, which is why a `POST /send` receipt cursor (the index the
 event **landed at**) can be handed straight back to `/poll` and re-read. But the cursor a poll
@@ -148,9 +168,16 @@ partition; the cursor never needs a `busBase` analogue because `seq` is already 
 ## B. The DDL
 
 SQL Server. `DATETIME2(3)` throughout (v1 timestamps are ISO-8601 with millisecond precision — do not
-use `DATETIME`, whose 3.33 ms rounding would silently move them). All timestamps **UTC**; v1 writes
-`toISOString()`, so this is a straight read. `NVARCHAR` throughout — the transcript contains emoji and
-non-ASCII, so `VARCHAR` would mangle it.
+use `DATETIME`, whose 3.33 ms rounding would silently move them). `NVARCHAR` throughout — the
+transcript contains emoji and non-ASCII, so `VARCHAR` would mangle it.
+
+**Timestamps are UTC — with three measured exceptions, and one of them fails silently.** v1 writes
+`toISOString()` almost everywhere, and for sessions, tasks, the transcript and the bus this really is
+a straight read (verified against the live store). The exceptions are enumerated in M9. The dangerous
+one is `schedule.events`: those timestamps arrive from Google Calendar as **offset** form
+(`2026-07-30T09:30:00-05:00`), not `Z`. `CAST`ing one into `DATETIME2` keeps the wall-clock digits and
+**discards the offset**, so a meeting silently lands hours away from the value the column claims to
+hold. `calendar_event` therefore uses `DATETIMEOFFSET(3)` — see B6.
 
 ### B1. Actors and sessions
 
@@ -167,6 +194,11 @@ CREATE TABLE actor (
 -- Exactly one 'human' and one 'hub' row, seeded by the migration.
 CREATE UNIQUE INDEX ux_actor_singleton ON actor(actor_kind)
     WHERE actor_kind IN ('human','hub');
+-- ...and exactly one actor row PER SESSION. Without this, two actor rows can point at one session
+-- and split its messages across two sender keys -- which is the very defect A1 exists to prevent,
+-- and it is invisible: v_message resolves both to the same callsign, so the console renders
+-- correctly while every per-session count silently halves.
+CREATE UNIQUE INDEX ux_actor_session ON actor(session_id) WHERE session_id IS NOT NULL;
 
 CREATE TABLE session (
     session_id      INT IDENTITY(1,1) PRIMARY KEY,
@@ -202,13 +234,17 @@ CREATE TABLE session (
     needs_you       BIT           NOT NULL DEFAULT 0,
     voice_muted     BIT           NOT NULL DEFAULT 0,
     handoff_notes   NVARCHAR(MAX) NULL,
+    -- `watching`: a Slack-channel watch. Small, but GET /board projects it, so the console reads it.
+    watch_channel   NVARCHAR(80)  NULL,
+    watch_since     DATETIME2(3)  NULL,
     row_version     ROWVERSION,
     CONSTRAINT ck_session_tier    CHECK (tier IN ('trusted','guarded')),
     CONSTRAINT ck_session_launch  CHECK (launch IS NULL OR launch IN ('pty','wt')),
     CONSTRAINT ck_session_ctx     CHECK (context_pct IS NULL OR context_pct BETWEEN 0 AND 100),
-    CONSTRAINT ck_session_binding CHECK (project_id IS NULL OR parent_project_id IS NULL),
-    CONSTRAINT fk_session_project        FOREIGN KEY (project_id)        REFERENCES project(project_id),
-    CONSTRAINT fk_session_parent_project FOREIGN KEY (parent_project_id) REFERENCES project(project_id)
+    CONSTRAINT ck_session_binding CHECK (project_id IS NULL OR parent_project_id IS NULL)
+    -- the two project FKs are ATTACHED IN B3, after `project` exists. Declaring them here does not
+    -- work: session and project are mutually referential, so one of the two CREATE TABLEs must run
+    -- against a table that is not there yet. See M1.
 );
 ALTER TABLE actor ADD CONSTRAINT fk_actor_session
     FOREIGN KEY (session_id) REFERENCES session(session_id);
@@ -248,8 +284,8 @@ CREATE TABLE board (
     CONSTRAINT ck_board_target CHECK (
         (board_kind='session' AND session_id IS NOT NULL AND project_id IS NULL) OR
         (board_kind='project' AND project_id IS NOT NULL AND session_id IS NULL)),
-    CONSTRAINT fk_board_session FOREIGN KEY (session_id) REFERENCES session(session_id),
-    CONSTRAINT fk_board_project FOREIGN KEY (project_id) REFERENCES project(project_id)
+    CONSTRAINT fk_board_session FOREIGN KEY (session_id) REFERENCES session(session_id)
+    -- fk_board_project is ATTACHED IN B3, same reason as session's. See M1.
 );
 CREATE UNIQUE INDEX ux_board_session ON board(session_id) WHERE session_id IS NOT NULL;
 CREATE UNIQUE INDEX ux_board_project ON board(project_id) WHERE project_id IS NOT NULL;
@@ -266,14 +302,19 @@ CREATE TABLE task (
     headline    NVARCHAR(400)  NULL,
     detail      NVARCHAR(MAX)  NULL,
     notes       NVARCHAR(MAX)  NULL,
-    -- lifecycle. LANE IS CURRENT TRUTH; these are HISTORY and may disagree -- see the note below
+    -- lifecycle. LANE IS CURRENT TRUTH; these are HISTORY and may disagree -- see the note below.
+    -- added_at comes from worklist.json. THE OTHER THREE DO NOT EXIST THERE -- only jarvis.db has
+    -- them, which makes D6 an ordering constraint rather than a preference. See M11.
     added_at    DATETIME2(3)   NOT NULL,
     started_at  DATETIME2(3)   NULL,
     done_at     DATETIME2(3)   NULL,
     dropped_at  DATETIME2(3)   NULL,
-    start_date  DATE           NULL,               -- v1 placeholders, never populated
+    start_date  DATE           NULL,               -- v1 placeholders, genuinely never populated
     due_date    DATE           NULL,
-    priority    INT            NULL,
+    -- NOT an INT. v1 writes a WORD: the only populated value in the live store is 'high'. Left
+    -- un-CHECKed on purpose -- the tag vocabulary grew from 10 documented to 14 in use, and a
+    -- CHECK here would reject real data the same way.
+    priority    VARCHAR(10)    NULL,
     row_version ROWVERSION,
     CONSTRAINT ck_task_lane CHECK (lane IN ('review','working','queued','done','dropped')),
     CONSTRAINT fk_task_board FOREIGN KEY (board_id) REFERENCES board(board_id)
@@ -298,6 +339,11 @@ CREATE TABLE task_subtask (
    (`db.mjs` COALESCEs, so a written timestamp can never be cleared). That is deliberate — it *was*
    done at that moment. **"What is finished" therefore means `lane='done'`, never
    `done_at IS NOT NULL`.** Any v2 report must respect this or it over-counts throughput.
+
+   **Where that behaviour actually lives, because it changes the migration:** in `db.mjs`, not in
+   `worklist.json`. A live task row carries exactly `id`, `text`, `addedAt`, `notes` and `priority` —
+   there is no `doneAt` in the JSON at all. So the disagreement above is real but only observable in
+   the SQLite mirror, and the mirror is the only source for these three columns. See M11.
 2. **`dropped` is a real lane here, where in v1 it exists only in the SQLite mirror.** v1's `op:drop`
    deletes the card from `worklist.json`, so abandoned work is invisible to any reconstruction. Making
    it a lane means a report can exclude it **knowingly** rather than never seeing it. Do not
@@ -388,6 +434,15 @@ CREATE TABLE project_doc (
     url         NVARCHAR(600) NOT NULL,
     CONSTRAINT fk_pdoc_project FOREIGN KEY (project_id) REFERENCES project(project_id)
 );
+
+-- The FKs deferred out of B1 and B2. `project` exists now, so they can finally be attached.
+-- This is the ONLY reason the DDL above runs in the order it is written.
+ALTER TABLE session ADD CONSTRAINT fk_session_project
+    FOREIGN KEY (project_id) REFERENCES project(project_id);
+ALTER TABLE session ADD CONSTRAINT fk_session_parent_project
+    FOREIGN KEY (parent_project_id) REFERENCES project(project_id);
+ALTER TABLE board ADD CONSTRAINT fk_board_project
+    FOREIGN KEY (project_id) REFERENCES project(project_id);
 ```
 
 **`manager_session_id` must keep its compare-and-set semantics.** v1's `setProjectManager(name, uid,
@@ -431,7 +486,10 @@ CREATE TABLE message_task_detail (
 
 CREATE TABLE reaction (
     reaction_id  BIGINT IDENTITY(1,1) PRIMARY KEY,
-    message_id   BIGINT       NOT NULL,   -- A5: a real FK, not a ts match
+    message_id   BIGINT       NULL,       -- A5: a real FK, not a ts match. NULL only when the
+                                          -- target no longer exists -- see the note below.
+    target_ts    DATETIME2(3) NOT NULL,   -- the raw v1 `target`, retained so an unresolved
+                                          -- reaction is still a row rather than a dropped one
     actor_id     INT          NOT NULL,
     reaction     VARCHAR(10)  NOT NULL,
     created_at   DATETIME2(3) NOT NULL,
@@ -439,7 +497,11 @@ CREATE TABLE reaction (
     CONSTRAINT fk_reaction_message FOREIGN KEY (message_id) REFERENCES message(message_id),
     CONSTRAINT fk_reaction_actor   FOREIGN KEY (actor_id)   REFERENCES actor(actor_id)
 );
-CREATE UNIQUE INDEX ux_reaction_once ON reaction(message_id, actor_id, reaction);
+CREATE INDEX ix_reaction_message ON reaction(message_id) WHERE message_id IS NOT NULL;
+-- NO unique index on (message_id, actor_id, reaction). `POST /react` is APPEND-ONLY by its own
+-- comment and does not dedupe, so reacting `up` twice on one message writes two v1 records. A
+-- UNIQUE index here is stricter than the endpoint it models and would fail the import. If v2 wants
+-- react-toggling instead, that is a behaviour change and needs deciding, not a quiet constraint.
 
 -- The event bus. A6: seq from a SEQUENCE, reads are seq > cursor.
 CREATE SEQUENCE seq_event AS BIGINT START WITH 1 INCREMENT BY 1;
@@ -458,6 +520,19 @@ CREATE TABLE event (
 );
 CREATE INDEX ix_event_to_seq ON event(to_actor_id, seq);
 ```
+
+**Where a reaction lives is an OPEN DECISION, not settled here.** `POST /react` writes exactly one
+thing in v1 — a **transcript row** of `kind:'react'` carrying the target's `ts` and the reaction word.
+That single record has two homes above: `message.kind` admits `'react'`, **and** there is a `reaction`
+table. Writing both double-counts every report that counts messages; writing only `message` puts
+"who reacted to what" back on `ts` matching, which is exactly what A5 forbids. **Decide before the
+transcript migration runs** — it is decision D7 in `docs/V2-DECISIONS.md`, with the recommendation
+there. The DDL above deliberately supports either answer; it does not pick one.
+
+Two facts to decide against, both measured: there are only **3** reaction records in the entire live
+store, so whichever way it goes the migration is trivial — and **12 distinct `ts` values are already
+shared by more than one transcript row**, so A5's collision is not hypothetical and a `ts`-matched
+reaction already has no unique target.
 
 **The `event.kind` CHECK list is exactly six, and that is a finding, not an omission.** `sys` is a
 *transcript* kind and never reaches the bus; `gap` is synthesized onto the poll response and never
@@ -518,7 +593,11 @@ CREATE UNIQUE INDEX ux_lq_once ON merge_lane_queue(lane_id, session_id);
 CREATE TABLE handoff (
     handoff_id    BIGINT IDENTITY(1,1) PRIMARY KEY,
     cwd_key       NVARCHAR(400) NOT NULL,
-    purpose_norm  NVARCHAR(400) NOT NULL,     -- lowercased, trimmed, whitespace-collapsed
+    -- NULLABLE, deliberately: 6 of the 110 live records are on LEGACY cwd-only keys and have no
+    -- purpose component at all. A sentinel '' would make every one of them collide with every
+    -- other legacy record under the same directory. SQL Server's UNIQUE index treats NULLs as
+    -- equal, so leaving it NULL gives exactly the right rule for free: one legacy record per cwd.
+    purpose_norm  NVARCHAR(400) NULL,         -- lowercased, trimmed, whitespace-collapsed
     from_session_id INT         NULL,
     summary       NVARCHAR(MAX) NULL,
     notes         NVARCHAR(MAX) NULL,         -- what the predecessor WROTE. May be empty.
@@ -554,12 +633,19 @@ CREATE TABLE calendar_day (
     nudged_for   DATE         NULL
 );
 
+-- DATETIMEOFFSET, not DATETIME2, and this is the one place in the schema that departs from the
+-- UTC-everywhere rule. Every real schedule.events timestamp is Google Calendar's OFFSET form
+-- (2026-07-30T09:30:00-05:00) -- 8 of 8 in the live store, zero in Z form. A CAST into DATETIME2
+-- keeps the digits and drops the offset, silently, in the column that drives the T-5/T-0/end
+-- announcements. Converting to UTC on import would also work, but loses information a local
+-- wall-clock time cannot recover: -05:00 and -06:00 are the same wall clock across the DST
+-- boundary. Keep the offset. See D8 in docs/V2-DECISIONS.md if this is revisited.
 CREATE TABLE calendar_event (
     event_id   INT IDENTITY(1,1) PRIMARY KEY,
     day_date   DATE          NOT NULL,
     title      NVARCHAR(300) NOT NULL,
-    starts_at  DATETIME2(3)  NOT NULL,
-    ends_at    DATETIME2(3)  NOT NULL,
+    starts_at  DATETIMEOFFSET(3) NOT NULL,
+    ends_at    DATETIMEOFFSET(3) NOT NULL,
     link       NVARCHAR(600) NULL,
     join_url   NVARCHAR(600) NULL,
     join_kind  VARCHAR(20)   NULL,
@@ -658,7 +744,9 @@ LEFT JOIN session ts2 ON ts2.session_id = ta.session_id;
 
 ## D. Open decisions — Chris's or the coordinator's, not mine
 
-Carded rather than assumed.
+Carded rather than assumed. **Each of these is written up with options, costs and a recommendation in
+`docs/V2-DECISIONS.md`** — that document is the one to put in front of Chris; this list is the index.
+Nothing here is answered, and step 3 must not decide any of them by writing code that assumes one.
 
 1. **Back-end language (Node vs .NET).** Chris's call, and the schema does not depend on it. The
    *access layer* does: `node:sqlite` has no SQL Server driver, so a Node v2 needs `mssql`/Tedious,
@@ -673,6 +761,18 @@ Carded rather than assumed.
    (A4) — someone has to own that check.
 6. **Does the reporting store (`db.mjs`, `jarvis.db`) survive?** This schema supersedes it entirely.
    My read is that it should be retired rather than migrated, but it has a CLI with users.
+   **Still open — but no longer free of consequences.** `jarvis.db` is the *only* source for
+   `task.started_at`, `task.done_at` and `task.dropped_at`; `worklist.json` never stored them. So
+   whatever is decided, **the backfill has to happen before the retirement does** — see M11. The
+   decision is still whether it survives; the ordering is not a decision.
+7. **Where does a reaction live — `message`, `reaction`, or both?** *(added by the review)* v1 writes
+   one transcript row per reaction and the schema gives it two homes. Both double-counts; `message`
+   alone puts reaction lookup back on `ts` matching, which A5 forbids. Cheap either way — 3 records
+   exist — but undecided it corrupts message counts.
+8. **Are calendar times stored with their offset, or converted to UTC?** *(added by the review)*
+   Part B now says `DATETIMEOFFSET(3)`, because discarding the offset is silently wrong and
+   converting loses DST information. If that is overturned, it is a column type change, so it belongs
+   on this list rather than buried in B6.
 
 ---
 
@@ -681,37 +781,97 @@ Carded rather than assumed.
 **Notes only. No migration code in this document, by instruction and by judgement** — several steps
 below depend on part D, and code written ahead of those decisions has to be unpicked.
 
-- **M1 — order matters.** `actor` (seed `human` + `hub`) → `project` → `mission` → `session` →
-  `board` → everything else. `session` and `project` are mutually referential, so create the FK on
-  `session.project_id` after both tables exist, as the DDL above does.
+- **M1 — order matters, and creating is a different order from populating.**
+  **Creating:** run part B top to bottom. It is already in a runnable order, and that is not an
+  accident — `actor`/`session` and `session`/`project` are each mutually referential, so **no single
+  ordering exists in which every FK can be declared inline.** Five are therefore deferred to
+  `ALTER TABLE`: `fk_actor_session` (attached in B1, once `session` exists) and `fk_session_project`,
+  `fk_session_parent_project`, `fk_board_project`, `fk_project_mission` (attached in B3, once
+  `project` and `mission` exist). If you reorder or split part B, keep those five deferred or the
+  script stops running.
+  **Populating:** `actor` seeds (`human` + `hub`, whose `session_id` is NULL) → `project` → `mission`
+  → `session` → the per-session `actor` rows → `board` → everything else. The per-session `actor`
+  rows cannot be written with the seeds; they need `session` loaded first.
 - **M2 — `uid` and `ext_id` are the idempotency keys.** Every table carrying a v1 identifier keeps it
   UNIQUE. That is what makes the migration **re-runnable** — an `IF NOT EXISTS`/`MERGE` on those
   columns means a half-finished run can be resumed rather than restored. Do not drop these columns in
   the same change that adds them.
-- **M3 — 461 sessions, 26 callsigns.** The filtered unique index `ux_session_live_callsign` will
+- **M3 — 464 sessions, 26 callsigns.** The filtered unique index `ux_session_live_callsign` will
   **fail** on import if the source has two live sessions sharing a callsign. That should be
   impossible (`assignCallsign` prevents it) but a crash-interrupted roster could contain it. Check
-  before creating the index, and treat a violation as data to inspect, not to auto-resolve.
-- **M4 — `project_log.from_label` often names a dead session by callsign.** Resolving it to
-  `from_actor_id` requires picking *which* `oscar`. Match on the log entry's `ts` falling inside a
-  session's `[registered_at, ended_at]` window; where that is ambiguous or empty, **leave
-  `from_actor_id` NULL and keep the label**. A wrong attribution is worse than a missing one.
+  before creating the index, and treat a violation as data to inspect, not to auto-resolve. Verified
+  clean against the live store on 2026-07-31 — exactly one live session per callsign.
+  Two other real rows that will trip a `NOT NULL`, both one-offs, both to be defaulted rather than
+  investigated: **`s_0001` has no `cwd`** (the first session JARVIS ever registered), and the legacy
+  handoff keys have no purpose (see B5).
+- **M4 — `project_log.from_label` names a dead session by callsign, and the obvious rule resolves
+  NOTHING.** Resolving it to `from_actor_id` requires picking *which* `oscar`. The intuitive rule —
+  the log `ts` falling inside a session's `[registered_at, ended_at]` window — **resolves 0 of the 45
+  real labels.** Measured: every one lands *after* the window, by 1 ms to 4.9 s (median 441 ms),
+  because the retire path stamps `ended` and *then* appends the log entry. The timestamp is always
+  just past the window it is supposed to fall inside.
+  **Use instead: the session of that callsign whose `ended` is the latest one at or before the log
+  `ts`.** That resolves **45 of 45 uniquely, with zero ties.** Keep the fallback — where it is
+  ambiguous or empty, **leave `from_actor_id` NULL and keep the label**; a wrong attribution is worse
+  than a missing one. It just never fires on today's data.
 - **M5 — `handoff.board_snapshot` stays JSON.** It is a point-in-time copy of a board that no longer
   exists, referenced by nothing. Normalizing it would create task rows for cards that were already
   migrated from the live board — duplicates that then need distinguishing. Keep the blob.
-- **M6 — the transcript is the big one.** ~6000 live rows plus ~2000 archived, and the archive is
-  append-only history that `GET /search` already reads. Migrate both into `message`, ordered by `ts`,
-  and expect `from`/`to` resolution to be the slow part (see M4 — same problem, far more rows).
+- **M6 — the transcript is the big one.** ~8000 rows across the live file and the archive (the split
+  between them moves; see M10), and the archive is append-only history that `GET /search` already
+  reads. Migrate both into `message`, ordered by `ts`, and expect `from`/`to` resolution to be the
+  slow part (see M4 — same problem, far more rows). Every real `from`/`to` in the transcript is a
+  **callsign**, never a uid, so M4's resolution rule applies to the whole file and not just to
+  `project_log`.
 - **M7 — `announced` needs its key rebuilt.** The v1 map is keyed by title string; resolving each to
   an `event_id` requires matching on (day, title). Same-titled meetings on one day are genuinely
   ambiguous — that is the v1 bug, and migration is where it surfaces. Log them rather than guessing.
 - **M8 — do NOT migrate the repo-directory `repos.json`.** It is an untracked, weeks-stale leftover
   that the hub does not read (`docs/V2-CURRENT-SYSTEM.md` §6.0). The live file is the one in
   `JARVIS_DATA`. It has already fooled people; delete it rather than importing it.
-- **M9 — timestamps are ISO-8601 UTC strings.** Straight `CAST` to `DATETIME2(3)`. Two v1 fields are
-  **not** ISO and need converting: `trust_until` and `away_until` are epoch milliseconds, and
-  `calendar_day.day_date` is a `Date.toDateString()` string like `"Thu Jul 30 2026"`.
-- **M10 — validate against the live counts before switching over.** Measured 2026-07-30/31: 461
-  sessions, 106 handoff records (7 with an `auto` block, 6 on legacy cwd-only keys), 5 projects,
-  3 missions, 6 board columns, 2 merge lanes, 3 repos, 3 AI threads, 456 archive epitaphs,
-  ~7031 total bus events (5029 retained), ~5960 transcript rows + ~2002 archived.
+- **M9 — timestamps are ISO-8601 UTC strings, with exactly three exceptions.** Straight `CAST` to
+  `DATETIME2(3)` for sessions, tasks, the transcript and the bus — verified against the live store.
+  The three that are **not** plain ISO-UTC:
+  1. `trust_until` and `away_until` are **epoch milliseconds**.
+  2. `calendar_day.day_date` is a `Date.toDateString()` string like `"Thu Jul 30 2026"`.
+  3. **`schedule.events` `start`/`end` carry a UTC OFFSET, not `Z`** — `2026-07-30T09:30:00-05:00`,
+     in 8 of 8 real rows. This is the one that does not fail loudly: a `CAST` into `DATETIME2`
+     succeeds, keeps the wall-clock digits, and throws the offset away. Load them into
+     `DATETIMEOFFSET(3)` (see B6) so the offset survives.
+
+  The first two announce themselves by failing. Assume nothing about a timestamp column you have not
+  actually looked at — this list was two items long until someone measured.
+- **M10 — validate against the live counts before switching over, and RE-MEASURE rather than
+  trusting these.** Measured 2026-07-31: **464 sessions**, **110 handoff records** (12 with an `auto`
+  block, 81 with written notes, 6 on legacy cwd-only keys), 5 projects, 3 missions, **5 board
+  columns**, ~775 live task cards, 2 merge lanes, 3 repos, 3 AI threads, 1 hold, 460 archive
+  epitaphs, ~7066 total bus events (5064 retained, `bus.base` 2002).
+  **The transcript numbers move fastest and are the least trustworthy to quote:** two measurements
+  four hours apart read 5960 + 2002 archived, then 5154 + 3003 — the trim/archive boundary had moved,
+  while the *total* stayed consistent. Validate on the **sum**, never on the split. The instruction
+  to re-measure is the durable part of this note; every figure in it is a snapshot.
+- **M11 — HARD PRECONDITION: backfill `task.started_at`/`done_at`/`dropped_at` from `jarvis.db`
+  BEFORE anything retires it.** This is not a preference and it does not wait on D6. A live task row
+  in `worklist.json` carries exactly `id`, `text`, `addedAt`, `notes` and `priority` — the three
+  lifecycle timestamps **exist nowhere else**. Retire the SQLite mirror first and every one of them
+  is gone permanently, so v2's throughput reporting starts from zero history and no later decision
+  can recover it. D6 stays open on whether the mirror survives; the *order* is settled by the fact
+  that one direction is reversible and the other is not.
+- **M12 — a transcript `to` is not always an actor.** 833 real rows carry `to: "m:<missionId>"` —
+  speech routed to a mission thread, not to a session. Map those to `message.mission_id` with
+  `to_actor_id` left NULL. Nothing is lost: all 833 also set `missionId` independently, so the
+  mission is recoverable from either field and they agree. Do **not** try to mint an actor for a
+  mission.
+- **M13 — deliberately NOT modelled, so the next reader can tell "rejected" from "missed".** Each of
+  these occurs in the live store and has no column on purpose, for the same reason `to:'all'` has
+  none: modelling a vestige builds a feature nobody asked for.
+  - `project.workers` — present on all 5 projects, **always an empty array**.
+  - `task.subtasks` — `task_subtask` is declared, but **0 of ~775 live cards** have a subtasks array.
+    The table is for the capability, not for a migration; expect to import nothing into it.
+  - `transcript.command` — 1 row, value `shutdown`.
+  - `sessions.nextUid` — the uid allocator's cursor. `IDENTITY` replaces it. The migration must still
+    not re-issue a `uid` string that already exists.
+  - `pendingPerms` — in-memory only in v1 and correctly absent. `session_auto_allow` covers the
+    durable half. Note its `granted_at` has **no source**: v1's `autoAllow` is a bare string array
+    with no timestamps. Default it to the owning session's `started` — a true lower bound, and more
+    useful than a nullable column nobody can interpret.
