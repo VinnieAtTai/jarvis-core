@@ -131,7 +131,14 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 let uid = null;
 (async () => {
     while (!uid) {
-        try { const r = await post('/register', { cwd: process.cwd(), purpose: 'scratch stub', pin: cs }); uid = r && r.uid; } catch {}
+        // The purpose carries the CALLSIGN because the hub keys durable handoff records by
+        // handoffKey(cwd, purpose). Every stub shares this cwd, so a fixed purpose gave every stub in
+        // a test ONE slot between them, and whichever session wrote last silently destroyed the rest.
+        // That is not a hypothetical: it made test/handoff.test.mjs fail roughly one full-suite run in
+        // three, and the failure read as "no handoff record filed" -- a filing bug -- when the record
+        // had been filed and then overwritten. Real jobs carry distinct purposes, which is the
+        // assumption the hub key is designed around; the rig was the only thing violating it.
+        try { const r = await post('/register', { cwd: process.cwd(), purpose: 'scratch stub ' + cs, pin: cs }); uid = r && r.uid; } catch {}
         if (!uid) await sleep(1000);
     }
     let cur = 0;

@@ -1347,6 +1347,21 @@ export function reconcileRoster(sessions, liveHosts, now, opts = {}) {
     return out;
 }
 
+// One repo key or callsign, spelled the way worktreePlan spells it into a directory name.
+const wtKey = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12);
+// Does this path's last segment look like a name the hub MINTED? worktreePlan builds every directory
+// it creates as `<repoKey>-<callsign>`, plus a `-2`/`-3` collision suffix, with both halves stripped
+// to [a-z0-9] -- so a name that cannot be spelled that way was put under the root by a human, and is
+// not ours to delete at any age. `adhoc` and `repo` are in the accepted set because worktreePlan
+// itself falls back to them when the spawn's cwd matches no configured repo (resolveRepo) or the key
+// normalizes away, and litter the hub really did mint has to stay collectable.
+function mintedWorktreeName(path, keys) {
+    const base = wtSlashes(path).toLowerCase().split('/').pop();
+    for (const k of [...keys, 'adhoc', 'repo']) {
+        if (base.startsWith(k + '-') && /^[a-z0-9]+(-\d+)?$/.test(base.slice(k.length + 1))) return true;
+    }
+    return false;
+}
 // Which directories under WT_ROOT belong to nobody. A worker that dies leaves its worktree on disk
 // with no session to ever clean it up, so something has to collect them — otherwise the disk fills
 // with dead checkouts and, worse, a recycled callsign trips over its own leftover directory and
@@ -1358,7 +1373,7 @@ export function reconcileRoster(sessions, liveHosts, now, opts = {}) {
 // its uncommitted work with it, so the assumption is worth naming as dead rather than leaving the
 // next reader to infer it.
 //
-// Two ways a directory is claimed, in order of how much they are worth trusting:
+// Two ways a directory is claimed BY A SESSION, in order of how much they are worth trusting:
 //   opts.claimed — paths the caller can PROVE are in use, from a live host pid or a worktree cut
 //                  for a worker that has not registered yet. Deterministic; outranks everything.
 //   heartbeat    — an unended session whose lastSeen is inside `staleMs`. The only signal available
@@ -1366,10 +1381,40 @@ export function reconcileRoster(sessions, liveHosts, now, opts = {}) {
 //                  hand), but note it is useless immediately after a restart, when every survivor's
 //                  lastSeen is frozen at whatever it was before the hub went down. A caller running
 //                  at boot must give survivors time to check in before trusting this.
+//
+// THE HOLE BOTH OF THOSE SHARE, measured on the live hub 2026-07-30: they are claims made by
+// SESSIONS, and a directory can be in use by something that is not a session. A manager gating a
+// merge candidate runs `git worktree add` by hand -- the hub never minted that tree, so there is no
+// pendingWorktree entry, and a bound coordinator's own roster row carries worktree:null -- so it is
+// claimable by nothing, and the sweep ate oscar's three-minute-old verify tree with a mutation probe
+// running inside it. Not an unlucky one-off either: the house standard tells a manager to gate a
+// merge candidate in a throwaway tree and THEN ask for the restart that deploys it, so every manager
+// aims the boot sweep at the tree its own gate is running in. Hence three gates that need no session
+// at all. Each one covers a case the other two cannot, which is why all three are here:
+//   opts.keys      — collect only names the hub itself mints (mintedWorktreeName). Protects a foreign
+//                    name (oscar-verify) at ANY age, which the age floor stops doing the moment a gate
+//                    outruns it. Absent or empty keys skip the gate, so an older caller keeps today's
+//                    behaviour instead of silently sweeping nothing.
+//   opts.minAgeMs  — refuse a directory younger than the window in which the hub cannot yet know its
+//                    OWN mint has failed (the pendingWorktree TTL, 5 minutes). Protects a brand-new
+//                    tree whatever it is called, including one named exactly like a minted one, which
+//                    the name gate cannot do.
+//   entry.branch   — a minted tree is always on a `jarvis/` branch (worktreePlan creates one or
+//                    continues a predecessor's). A merge-gate tree is the opposite by construction:
+//                    you cut it at a candidate commit, so it reads `HEAD` -- detached -- which is
+//                    exactly what the incident log recorded. This is the gate that closes the case the
+//                    other two both miss: a hand-made tree named like a minted one and older than the
+//                    floor. It costs nothing, because the caller already reads this branch to name it.
+// Every gate FALLS THROUGH when its input is missing (no createdAt, no branch): refusing everything
+// unmeasured would turn one failed stat into a dead sweep, which is its own bug. A tree spared here is
+// collected on a later boot, so being too careful costs one directory for one restart cycle. Being
+// wrong the other way costs a live worker's uncommitted work.
 // Removal is the caller's job and it commits any WIP to the branch first — nothing is swept unsaved.
 export function orphanWorktrees(dirs, sessions, now, opts = {}) {
     const o = opts && typeof opts === 'object' ? opts : {};
     const staleMs = Number.isFinite(o.staleMs) ? o.staleMs : 120000;
+    const minAgeMs = Number.isFinite(o.minAgeMs) ? o.minAgeMs : 300000;
+    const keys = (o.keys || []).map(wtKey).filter(Boolean);
     const live = new Set();
     for (const p of (o.claimed || [])) if (p) live.add(wtSlashes(p).toLowerCase());
     for (const uid in (sessions || {})) {
@@ -1378,7 +1423,79 @@ export function orphanWorktrees(dirs, sessions, now, opts = {}) {
         const seen = Date.parse(s.lastSeen);
         if (Number.isFinite(seen) && (now - seen) < staleMs) live.add(wtSlashes(s.worktree).toLowerCase());
     }
-    return (dirs || []).filter(d => d && !live.has(wtSlashes(d).toLowerCase()));
+    const out = [];
+    for (const d of (dirs || [])) {
+        // An entry is a bare path, or { path, createdAt, branch } when the caller has looked.
+        const rec = d && typeof d === 'object' ? d : null;
+        const path = rec ? rec.path || '' : (typeof d === 'string' ? d : '');
+        if (!path) continue;
+        if (live.has(wtSlashes(path).toLowerCase())) continue;
+        if (keys.length && !mintedWorktreeName(path, keys)) continue;
+        const born = rec ? (typeof rec.createdAt === 'number' ? rec.createdAt : Date.parse(rec.createdAt)) : NaN;
+        if (Number.isFinite(born) && (now - born) < minAgeMs) continue;
+        const branch = rec ? String(rec.branch || '').trim() : '';
+        if (branch && !/^jarvis\//i.test(branch)) continue;
+        out.push(path);
+    }
+    return out;
+}
+// The sys line a worktree teardown leaves behind, decided from what the filesystem says AFTERWARDS
+// rather than from git's exit code -- because those two disagree, and the disagreement is the kind
+// that loses work.
+//
+// Measured on the live hub 2026-07-30. A boot sweep logged "worktree remove FAILED for a dead session
+// at d:/claude/.jarvis-wt/oscar-verify; branch HEAD kept" and on disk that path was an EMPTY
+// directory: contents gone, no .git file, absent from `git worktree list`. Same shape for the two
+// genuinely-dead trees collected in the same pass, so the litter is systematic rather than a fluke.
+// The mechanism is git's own order of operations: `worktree remove` deletes the checkout recursively
+// and THEN removes the administrative .git/worktrees/<id> entry regardless, reporting non-zero if any
+// part of the recursive delete failed. So a failure means "partly destroyed and deregistered", never
+// "untouched" -- and a log that says kept about a directory it emptied is worse than no log, because
+// the next session reads it as work that is still there to recover.
+//
+// Hence the claim is graded on what was OBSERVED after the attempt, and only `intact` -- the directory
+// is still there AND git still resolves it as a worktree -- earns the words "still there".
+//
+// `intact` is that observable, and it was measured rather than reasoned -- git 2.54.0.windows.1, a
+// throwaway repo, two ways of failing the same remove:
+//   locked worktree   -> exit 128, directory AND .git still there, still in `worktree list`. Refused
+//                        before touching anything, so this is the one case the log may promise a
+//                        checkout is waiting.
+//   junction inside   -> exit ZERO, every tracked file deleted, .git gone, GONE from `worktree list`,
+//                        directory left holding only the junction. The exit code says success, the
+//                        tree is destroyed, and the old line called it "STILL THERE".
+// So the exit code is wrong in BOTH directions and the pair above is what separates them: .git present
+// and `rev-parse --git-common-dir` answering. (The junction is not followed -- the real node_modules
+// behind it was verified untouched -- and rmdirSync then refuses the leftover, as it should.)
+//   destroyed — the checkout is gone, whatever git's exit code said.
+//   litter    — the contents are gone but the directory itself could not be removed. Nothing in it is
+//               recoverable; it is a shell, and saying so is the entire point of this function.
+export function worktreeRemoval({ ok, existedBefore, exists, intact, cs, path, branch } = {}) {
+    const who = cs || 'a dead session', p = path || '?';
+    const kept = '; branch ' + (branch || '?') + ' kept';
+    if (existedBefore === false && !exists) return {
+        state: 'removed', destroyed: false, litter: false,
+        text: 'nothing to remove for ' + who + ': ' + p + ' was already gone before the teardown' + kept,
+    };
+    if (exists && intact) return {
+        state: 'kept', destroyed: false, litter: false,
+        text: ok
+            ? 'git reported removing ' + who + ' worktree but ' + p + ' is STILL a checkout git resolves, so nothing was collected' + kept
+            : 'worktree remove FAILED for ' + who + ' at ' + p + '; the checkout is STILL THERE and still registered' + kept,
+    };
+    if (exists) return {
+        state: 'removed', destroyed: true, litter: true,
+        text: 'worktree ' + p + ' for ' + who + ' was DESTROYED, not kept: git deleted its contents and '
+            + 'deregistered it, then could not delete the directory itself (an open handle, or a junction '
+            + 'inside), so a shell of it is left behind and nothing in it is recoverable' + kept,
+    };
+    return {
+        state: 'removed', destroyed: true, litter: false,
+        text: ok
+            ? 'worktree for ' + who + ' removed' + kept + ' for merge'
+            : 'worktree remove reported an ERROR for ' + who + ' at ' + p + ', but the directory is gone: '
+                + 'the checkout was destroyed anyway, so there is nothing there to recover' + kept,
+    };
 }
 
 // The running build, normalized from raw git output. Pure so it can be tested; the hub supplies
