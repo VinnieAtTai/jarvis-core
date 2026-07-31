@@ -50,12 +50,19 @@ const SHORT = 'NOTE: merge lane is clear';
 // the lane chip and the activity glyph -- so even a short line got chopped mid-word by CSS with no
 // way to read the rest.
 //
-// MEASURED, and it caught a bad fixture here: the hub CAPS doing at 80 characters on ingest
-// (jarvis-core.mjs:3988, `s.doing = String(b.doing || '').slice(0, 80)`). The first version of this
-// fixture was 118 chars, so its tail was cut off SERVER-SIDE and never reached the browser at all --
-// which read exactly like the rail's caret being wired to nothing. Keep this under 80 or the test is
-// asserting against text the console was never sent.
-const LONG_DOING = 'working: merging zulu wedge -- gate 516/516 green, 8 probes, then whiskey';
+// MEASURED, and it caught a bad fixture here: the hub CAPS doing on ingest (grep POST /health in
+// jarvis-core.mjs for the clamp -- a line number here would rot). The first version of this fixture
+// was 118 chars against a cap of 80, so its tail was cut off SERVER-SIDE and never reached the browser
+// at all -- which read exactly like the rail's caret being wired to nothing.
+//
+// The cap is now 400, raised precisely so a doing line can carry `headline -- detail`, and this fixture
+// is deliberately 100+ chars: it would NOT have survived the old cap, so it now proves the ingest and
+// the render halves in one pass. test/doingcap.test.mjs pins the boundary arithmetic; what only a
+// browser can show is that the whole tail is on Chris's rail one click down. Keep it over 80 and under
+// the cap -- too short and it stops exercising the raise, too long and it is asserting against text
+// the console was never sent.
+const LONG_DOING = 'working: merging zulu wedge -- gate 516/516 green, 8 probes killed, no survivors, '
+    + 'then whiskey';
 const DOING_HEAD = 'working: merging zulu wedge';
 const DOING_TAIL = 'then whiskey';
 

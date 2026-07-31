@@ -4128,7 +4128,23 @@ async function handleRequest(req, res) {
         if (!Number.isFinite(n) || n < 0 || n > 100) return json(res, 400, { error: 'context must be a number 0-100' });
         s.ctx = n;
         s.ctxTs = new Date().toISOString();
-        if (b.doing !== undefined) s.doing = String(b.doing || '').slice(0, 80);
+        // THE DOING LINE IS STILL BOUNDED, at 400 rather than the 80 it was until now. 80 was sized for
+        // a rail that could only ever render one nowrap line: anything past it was cut off SERVER-SIDE,
+        // so the tail existed nowhere and a session reporting more than a phrase was silently editing
+        // itself. The readability work removed that constraint -- every site that shows this string now
+        // shows a HEADLINE (60 chars on the rail, 80 on the card) with the full text one click down --
+        // so a doing line can legitimately carry the house `headline -- detail` shape, and what reaches
+        // Chris's screen is bounded by the renderer, not by this number. Verified, not assumed: see
+        // test/doingcap.test.mjs, which feeds a stored value through the real splitter, and
+        // verify-headline-browser.mjs, which feeds an over-80 doing line to a real browser.
+        //
+        // What the bound still buys, and why it is not simply removed: this string is stored on the
+        // roster row and quoted verbatim into every handoff record reconstructHandoff assembles, so an
+        // unbounded one lets a runaway paste -- a stack trace, a log tail -- follow a session's whole
+        // lineage. 400 is the same bound the hub already puts on a push-notification body, and it stays
+        // conservative next to `purpose`, which renders on the same card through the same splitter with
+        // no cap at all.
+        if (b.doing !== undefined) s.doing = String(b.doing || '').slice(0, 400);
         if (n >= 80 && !s.ctxWarned) {
             s.ctxWarned = true;
             enqueueSay(s.callsign + ' is at ' + n + ' percent context. Have it wrap up and hand off soon.', 'jarvis');
