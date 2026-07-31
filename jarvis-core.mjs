@@ -13,7 +13,7 @@ import { worktreeRoot, worktreeBase, worktreePlan, claudeTrustPatch, shouldIsola
 import { BATON_STALE_MS, normalizeLane, batonRequest, batonRelease, batonCancel, batonForce, batonReap, isBatonQuestion, speakBaton } from './jarvis-text.mjs';
 import { SPAWN_REGISTER_TIMEOUT_MS, overdueSpawns, diagnoseSpawnLog, deadSpawnNote, reconstructHandoff, spawnDispatch } from './jarvis-text.mjs';
 import { CMD_LINE_MAX, BOOT_PROMPT_MAX, capBootPrompt } from './jarvis-text.mjs';
-import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, pickHandoff, purposeOfHandoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, wedgeState, wedgeGraceMs, wedgeEscalateDue, cursorGap, parseBodyLenient } from './jarvis-text.mjs';
+import { clk, remTitle, parseReminder, parseScheduleText, WORK_VERSION, textOf, shortTitle, summarizeBoard, migrateWork, cwdKey, handoffKey, pickHandoff, purposeOfHandoffKey, shouldSpawnSuccessor, boardHasWork, transferBoard, AI_MODELS, AI_DEFAULT_MODEL, aiCost, monthKey, rollSpend, capExceeded, normalizeProject, pushCapped, subworkerBrief, PROJECT_LOG_CAP, normalizeMission, missionProgress, isMissionCloseIntent, isMissionConfirm, isMissionCancel, parseNewMissionTitle, matchMissionByPhrase, permSig, permLabel, PERM_MULTIWORD, canon, orderedTasks, projectForMission, pickProjectWorker, lastProjectCwd, projectOwningCwd, activeProjectsForCwd, shouldNudgeSchedulePull, matchRepo, repoRow, focusHolderUid, focusHeldByLiveOther, nextFocusKey, boardKeyFor, resolveBinding, coordinatorSlotHolder, liveSubWorkers, coordinatorChangeNote, wedgeState, wedgeGraceMs, wedgeEscalateDue, cursorGap, parseBodyLenient } from './jarvis-text.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // What code is actually RUNNING, resolved once at load and stated out loud.
@@ -1027,6 +1027,9 @@ function takePendingBind(cs) {
 // EVERY site that is about to spawn a coordinator asks this first; a project gets exactly one.
 // (Same wrapper shape as boardKey / wedgedNow: the decision is pure and unit-tested, the state is here.)
 const coordinatorHeld = name => coordinatorSlotHolder(roster.sessions, pendingBind, name, Date.now());
+// ...and who is working UNDER it right now. Same wrapper shape, same clock, same staleness window, so
+// "live" can never mean one thing to the slot predicate and another to the fan-out that follows it.
+const liveSubsOf = (name, exclude) => liveSubWorkers(roster.sessions, name, Date.now(), 120000, exclude);
 function enqueueSay(text, from) {
     const label = from || 'jarvis';
     const focus = loadWork().focus;
@@ -1549,6 +1552,35 @@ function retireSession(uid, summary, opts = {}) {
                 busAppend({ from: 'jarvis', to: held.uid, kind: 'msg', text: cs + ' retired off ' + s.project + ' and you already hold the coordinator slot, so no successor was spawned. Its handoff: GET /handoff?cwd=' + encodeURIComponent(s.cwd || '') + '&purpose=' + encodeURIComponent(s.purpose || '') + (rec.summary ? ' -- summary: ' + rec.summary : '') });
             }
         }
+        // Tell the LIVE SUB-WORKERS their coordinator just changed hands. The upward half of this
+        // already existed — the sub-worker retire path above pushes "your sub-worker X retired" to the
+        // coordinator — and the downward half did not, so a session could lose the manager it was
+        // briefed by and never be told.
+        //
+        // MEASURED, 2026-07-31 20:13:58: bravo retired off jarvis having briefed two sub-workers.
+        // uniform's completion report 90s later had to open by GUESSING that oscar had inherited the
+        // job ("if this belongs somewhere else, say so"); whiskey, still live, still believed it
+        // reported to bravo. Neither had done anything wrong — nothing on the wire could have told
+        // them.
+        //
+        // AFTER the successor/held block on purpose: `psucc` is only resolved once spawnWorker has
+        // returned, and a notification naming a null coordinator is worse than none — it reads as
+        // "your coordinator is gone" with the actionable half missing, which is exactly the state
+        // uniform was already in. The three verdicts are the three branches above, in the same order.
+        //
+        // kind:'msg', never 'chat'. A chat line lands in the mission thread that a booting coordinator
+        // reads as its opening prompt, so this would come back as an instruction to the very session
+        // it is announcing. Its own try/catch, like the upward push: no fan-out failure may strand a
+        // session mid-retire, and the retire is already irreversible by here.
+        try {
+            const next = psucc ? { kind: 'successor', callsign: psucc }
+                : held ? { kind: 'holder', callsign: held.callsign || held.uid }
+                    : { kind: 'none', callsign: null };
+            const note = coordinatorChangeNote(s.project, cs, next);
+            for (const sub of liveSubsOf(s.project, uid)) {
+                busAppend({ from: 'jarvis', to: sub.uid, kind: 'msg', text: note });
+            }
+        } catch (e) { logCrash('coordinator-change-notify-failed', e); }
         // Feed the retiring manager's summary into the durable project log so the successor
         // rebuilds context from recent work, and release the manager slot — the successor re-claims
         // it when it registers (it hasn't yet; spawnWorker only launches the ConPTY). The release is
