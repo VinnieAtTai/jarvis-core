@@ -268,6 +268,59 @@ export function handoffKey(cwd, purpose) {
     return cwdKey(cwd) + String.fromCharCode(10) + p;
 }
 
+// WHICH handoff record a session on (cwd, purpose) should be served, and under WHICH KEY it was
+// found. The ordering rule lives here, once, so the register hint and GET /handoff cannot answer
+// differently for the same job -- the way boardKeyFor and nextFocusKey drifted apart in 14f3ad4.
+//
+// The bug, measured 2026-07-30: golf booted with purpose "JARVIS punchlist and the console board-rot
+// fixes"; its real predecessor quebec had checkpointed under "JARVIS punchlist - project
+// coordinator". Every human reading says one job, but handoffKey folds the purpose into the key, so
+// they are two slots -- and golf's own slot still held a DIFFERENT session's record from the day
+// before, which is what it was served. An exact key hit outranked recency, and the newest-on-cwd
+// fallback fired only when the purpose was ABSENT, so the near-miss case had no path to the right
+// record at all. The failure is silent in both directions: the successor cannot tell it got the
+// wrong notes, and the predecessor's notes are still filed, just unreachable.
+//
+// So recency is a TIE-BREAKER, not a last resort: the newest record on this cwd wins whenever it is
+// STRICTLY newer than the exact hit. Strictly, so the exact hit keeps its own key when it IS the
+// newest and equal timestamps never flip the answer. An unparseable ts sorts as -Infinity -- a
+// record with a broken clock can lose to a good one but can never beat one.
+//
+// KNOW THE COST BEFORE YOU EXTEND THIS. It is a partial walk-back of the scoping handoffKey exists
+// for: where one cwd hosts several unrelated jobs (d:/code/tms is the standing example), a job's own
+// record is now shadowed by any NEWER record on that cwd, whoever filed it. That is deliberate --
+// /handoff's overwhelming caller is a successor whose predecessor just retired, and for that caller
+// "the newest one here" is right far more often than "the one whose purpose string matches" -- but it
+// is a trade, not a free win. `servedKey` is the mitigation: a session handed another job's notes can
+// SEE that and disregard them, which is precisely what golf could not do. If this misfires the other
+// way in practice, the fix is to bound the override by an absolute freshness window (a predecessor
+// retires minutes before its successor registers), NOT to go back to exact-hit-wins.
+//
+// Returns { rec, servedKey, viaRecency } | null. `servedKey` is what turns a misfire from invisible
+// into visible: the caller hands it to the successor, so a session served another job's notes can
+// SEE that instead of acting on them as its own. `cs:` stash entries are never candidates -- those
+// are one-shot, addressed to a callsign, and consumed on read. Pure: reads, mutates nothing (the
+// record is returned by reference, so a caller annotating it must copy first -- these live in
+// roster.handoffs and saveRoster would persist the annotation).
+export function pickHandoff(handoffs, cwd, purpose) {
+    if (!handoffs || typeof handoffs !== 'object' || !cwd) return null;
+    const exactKey = handoffKey(cwd, purpose);
+    const exact = (handoffs[exactKey] && typeof handoffs[exactKey] === 'object') ? handoffs[exactKey] : null;
+    const pref = cwdKey(cwd);
+    const at = r => { const t = Date.parse(r && r.ts); return Number.isFinite(t) ? t : -Infinity; };
+    let best = null, bestKey = null;
+    for (const k in handoffs) {
+        if (k.startsWith('cs:')) continue;
+        const r = handoffs[k];
+        if (!r || typeof r !== 'object' || !r.cwd || cwdKey(r.cwd) !== pref) continue;
+        if (!best || at(r) > at(best)) { best = r; bestKey = k; }
+    }
+    // A tie leaves `best` as whichever came first in key order, so the exact hit is only displaced by
+    // a strictly greater timestamp -- never by iteration order.
+    if (best && (!exact || at(best) > at(exact))) return { rec: best, servedKey: bestKey, viaRecency: bestKey !== exactKey };
+    return exact ? { rec: exact, servedKey: exactKey, viaRecency: false } : null;
+}
+
 // "on the job 4h 28m (start -> end)" for the line above. Private: it exists for that one line, and a
 // half-open or clock-skewed pair returns null rather than printing a negative duration nobody can act
 // on -- an unparseable span is a missing line, never a wrong one.
